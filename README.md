@@ -1,16 +1,25 @@
 # Dockstride
 
-*Your development loop and production deployment, managed by one executable from one typed Docker Compose definition.*
+*Your whole devloop and deploy setup in a single executable*
 
-**How does it work?**
+Deploy and develop your code with ease. Dockstride is a simple set of systems that work well together to deploy your code end to end from a single Docker Compose config.
 
-- **Define your services** with [Docker Compose](https://docs.docker.com/compose/) expressed in [Nickel](https://github.com/nickel-lang/nickel). Dockstride's library provides defaults and helpers; your `Config` contract defines the environment-specific settings.
-- **Develop locally** with `dks up` or `dks dev`, backed by Docker Compose.
-- **Deploy to production** with `dks deploy`, backed by [Docker Swarm](https://docs.docker.com/engine/swarm/). Use the same service definition with different environment values.
+**So how does it work?**
 
-Docker runs your containers. Dockstride connects configuration, setup, startup, and deployment without requiring a separate configuration stack for each environment.
+- **Define your services:** [Docker Compose](https://docs.docker.com/compose/) + [Nickel](https://github.com/nickel-lang/nickel)
+  - Use Dockstride's Nickel library for improved defaults and simple helpers
+  - Define a `Config` type for your service's env-specific parameters
+- **Deploy your services:**
+  - **Development:** `dks up` to start your services with Docker Compose, or `dks dev` for file watching and your devloop
+  - **Production:** `dks deploy` to deploy to [Docker Swarm](https://docs.docker.com/engine/swarm/)
 
-## Getting started
+That's it! In addition, Dockstride includes a lot of other useful features like:
+- Automatic startup monitoring
+- Secret provisioning and management
+- Building and publishing images for production
+- Deploying individual services
+
+## Getting Started
 
 ### Install
 
@@ -21,19 +30,17 @@ curl -fsSL https://raw.githubusercontent.com/MatthewScholefield/dockstride/main/
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-The installer supports Linux x86_64 and ARM64. Nickel is embedded in `dks`; you don't need to install it separately. Docker remains a separate prerequisite.
+Nickel is included in `dks`, so there's nothing else to install.
 
 ### Define your services
 
-In your project directory, run:
+In your project directory:
 
 ```sh
 dks init
 ```
 
-This creates `compose.ncl`, a pinned library at `libs/dockstride.ncl`, and an empty `env.yaml`. It also adds ignore rules for local configuration and Dockstride state.
-
-Here's the generated definition, without the explanatory comments:
+This creates `compose.ncl`, `libs/dockstride.ncl`, and `env.yaml`. Here's the starter `compose.ncl`, without the comments:
 
 ```nickel
 let lib = import "libs/dockstride.ncl" in
@@ -58,115 +65,99 @@ dc.ComposeFile {
 }
 ```
 
-It's one HTTP service, one required project name, and a configurable port. `Config` tells Dockstride which settings to ask for; Nickel supplies defaults and validates their types. The `dockstride` metadata isn't sent to Docker.
+This runs a tiny HTTP server that responds with `Hello world!`. The config defines a project name, a backend, and a port. Replace the `hello` service with your own services when you're ready.
 
-Replace `hello` with your application's services as you go. The [larger example](examples/sample/compose.ncl) shows builds, persistent data, secrets, migrations, and file watching.
-
-### Set up your environment
+### Set up your env
 
 ```sh
 dks setup
 ```
 
-Dockstride asks for missing required settings, validates them, and writes `env.yaml`. Enter `hello` for the project name and you're ready:
+This asks for missing settings and saves them to `env.yaml`. For this example, just enter `hello` as the project name:
 
 ```yaml
 project: hello
 ```
 
-The backend and port use their declared defaults. To override the port, either edit `env.yaml` or run:
+The backend defaults to Compose and the port to 8080. You can change them in `env.yaml`, or use `dks config set apiPort 8081`. Invalid values are rejected.
 
-```sh
-dks config set apiPort 8081
-```
+Commit `compose.ncl` and the library, but not `env.yaml`. Each environment gets its own settings. `dks init` adds the ignore rules for you.
 
-Keep `compose.ncl` and the library in version control; keep `env.yaml` local to each environment. Setup also provisions secrets when your application declares them, storing references rather than secret bytes in YAML.
+### Deploy your services
 
-### Run locally
-
-With the default port:
+Start locally:
 
 ```sh
 dks up --trust
 curl http://localhost:8080
 ```
 
-The response is `Hello world!`. If you changed `apiPort`, use that port instead.
+You should get `Hello world!`. If you changed the port, use that instead.
 
-`up` starts the services in the background. For applications with declared Compose watch rules or a development command, use `dks dev --trust` to start the foreground development loop. The hello-world example doesn't need one.
+Use `dks dev --trust` for a devloop once you've added Compose watch rules or a development command. The starter doesn't have either. `--trust` allows Dockstride to run the project's builds and commands, so only use it on code you trust.
 
-`--trust` authorizes execution of the project's Docker configuration, builds, and hooks. Only use it for projects you trust.
+To stop your services:
 
 ```sh
-dks logs -f hello
-dks status
 dks down
 ```
 
-`down` stops the local stack without deleting its data volumes.
+#### Production
 
-### Deploy to production
+On your production server, install Docker and `dks`, then get a separate checkout of your project.
 
-Use a separate checkout on your production server so development and production have independent `env.yaml` files and state. Install Docker and `dks` there too.
-
-For a single-server deployment, initialize Swarm on that server:
+Swarm comes with Docker. For a single-server deployment, enable it with:
 
 ```sh
 docker swarm init
 ```
 
-A single manager is enough to run this example. To add servers later, Docker provides join commands for workers; networking and cluster administration remain yours to configure. Dockstride deploys to an existing manager rather than creating a cluster for you.
-
-From the production checkout:
+Then, in your project directory:
 
 ```sh
 dks setup --non-interactive --set project=hello-prod --set backend=swarm
-dks deploy --plan
 dks deploy --trust
-dks status
 ```
 
-The same `compose.ncl` now runs as a Swarm stack. Visit port 8080 on your server, with that port allowed through its firewall.
+Your service is now available on port 8080 of the server. Make sure the firewall allows it.
 
-This example uses a public image. For your own services with `build`, configure a registry repository reachable by your Swarm nodes; Dockstride builds and publishes immutable image revisions and deploys them by digest. See the [deployment reference](docs/reference.md#swarm-deployment-and-selected-scope) for the full workflow.
+For services with a `build`, you'll also need to configure a registry repository that your servers can reach. Dockstride builds and pushes the images for you. This example uses a public image, so it doesn't need that setup.
 
-For subsequent changes, deploy the whole stack again or update just one service:
+To deploy changes to just one service:
 
 ```sh
 dks deploy hello --trust
 ```
 
-That's the path: define once, configure each environment, run locally, then deploy.
+### Finished!
 
-## What else is included?
+For a bigger example with builds, secrets, persistent data, migrations, and file watching, see [the sample project](examples/sample/compose.ncl).
 
-- **Startup monitoring:** wait for declared readiness checks and report failures. Without healthchecks, a running container isn't treated as proof of application health.
-- **Development loops:** Compose file watching and explicit development commands.
-- **Secret management:** provision secrets once, reuse their references, and replace them explicitly.
-- **Inspectable operations:** `dks render` shows the Docker configuration; `--plan` previews startup or deployment without applying it.
-- **Targeted deployments:** update a selected Swarm service without implicitly redeploying its dependencies.
-- **Docker escape hatches:** `dks compose` and `dks stack` expose the underlying tools.
+A few other useful commands:
+- `dks logs -f hello` to follow logs
+- `dks status` to check your services
+- `dks render` to see the generated Docker config
+- `dks deploy --plan` to see what a deployment would do
+- `dks compose` and `dks stack` to use the underlying Docker commands
 
-See the [reference](docs/reference.md) for configuration, lifecycle behavior, secrets, and automation.
+See the [reference](docs/reference.md) for the details.
 
-## Why this approach?
+## Alternatives
 
 ### Why not Kubernetes?
 
-Kubernetes makes sense when you need its ecosystem, scheduling capabilities, or organizational conventions. But for an application on one or a few servers, its control plane, resource model, networking, and supporting tools can be more infrastructure than the application needs.
+Kubernetes can look simple at first, but running it means dealing with a lot more than your application's services. There's the control plane, networking, resource definitions, and extra CPU and RAM usage. For a single server, you'll probably use something like K3s. That makes installation and resource usage smaller, but you still have Kubernetes to manage.
 
-Lightweight distributions such as K3s reduce CPU and memory overhead and make single-node Kubernetes practical; they don't remove the Kubernetes model you still have to operate. Helm charts, operators, and deployment platforms can help manage that complexity, but also introduce their own layers.
+There are plenty of tools that try to make Kubernetes easier. They help with parts of it, but you often end up learning and maintaining those tools as well. If you need Kubernetes, use it. For deploying a few services on one or a few servers, Compose and Swarm are much simpler.
 
-Dockstride takes a narrower approach: Compose for development, Swarm for deployment, and one service definition between them. It's not a replacement for every Kubernetes workload.
+### Why not vanilla Compose? Why Nickel?
 
-### Why not plain Docker Compose?
+Flat env files get awkward as a project grows. You end up with a bunch of variables and defaults that have to line up for the app to work, and it's easy to miss a required value or pass an invalid one. Trying to keep things DRY with `-f compose.dev.yaml` and other overlays gives you another set of files to maintain.
 
-Plain Compose is a good starting point. The friction comes as configuration grows: flat environment variables, required values and defaults scattered across files, and environment-specific `-f compose.dev.yaml` overlays that must stay in sync. Invalid values often aren't discovered until startup.
+With Nickel, you define your services once and give the env-specific settings types, defaults, and documentation. Each environment has a small `env.yaml` containing its values. Dockstride can ask you for what's missing and validate what you enter.
 
-Nickel lets you define a typed configuration contract alongside your services, with defaults, documentation, validation, and reusable functions. Each environment supplies values in `env.yaml` rather than another copy or overlay of the service definition. Dockstride uses that contract to guide setup and validate changes.
+### Why not Jsonnet?
 
-### Why Nickel rather than Jsonnet?
+Jsonnet isn't bad, but it doesn't have a built-in type system. If your env lives in a separate file, catching typos and invalid values depends on validation you write yourself.
 
-Jsonnet is useful for generating configuration and keeping it DRY. The difference here is an inspectable type contract: Jsonnet doesn't provide a built-in type system for a separate environment file. You can write assertions yourself, but a misspelled setting doesn't automatically become a schema error.
-
-Nickel's contracts let Dockstride discover the expected inputs, explain them during setup, and reject invalid values. That makes the configuration language useful not just for generating Compose, but also for configuring the application interactively.
+Dockstride also needs to know what settings exist and what types they accept to guide you through setup. Nickel gives us that information directly.
