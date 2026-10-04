@@ -1,165 +1,172 @@
 # Dockstride
 
-[![Linux builds](https://github.com/MatthewScholefield/dockstride/actions/workflows/release.yml/badge.svg)](https://github.com/MatthewScholefield/dockstride/actions/workflows/release.yml)
+*Your development loop and production deployment, managed by one executable from one typed Docker Compose definition.*
 
-Dockstride is a transparent development and deployment CLI for Docker applications. One checked-in application definition supports a configured Compose development environment and a separately configured Swarm production environment. `dks` owns setup, secret references, startup, readiness, watch, image publication, scoped deployment, and safe teardown—not the entire host.
+**How does it work?**
 
-## The project contract
+- **Define your services** with [Docker Compose](https://docs.docker.com/compose/) expressed in [Nickel](https://github.com/nickel-lang/nickel). Dockstride's library provides defaults and helpers; your `Config` contract defines the environment-specific settings.
+- **Develop locally** with `dks up` or `dks dev`, backed by Docker Compose.
+- **Deploy to production** with `dks deploy`, backed by [Docker Swarm](https://docs.docker.com/engine/swarm/). Use the same service definition with different environment values.
 
-```text
-compose.ncl              Nickel architecture, Config contract, operational metadata
-libs/dockstride.ncl       Checked-in pinned Dockstride library
-env.yaml                 Local environment values and secret references; ignored
-.dockstride/             Private locks, ownership, journals, snapshots; ignored
-```
+Docker runs your containers. Dockstride connects configuration, setup, startup, and deployment without requiring a separate configuration stack for each environment.
 
-One directory represents one environment and identity. Development and production use different directories/checkouts. There are no hidden environment overlays. YAML contains references, never secret bytes. Configuration edits do not restart containers or deploy services.
+## Getting started
 
-Nickel supplies types, documentation, defaults, reusable definitions, and validation. The CLI edits YAML, not Nickel source expressions. The evaluator and library are embedded; evaluation never downloads a library or executes hooks.
+### Install
 
-## Installation and prerequisites
-
-Runtime prerequisites: Linux, Docker Engine, and Docker Compose >= 2.24. Swarm deployment additionally requires a manager context and a reachable registry for built images. Docker installation, Swarm initialization, registry infrastructure, and networking are explicit administrator prerequisites; Dockstride never installs packages or changes them silently.
-
-Install the latest release with curl:
+You'll need Linux, Docker Engine, and Docker Compose 2.24 or newer.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/MatthewScholefield/dockstride/main/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
-dks --version
 ```
 
-The installer detects Linux x86_64 or ARM64, verifies the archive's SHA-256 checksum and binary version, and atomically installs `dks` to `~/.local/bin`. No sudo, Rust toolchain, Docker installation, or host package changes. A failed download or verification leaves an existing `dks` unchanged. Add `~/.local/bin` to your shell's persistent `PATH` if needed.
+The installer supports Linux x86_64 and ARM64. Nickel is embedded in `dks`; you don't need to install it separately. Docker remains a separate prerequisite.
 
-To inspect before executing, or pin a version/custom destination:
+### Define your services
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/MatthewScholefield/dockstride/main/scripts/install.sh -o install-dockstride.sh
-less install-dockstride.sh
-DOCKSTRIDE_VERSION=v0.1.0 DOCKSTRIDE_INSTALL_DIR="$HOME/bin" sh install-dockstride.sh
-```
-
-[GitHub Releases](https://github.com/MatthewScholefield/dockstride/releases) also provides archives and checksum files for manual installation. Checksums detect corruption; publisher authenticity relies on HTTPS and the GitHub repository/release.
-
-```sh
-# Source installation on the current Linux host
-cargo install --path . --locked
-
-# Static release, with an explicitly selected isolated Alpine compiler
-scripts/release.sh --container --verify-reproducible
-```
-
-Every push to `main` and every pull request automatically tests and builds native Linux x86_64/ARM64 binaries in [GitHub Actions](https://github.com/MatthewScholefield/dockstride/actions/workflows/release.yml). Pushing a version tag such as `v0.1.0` publishes both verified archives and checksums after both builds pass. Branch builds are available as Actions artifacts; curl installs the latest published stable release, not an untagged branch build.
-
-The release workflow uses native runners; the script rejects accidental cross-target builds. Docker remains external to the static executable. Archives include `dks`, the pinned library, a runnable starter, provenance, and checksums. [Release details](docs/reference.md#release-and-verification).
-
-## From checkout to development
+In your project directory, run:
 
 ```sh
 dks init
-dks dev --trust
 ```
 
-`init` creates a commented `compose.ncl` with a small prebuilt hello-world service, the bundled `libs/dockstride.ncl` (no submodule), and an empty `env.yaml` mapping if absent. It preserves existing environment values and `.gitignore` contents, adding missing `env.yaml` and `.dockstride/` ignore rules. It refuses to overwrite the project definition or library and generates no Dockerfile or application source. Only `project` is required; `backend` defaults to `compose` and `apiPort` to `8080`.
+This creates `compose.ncl`, a pinned library at `libs/dockstride.ncl`, and an empty `env.yaml`. It also adds ignore rules for local configuration and Dockstride state.
 
-`dev` fills missing ordinary values, provisions secrets once, validates ownership and ports, builds/starts the declared stack, waits for actual readiness, reports endpoints, and enters declared Compose watch or `dockstride.dev.argv`. `up` performs startup without the foreground development loop.
+Here's the generated definition, without the explanatory comments:
 
-```sh
-dks setup                         # Configure/provision without starting containers
-dks config list
-dks config set apiPort 8081
-dks config unset apiPort           # Restore the declared default
-dks render
-dks doctor
-dks up --plan                     # Inspection only; unresolved inputs stay unresolved
-dks up --trust
-dks status
-dks logs -f hello
-dks down                          # Preserve volumes, secrets, allocated endpoints
-dks destroy --plan
-dks destroy --yes                 # Delete only owned application data, not secrets
+```nickel
+let lib = import "libs/dockstride.ncl" in
+let configContract = {
+  project | String | doc "Unique lowercase Compose project or Swarm stack name.",
+  backend | lib.Backend | doc "Runtime backend." | default = "compose",
+  apiPort | lib.Port | doc "Host HTTP port." | default = 8080,
+} in
+let env | configContract = import "env.yaml" in
+let dc = lib.forEnvironment env in
+
+dc.ComposeFile {
+  dockstride | not_exported = {
+    Config = configContract,
+    endpoints.hello = "http://localhost:%{env.apiPort}",
+  },
+  services.hello = dc.Service {
+    image = "hashicorp/http-echo:1.0.0",
+    command = ["-listen=:5678", "-text=Hello world!"],
+    ports = ["%{env.apiPort}:5678"],
+  },
+}
 ```
 
-`--trust` explicitly authorizes Dockerfiles, project argv hooks, and privileged Docker configuration. Without it, noninteractive execution fails before setup. Inspection runs no project shell commands, but Nickel imports can read accessible files: rendering an untrusted project is **not** a security sandbox.
+It's one HTTP service, one required project name, and a configurable port. `Config` tells Dockstride which settings to ask for; Nickel supplies defaults and validates their types. The `dockstride` metadata isn't sent to Docker.
 
-Ctrl-C stops foreground work; it does not undo completed setup or deployment and does not stop detached containers. Stop an active foreground development loop before another lifecycle mutation. `down` stops owned containers. Running without healthchecks is reported as running, not proven healthy. Hot reload exists only when declared by the project.
+Replace `hello` with your application's services as you go. The [larger example](examples/sample/compose.ncl) shows builds, persistent data, secrets, migrations, and file watching.
 
-The richer [sample application](examples/sample/compose.ncl) includes UID-1000 secret consumers, one-shot migrations, persistent data, HTTP identity checks, automatic checkout-local port allocation, content watch, and a production worker. Its file permission policy must match the invoking host UID/GID; see the reference before running it.
-
-`setup` provisions inputs and reserves explicitly declared checkout-local ports without starting containers. Automatic port allocation is only for local Unix-socket contexts; remote environments use explicit ports.
-
-## Automation and secret inputs
-
-```sh
-dks setup --non-interactive --set project=sample-ci
-# Initial prompt-based secrets also have file/stdin equivalents:
-dks setup --non-interactive --secret-file authKey=/private/auth-key
-dks setup --non-interactive --secret-stdin authKey < /private/auth-key
-dks up --non-interactive --trust --json
-```
-
-Initial input flags affect only missing references. Existing credentials are reused; changing credentials requires explicit replacement. Secret values are never command-line arguments. `--json` emits version-1 newline-delimited events and a terminal result/error; subprocess output cannot corrupt stdout. Missing ordinary values are returned as structured inputs instead of prompting. Human native passthrough preserves raw output and interactive terminal input. `--no-color`, `NO_COLOR`, help, completions, and `--` forwarding are supported.
-
-## Secret lifecycle
-
-```sh
-dks secrets list
-dks secrets replace authKey
-dks secrets replace authKey --file /private/new-key
-dks secrets replace authKey --stdin < /private/new-key
-dks secrets gc --plan
-dks secrets gc EXACT_REVISION_FROM_PLAN --yes
-```
-
-Private files support local development; immutable Swarm objects support production. Applications consume `/run/secrets/<logical-name>` and must implement their own `_FILE` handling. References, revisions, and consumers are visible; bytes are not.
-
-Missing recorded secrets fail with recovery guidance—never automatic regeneration. Replacement retains the previous revision and does not restart applications. `--apply --trust` requires a declared application-specific rotation procedure; storage replacement is not a universal database password/encryption-key rotation.
-
-The default file store is a marked user-private directory under `XDG_DATA_HOME` (normally `~/.local/share/dockstride/secrets`) with non-listable per-user mode-0300 directories. An optional root-owned shared parent is provisioned only by the explicit executable [administration script](scripts/setup-secret-storage.sh). See [permissions, rootless contexts, and recovery](docs/reference.md#secrets).
-
-## From the same definition to production
-
-In a **separate checkout** configured with `backend: swarm`, an explicit registry image prefix, and durable secret recovery sources:
+### Set up your environment
 
 ```sh
 dks setup
+```
+
+Dockstride asks for missing required settings, validates them, and writes `env.yaml`. Enter `hello` for the project name and you're ready:
+
+```yaml
+project: hello
+```
+
+The backend and port use their declared defaults. To override the port, either edit `env.yaml` or run:
+
+```sh
+dks config set apiPort 8081
+```
+
+Keep `compose.ncl` and the library in version control; keep `env.yaml` local to each environment. Setup also provisions secrets when your application declares them, storing references rather than secret bytes in YAML.
+
+### Run locally
+
+With the default port:
+
+```sh
+dks up --trust
+curl http://localhost:8080
+```
+
+The response is `Hello world!`. If you changed `apiPort`, use that port instead.
+
+`up` starts the services in the background. For applications with declared Compose watch rules or a development command, use `dks dev --trust` to start the foreground development loop. The hello-world example doesn't need one.
+
+`--trust` authorizes execution of the project's Docker configuration, builds, and hooks. Only use it for projects you trust.
+
+```sh
+dks logs -f hello
+dks status
+dks down
+```
+
+`down` stops the local stack without deleting its data volumes.
+
+### Deploy to production
+
+Use a separate checkout on your production server so development and production have independent `env.yaml` files and state. Install Docker and `dks` there too.
+
+For a single-server deployment, initialize Swarm on that server:
+
+```sh
+docker swarm init
+```
+
+A single manager is enough to run this example. To add servers later, Docker provides join commands for workers; networking and cluster administration remain yours to configure. Dockstride deploys to an existing manager rather than creating a cluster for you.
+
+From the production checkout:
+
+```sh
+dks setup --non-interactive --set project=hello-prod --set backend=swarm
 dks deploy --plan
 dks deploy --trust
-dks deploy api --trust             # Only the selected service and explicit prerequisites
 dks status
-dks logs -f api
 ```
 
-Built images use immutable revisions and digest references. Repeated identical builds reuse the published revision. Full deployment does not prune omitted services. Selected deployment uses direct service operations, does not deploy dependencies implicitly, and rejects incompatible/shared changes before applying them. Rollout failures return failure with task diagnostics; snapshots and owned live specifications support interrupted-operation recovery.
+The same `compose.ncl` now runs as a Swarm stack. Visit port 8080 on your server, with that port allowed through its firewall.
 
-There is no universal zero-downtime guarantee or transactional rollback across services, migrations, and database state. Old secrets and snapshots remain available deliberately. Multi-node registries must be reachable by every node; loopback-only registry prefixes are rejected on multi-node clusters. Destructive multi-node volume removal is rejected rather than guessing which node owns data.
+This example uses a public image. For your own services with `build`, configure a registry repository reachable by your Swarm nodes; Dockstride builds and publishes immutable image revisions and deploys them by digest. See the [deployment reference](docs/reference.md#swarm-deployment-and-selected-scope) for the full workflow.
 
-## Inspection and escape hatches
+For subsequent changes, deploy the whole stack again or update just one service:
 
 ```sh
-dks config schema --json
-dks render --target compose
-dks render --target swarm
-dks render --target build
-dks compose logs -f api
-dks stack services
-dks completions bash
+dks deploy hello --trust
 ```
 
-Rendering after identity establishment includes the same managed ownership labels used for execution. Before identity exists, rendering is canonical and does not allocate an identity. Plans disclose Docker operations, images, prerequisites, secrets, shared resources, and unresolved allocations without generating secrets, editing YAML, building, or deploying. Native namespaces retain Docker semantics; unknown commands never become passthrough.
+That's the path: define once, configure each environment, run locally, then deploy.
 
-## Architecture and verification
+## What else is included?
 
-Small Rust modules separate Nickel, document-aware configuration, canonical Docker views, planning/execution, secrets, state, and presentation. Connections are pinned per operation; context switching cannot redirect later managed commands. Ownership is a random persisted token, never an inferred folder basename.
+- **Startup monitoring:** wait for declared readiness checks and report failures. Without healthchecks, a running container isn't treated as proof of application health.
+- **Development loops:** Compose file watching and explicit development commands.
+- **Secret management:** provision secrets once, reuse their references, and replace them explicitly.
+- **Inspectable operations:** `dks render` shows the Docker configuration; `--plan` previews startup or deployment without applying it.
+- **Targeted deployments:** update a selected Swarm service without implicitly redeploying its dependencies.
+- **Docker escape hatches:** `dks compose` and `dks stack` expose the underlying tools.
 
-The pinned Nickel 0.19.0 evaluator contains a minimal, regression-tested repair for nested deserialized-data merges. [Patch provenance and compatibility](vendor/nickel-lang-core/PATCHES.md) explain the invariant and why unpatched published 0.19.0 is not a compatible standalone exporter for these fixtures. No assertions are suppressed and no panic fallback is used.
+See the [reference](docs/reference.md) for configuration, lifecycle behavior, secrets, and automation.
 
-```sh
-cargo test --locked --all-targets
-scripts/smoke.py --dks target/debug/dks --compose
-scripts/smoke.py --dks target/debug/dks --swarm
-```
+## Why this approach?
 
-The Swarm smoke uses disposable manager/worker/registry containers and separate contexts; it never initializes the selected existing daemon. It requires privileged Docker-in-Docker and nested Docker networking. Its explicit `swarmDirectNetworking=true` profile verifies host-published/DNS-round-robin services, two-node image/secret distribution, and selected updates without IPVS. Ingress routing mesh is not verified on this rootless host. Unsupported infrastructure is an explicit verification failure, not a silently skipped success. The smoke cleans up its own UUID-named resources.
+### Why not Kubernetes?
 
-[Complete configuration/lifecycle/automation reference](docs/reference.md). [Changelog](CHANGELOG.md).
+Kubernetes makes sense when you need its ecosystem, scheduling capabilities, or organizational conventions. But for an application on one or a few servers, its control plane, resource model, networking, and supporting tools can be more infrastructure than the application needs.
+
+Lightweight distributions such as K3s reduce CPU and memory overhead and make single-node Kubernetes practical; they don't remove the Kubernetes model you still have to operate. Helm charts, operators, and deployment platforms can help manage that complexity, but also introduce their own layers.
+
+Dockstride takes a narrower approach: Compose for development, Swarm for deployment, and one service definition between them. It's not a replacement for every Kubernetes workload.
+
+### Why not plain Docker Compose?
+
+Plain Compose is a good starting point. The friction comes as configuration grows: flat environment variables, required values and defaults scattered across files, and environment-specific `-f compose.dev.yaml` overlays that must stay in sync. Invalid values often aren't discovered until startup.
+
+Nickel lets you define a typed configuration contract alongside your services, with defaults, documentation, validation, and reusable functions. Each environment supplies values in `env.yaml` rather than another copy or overlay of the service definition. Dockstride uses that contract to guide setup and validate changes.
+
+### Why Nickel rather than Jsonnet?
+
+Jsonnet is useful for generating configuration and keeping it DRY. The difference here is an inspectable type contract: Jsonnet doesn't provide a built-in type system for a separate environment file. You can write assertions yourself, but a misspelled setting doesn't automatically become a schema error.
+
+Nickel's contracts let Dockstride discover the expected inputs, explain them during setup, and reject invalid values. That makes the configuration language useful not just for generating Compose, but also for configuring the application interactively.
