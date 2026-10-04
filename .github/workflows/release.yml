@@ -27,7 +27,7 @@ jobs:
             target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check installer shell syntax
         run: sh -n scripts/install.sh
       - name: Provision native static C compiler
@@ -73,7 +73,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: python3 scripts/smoke-install.py --archive dist/dockstride-*-${TARGET}.tar.gz
       - name: Upload native release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dockstride-${{ matrix.target }}
           if-no-files-found: error
@@ -82,19 +82,23 @@ jobs:
             dist/*.tar.gz.sha256
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
+    name: Verify artifacts and publish tags
+    if: github.event_name != 'pull_request'
     needs: native
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: dockstride-*
           merge-multiple: true
           path: dist
+      - name: Verify downloaded archive checksums
+        run: (cd dist && sha256sum --check *.tar.gz.sha256)
       - name: Publish verified binary archives and checksums
+        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -105,6 +109,5 @@ jobs:
             test -f "$archive"
             test -f "$archive.sha256"
           done
-          (cd dist && sha256sum --check *.tar.gz.sha256)
           gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
             --title "Dockstride $GITHUB_REF_NAME" dist/*.tar.gz dist/*.tar.gz.sha256
