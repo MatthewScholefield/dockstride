@@ -2,7 +2,7 @@
 
 *Your whole devloop and deploy setup in a single executable*
 
-Deploy and develop your code with ease. Dockstride is a simple set of systems that work well together to deploy your code end to end from a single Docker Compose config.
+Deploy and develop your code with ease (yes, I, a human, wrote that 😂). Dockstride is a simple set of systems that work well together to deploy your code end to end from a single Docker Compose config.
 
 **So how does it work?**
 
@@ -29,8 +29,6 @@ You'll need Linux, Docker Engine, and Docker Compose 2.24 or newer.
 curl -fsSL https://raw.githubusercontent.com/MatthewScholefield/dockstride/main/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
-
-Nickel is included in `dks`, so there's nothing else to install.
 
 ### Define your services
 
@@ -65,7 +63,7 @@ dc.ComposeFile {
 }
 ```
 
-This runs a tiny HTTP server that responds with `Hello world!`. The config defines a project name, a backend, and a port. Replace the `hello` service with your own services when you're ready.
+Replace the `hello` service with your own services when you're ready.
 
 ### Set up your env
 
@@ -81,7 +79,7 @@ project: hello
 
 The backend defaults to Compose and the port to 8080. You can change them in `env.yaml`, or use `dks config set apiPort 8081`. Invalid values are rejected.
 
-Commit `compose.ncl` and the library, but not `env.yaml`. Each environment gets its own settings. `dks init` adds the ignore rules for you.
+Commit `compose.ncl` and the library, but not `env.yaml`. Each environment gets its own settings. (`dks init` should have gitignored the file for you)
 
 ### Deploy your services
 
