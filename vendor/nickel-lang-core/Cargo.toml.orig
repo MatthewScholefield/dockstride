@@ -1,0 +1,144 @@
+[package]
+name = "nickel-lang-core"
+version = "0.19.0"
+description = "Programmable configuration files."
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+# Maybe we should have the nix bindings in a separate -sys crate. maybe we
+# should even have separate crates for "nix-store", "nix-cmd", "nix-expr", "nix-
+# main", since they're separate libraries, but that seems a bit over the top.
+# SEE: https://kornel.ski/rust-sys-crate
+links = "nix"
+
+[lib]
+bench = false
+
+[features]
+default = ["markdown", "repl", "doc", "format"]
+clap = ["dep:clap", "nickel-lang-parser/clap"]
+markdown = ["dep:termimad"]
+repl = ["dep:rustyline", "dep:rustyline-derive", "dep:anstyle"]
+repl-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde_repr", "dep:serde-wasm-bindgen"]
+doc = ["dep:comrak"]
+format = ["dep:topiary-core", "dep:topiary-queries", "dep:tree-sitter-nickel"]
+metrics = ["dep:metrics"]
+nix-experimental = [ "dep:cxx", "dep:cxx-build", "dep:pkg-config", "nickel-lang-parser/nix-experimental" ]
+incremental-experimental = []
+benchmark-ci = []
+
+[build-dependencies]
+lalrpop.workspace = true
+cxx-build = { workspace = true, optional = true }
+pkg-config = { workspace = true, optional = true }
+
+[dependencies]
+lalrpop-util.workspace = true
+regex.workspace = true
+simple-counter.workspace = true
+clap = { workspace = true, features = ["derive"], optional = true }
+codespan.workspace = true
+codespan-reporting.workspace = true
+colorchoice.workspace = true
+cxx = { workspace = true, optional = true }
+json_scanner.workspace = true
+logos.workspace = true
+nickel-lang-parser.workspace = true
+nickel-lang-vector.workspace = true
+ouroboros.workspace = true
+saphyr-parser.workspace = true
+smallvec.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml_edit = { workspace = true, features = ["parse"] }
+toml = { workspace = true }
+sha1.workspace = true
+sha2.workspace = true
+md-5.workspace = true
+base64.workspace = true
+unicode-segmentation.workspace = true
+indoc.workspace = true
+
+termimad = { workspace = true, optional = true }
+anstyle = { workspace = true, optional = true }
+
+rustyline = { workspace = true, optional = true}
+rustyline-derive = { workspace = true, optional = true }
+
+wasm-bindgen = { workspace = true, optional = true, features = ["serde-serialize"] }
+serde-wasm-bindgen = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+serde_repr = { workspace = true, optional = true }
+pretty.workspace = true
+
+comrak = { workspace = true, optional = true, features = [] }
+once_cell.workspace = true
+typed-arena.workspace = true
+malachite = { workspace = true, features = ["enable_serde"] }
+malachite-q.workspace = true
+indexmap = { workspace = true, features = ["serde"] }
+strip-ansi-escapes.workspace = true
+
+topiary-core = { workspace = true, optional = true }
+topiary-queries = { workspace = true, optional = true }
+tree-sitter-nickel = { workspace = true, optional = true }
+
+metrics = { workspace = true, optional = true }
+strsim.workspace = true
+bumpalo.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+assert_matches.workspace = true
+criterion.workspace = true
+similar.workspace = true
+test-generator.workspace = true
+
+# Enable this to use flamegraphs
+# [profile.release]
+# debug = true
+
+[[bench]]
+name = "numeric"
+harness = false
+
+[[bench]]
+name = "functions"
+harness = false
+
+[[bench]]
+name = "arrays"
+harness = false
+
+[[bench]]
+name = "records"
+harness = false
+
+[[bench]]
+name = "serialization"
+harness = false
+
+[[bench]]
+name = "mantis"
+harness = false
+
+[[bench]]
+name = "stdlib"
+harness = false
+
+[[bench]]
+name = "typecheck-nixpkgs-lib"
+harness = false
+
+[[bench]]
+name = "deserialization"
+harness = false
+
+[lints.clippy]
+new_without_default = "allow"

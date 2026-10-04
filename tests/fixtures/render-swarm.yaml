@@ -1,0 +1,22 @@
+version: '3.8'
+services:
+  api:
+    image: registry.example/api:revision
+    deploy:
+      replicas: 2
+      update_config:
+        order: start-first
+    healthcheck:
+      test: [CMD, 'true']
+    secrets: [authKey]
+  db:
+    image: registry.example/db:revision
+    healthcheck:
+      test: [CMD, 'true']
+    volumes: [database:/var/lib/db]
+volumes:
+  database: {}
+secrets:
+  authKey:
+    external: true
+    name: revision-1

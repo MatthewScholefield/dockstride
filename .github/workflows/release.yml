@@ -1,0 +1,110 @@
+name: Native Linux static releases
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  native:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check installer shell syntax
+        run: sh -n scripts/install.sh
+      - name: Provision native static C compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools binutils
+          musl-gcc --version
+      - name: Install stable Rust toolchain
+        # Dependency resolutions remain pinned by Cargo.lock.
+        run: |
+          rustup toolchain install stable --profile minimal --target '${{ matrix.target }}'
+          rustup default stable
+          rustc -vV
+      - name: Test, independently reproduce, and package native static binary
+        run: scripts/release.sh --target '${{ matrix.target }}' --test --verify-reproducible
+      - name: Exercise packaged evaluator and verify every checksum
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          cd dist
+          sha256sum --check *.tar.gz.sha256
+          archive=$(printf '%s\n' dockstride-*-${TARGET}.tar.gz)
+          tar -xzf "$archive"
+          package=${archive%.tar.gz}
+          (cd "$package" && sha256sum --check SHA256SUMS)
+          binary="$PWD/$package/dks"
+          "$binary" --version
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            actual=$("$binary" --version)
+            test "$actual" = "dks ${GITHUB_REF_NAME#v}"
+          fi
+          smoke=$(mktemp -d)
+          trap 'rm -rf "$smoke"' EXIT
+          "$binary" -C "$smoke" --json init
+          "$binary" -C "$smoke" --json config schema
+          cmp "$package/sample/libs/dockstride.ncl" "$smoke/libs/dockstride.ncl"
+          cmp "$package/sample/compose.ncl" "$smoke/compose.ncl"
+          cmp "$package/sample/app/Dockerfile" "$smoke/app/Dockerfile"
+          cmp "$package/sample/app/server.py" "$smoke/app/server.py"
+      - name: Exercise curl installer against the packaged release
+        env:
+          TARGET: ${{ matrix.target }}
+        run: python3 scripts/smoke-install.py --archive dist/dockstride-*-${TARGET}.tar.gz
+      - name: Upload native release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dockstride-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: native
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dockstride-*
+          merge-multiple: true
+          path: dist
+      - name: Publish verified binary archives and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version=${GITHUB_REF_NAME#v}
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            archive="dist/dockstride-$version-$target.tar.gz"
+            test -f "$archive"
+            test -f "$archive.sha256"
+          done
+          (cd dist && sha256sum --check *.tar.gz.sha256)
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+            --title "Dockstride $GITHUB_REF_NAME" dist/*.tar.gz dist/*.tar.gz.sha256
