@@ -146,7 +146,7 @@ The absolute recovery path contains literal `{revision}` and has a private `0700
 
 Replacement creates a new revision, atomically updates the reference, and retains the old one. Missing recorded files/objects fail rather than regenerate. Interrupted owned pending revisions reconcile through journals/labels. Externally managed references remain unowned; replacement never grants deletion authority over them.
 
-`--apply --trust` requires `setup.rotations.<name> = {workflow = "rotate-auth", services = ["api"]}` plus explicit actions for that workflow. Credential rotation can fail after storage replacement; the CLI reports committed storage and retained previous revision without pretending database/encryption changes are transactional.
+`--apply` requires `setup.rotations.<name> = {workflow = "rotate-auth", services = ["api"]}` plus explicit actions for that workflow. Credential rotation can fail after storage replacement; the CLI reports committed storage and retained previous revision without pretending database/encryption changes are transactional.
 
 GC plans list exact `revision` identifiers and reasons for ineligibility. Actual deletion requires explicit identifiers and confirmation:
 

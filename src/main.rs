@@ -30,9 +30,6 @@ struct Cli {
     /// Inspect operations without generating secrets, editing files, building, or deploying.
     #[arg(long, global = true)]
     plan: bool,
-    /// Explicitly trust this project's Dockerfiles, hooks, and Docker privileges.
-    #[arg(long, global = true)]
-    trust: bool,
     /// Supply an initial secret from a private file; existing references are reused.
     #[arg(long = "secret-file", global = true, value_name = "NAME=PATH")]
     secret_files: Vec<String>,
@@ -225,7 +222,7 @@ fn classify(error: &anyhow::Error) -> (&'static str, i32) {
     message.make_ascii_lowercase();
     if message.contains("cancel") || message.contains("interrupted") {
         ("cancelled", 130)
-    } else if message.contains("trust") || message.contains("confirm") {
+    } else if message.contains("confirm") {
         ("consent", 5)
     } else if message.contains("env.yaml")
         || message.contains("nickel")
@@ -351,20 +348,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                 } else {
                     None
                 };
-                let trusted = if *apply {
-                    trust(cli, non_interactive)?
-                } else {
-                    false
-                };
-                secrets::replace(
-                    &root,
-                    name,
-                    input.as_deref(),
-                    *apply,
-                    trusted,
-                    non_interactive,
-                    out,
-                )?
+                secrets::replace(&root, name, input.as_deref(), *apply, non_interactive, out)?
             }
             SecretCommand::Gc { names, yes } => {
                 let confirmed = cli.plan
@@ -393,20 +377,19 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                     }
                 }
             } else {
-                let trusted = trust(cli, non_interactive)?;
                 config::setup(&root, &[], non_interactive)?;
                 secrets::provision(&root, non_interactive, &secret_inputs, out)?;
                 let project = nickel::evaluate(&root, None)?;
                 header(&project, out)?;
                 let result = if workflow == "deploy" {
-                    deploy::deploy(&project, services, false, trusted, cli.timeout, out)?
+                    deploy::deploy(&project, services, false, cli.timeout, out)?
                 } else {
                     runtime::lifecycle(
                         &project,
                         workflow,
                         services,
                         false,
-                        trusted,
+                        false,
                         cli.timeout,
                         out,
                     )?
@@ -414,7 +397,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                 return Ok(Some(result));
             };
             if workflow == "deploy" {
-                deploy::deploy(&project, services, true, false, cli.timeout, out)?
+                deploy::deploy(&project, services, true, cli.timeout, out)?
             } else {
                 runtime::lifecycle(&project, workflow, services, true, false, cli.timeout, out)?
             }
@@ -553,29 +536,10 @@ fn parse_value(text: &str) -> Result<Value> {
     )?;
     Ok(value)
 }
-fn trust(cli: &Cli, non_interactive: bool) -> Result<bool> {
-    if cli.trust {
-        return Ok(true);
-    }
-    if non_interactive {
-        bail!(
-            "project execution requires explicit trust: inspect dks render and dks --plan, then supply --trust for Dockerfiles, hooks, and privileged Docker configuration"
-        );
-    }
-    if confirm(
-        cli,
-        false,
-        "Trust this project's Dockerfiles, lifecycle commands, and Docker privileges?",
-    )? {
-        Ok(true)
-    } else {
-        bail!("project execution trust declined")
-    }
-}
 fn confirm(cli: &Cli, non_interactive: bool, message: &str) -> Result<bool> {
     if non_interactive || cli.json {
         bail!(
-            "confirmation required: {message} Supply the explicit --yes/--trust flag in noninteractive mode"
+            "confirmation required: {message} Supply the explicit --yes flag in noninteractive mode"
         );
     }
     eprint!("{message} [y/N] ");

@@ -1124,58 +1124,6 @@ pub fn execute_actions(
     Ok(())
 }
 
-fn trust_required(project: &Project, workflow: &str, selected: &[String]) -> Result<Vec<String>> {
-    let mut reasons = Vec::new();
-    if !actions(project, workflow, selected, None)?.is_empty() {
-        reasons.push("project lifecycle actions".into());
-    }
-    if workflow == "dev" && project.metadata["dev"].get("argv").is_some() {
-        ensure!(
-            !argv(&project.metadata["dev"]["argv"])?.is_empty(),
-            "Development loop argv cannot be empty"
-        );
-        reasons.push("foreground project development command".into());
-    }
-    for name in selected_services(project, selected)? {
-        let service = &project.services()?[&name];
-        if service.get("build").is_some() {
-            reasons.push(format!("{name}: image build executes project code"));
-        }
-        if service["privileged"] == true
-            || service.get("cap_add").is_some()
-            || service.get("devices").is_some()
-            || service["network_mode"] == "host"
-            || service["pid"] == "host"
-        {
-            reasons.push(format!("{name}: privileged host access"));
-        }
-        if let Some(volumes) = service["volumes"].as_array() {
-            for volume in volumes {
-                let source = volume
-                    .as_str()
-                    .and_then(|s| s.split(':').next())
-                    .or_else(|| volume["source"].as_str())
-                    .unwrap_or("");
-                if source.contains("docker.sock")
-                    || source == "/"
-                    || source == "/proc"
-                    || source == "/sys"
-                    || source == "/dev"
-                {
-                    reasons.push(format!("{name}: sensitive host mount {source}"));
-                }
-            }
-        }
-        if project.metadata["readiness"][&name]
-            .get("command")
-            .is_some()
-        {
-            reasons.push(format!("{name}: readiness command"));
-        }
-    }
-    Ok(reasons)
-}
-
 #[derive(Clone, Debug)]
 struct Port {
     service: String,
@@ -1697,7 +1645,7 @@ pub fn lifecycle(
     workflow: &str,
     selected: &[String],
     plan_only: bool,
-    trusted: bool,
+    confirmed: bool,
     timeout: u64,
     output: &Output,
 ) -> Result<Value> {
@@ -1711,7 +1659,7 @@ pub fn lifecycle(
     );
     let selected_full = selected_services(project, selected)?;
     let planned = actions(project, workflow, selected, None)?;
-    let plan = json!({"backend":"compose","project":project.name()?,"workflow":workflow,"services":selected_full,"actions":planned,"readiness":project.metadata["readiness"],"portAllocation":project.metadata["setup"]["ports"],"effects":if workflow == "destroy" {"remove owned containers/networks and managed volumes; retain secret references"} else if workflow == "down" {"stop/remove owned containers/networks; preserve volumes and secrets"} else {"allocate declared ports, build/start, run declared actions, verify readiness"},"trustRequired":trust_required(project,workflow,selected)?,"endpoints":project.endpoints()});
+    let plan = json!({"backend":"compose","project":project.name()?,"workflow":workflow,"services":selected_full,"actions":planned,"readiness":project.metadata["readiness"],"portAllocation":project.metadata["setup"]["ports"],"effects":if workflow == "destroy" {"remove owned containers/networks and managed volumes; retain secret references"} else if workflow == "down" {"stop/remove owned containers/networks; preserve volumes and secrets"} else {"allocate declared ports, build/start, run declared actions, verify readiness"},"endpoints":project.endpoints()});
     let mut plan = plan;
     plan["devLoop"] = project.metadata["dev"].clone();
     plan["operations"] = if workflow == "down" || workflow == "destroy" {
@@ -1729,17 +1677,9 @@ pub fn lifecycle(
         return Ok(plan);
     }
     ensure!(
-        workflow != "destroy" || trusted,
+        workflow != "destroy" || confirmed,
         "Destruction requires explicit confirmation (--yes)"
     );
-    if workflow == "up" || workflow == "dev" {
-        let reasons = trust_required(project, workflow, selected)?;
-        ensure!(
-            trusted || reasons.is_empty(),
-            "Project execution requires explicit --trust: {}",
-            reasons.join(", ")
-        );
-    }
     let _lock = state::lock(&project.root, "lifecycle")?;
     let fresh = crate::nickel::evaluate(&project.root, None)?;
     ensure!(
@@ -1747,14 +1687,6 @@ pub fn lifecycle(
         "Environment identity changed while waiting for lifecycle lock; rerun the command with current configuration"
     );
     let project = &fresh;
-    if workflow == "up" || workflow == "dev" {
-        let reasons = trust_required(project, workflow, selected)?;
-        ensure!(
-            trusted || reasons.is_empty(),
-            "Current project execution requires explicit --trust: {}",
-            reasons.join(", ")
-        );
-    }
     let docker = Docker::new(&project.root, output.clone());
     output.event(
         "check",
@@ -2047,8 +1979,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("confirmation"));
-        assert!(!dir.path().join(".dockstride").exists());
-        assert!(lifecycle(&project, "dev", &[], false, false, 1, &Output::default()).is_err());
         assert!(!dir.path().join(".dockstride").exists());
     }
     #[test]

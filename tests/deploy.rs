@@ -23,15 +23,14 @@ fn incompatible_configuration_fails_before_touching_docker_or_state() {
         json!({"image":"registry.example/api","privileged":true}),
         json!({}),
     );
-    let error = deploy::deploy(&project, &[], false, true, 5, &output()).unwrap_err();
+    let error = deploy::deploy(&project, &[], false, 5, &output()).unwrap_err();
     assert!(error.to_string().contains("privileged"));
 }
 
 #[test]
 fn selection_must_exist_even_for_readonly_plans() {
     let project = project(json!({"image":"registry.example/api"}), json!({}));
-    let error =
-        deploy::deploy(&project, &["database".into()], true, false, 5, &output()).unwrap_err();
+    let error = deploy::deploy(&project, &["database".into()], true, 5, &output()).unwrap_err();
     assert!(error.to_string().contains("unknown service database"));
 }
 
@@ -43,7 +42,7 @@ fn a_compose_prerequisite_is_not_silently_reinterpreted_in_production() {
             "name":"migration","workflows":["deploy"],"services":["api"],"kind":"run","service":"api"
         }]}),
     );
-    let error = deploy::deploy(&project, &["api".into()], true, false, 5, &output()).unwrap_err();
+    let error = deploy::deploy(&project, &["api".into()], true, 5, &output()).unwrap_err();
     assert!(error.to_string().contains("Swarm migration semantics"));
 }
 
@@ -54,7 +53,7 @@ fn production_secrets_require_durable_external_references() {
         json!({}),
     );
     project.model["secrets"] = json!({"key":{"file":"/private/key"}});
-    let error = deploy::deploy(&project, &[], true, false, 5, &output()).unwrap_err();
+    let error = deploy::deploy(&project, &[], true, 5, &output()).unwrap_err();
     assert!(
         error
             .to_string()

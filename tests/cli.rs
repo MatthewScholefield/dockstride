@@ -169,15 +169,17 @@ fn init_refuses_to_overwrite_checked_in_application_code() {
 }
 
 #[test]
-fn managed_execution_requires_consent_before_setup_and_unknown_commands_are_not_passthrough() {
+fn managed_execution_reaches_setup_and_unknown_commands_are_not_passthrough() {
     let dir = initialized();
-    let output = cli(dir.path(), &["up"]);
-    assert_eq!(output.status.code(), Some(5));
-    assert_eq!(terminal(&output)["category"], "consent");
-    assert_eq!(
-        fs::read_to_string(dir.path().join("env.yaml")).unwrap(),
-        "{}\n"
-    );
+    for command in ["up", "dev", "deploy"] {
+        let output = cli(dir.path(), &[command]);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(terminal(&output)["category"], "configuration");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("env.yaml")).unwrap(),
+            "{}\n"
+        );
+    }
     let output = cli(dir.path(), &["definitely-not-a-docker-command"]);
     assert!(!output.status.success());
     assert_eq!(

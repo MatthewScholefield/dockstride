@@ -86,13 +86,13 @@ Commit `compose.ncl` and the library, but not `env.yaml`. Each environment gets 
 Start locally:
 
 ```sh
-dks up --trust
+dks up
 curl http://localhost:8080
 ```
 
 You should get `Hello world!`. If you changed the port, use that instead.
 
-Use `dks dev --trust` for a devloop once you've added Compose watch rules or a development command. The starter doesn't have either. `--trust` allows Dockstride to run the project's builds and commands, so only use it on code you trust.
+Use `dks dev` for a devloop once you've added Compose watch rules or a development command. The starter doesn't have either.
 
 To stop your services:
 
@@ -114,7 +114,7 @@ Then, in your project directory:
 
 ```sh
 dks setup --non-interactive --set project=hello-prod --set backend=swarm
-dks deploy --trust
+dks deploy
 ```
 
 Your service is now available on port 8080 of the server. Make sure the firewall allows it.
@@ -124,7 +124,7 @@ For services with a `build`, you'll also need to configure a registry repository
 To deploy changes to just one service:
 
 ```sh
-dks deploy hello --trust
+dks deploy hello
 ```
 
 ### Finished!

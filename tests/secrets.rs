@@ -362,9 +362,7 @@ fn pending_owned_revision_recovers_without_generation_and_rotation_requires_proc
     assert_eq!(fixture.env()["secrets"]["authKey"], reference);
     assert_eq!(fixture.history()["revisions"][0]["pending"], false);
     let output = fixture.command(
-        &[
-            "secrets", "replace", "authKey", "--stdin", "--apply", "--trust",
-        ],
+        &["secrets", "replace", "authKey", "--stdin", "--apply"],
         Some(b"must-not-be-committed"),
     );
     assert!(!output.status.success());

@@ -242,17 +242,10 @@ pub fn replace(
     name: &str,
     input: Option<&[u8]>,
     apply: bool,
-    trusted: bool,
     non_interactive: bool,
     output: &Output,
 ) -> Result<Value> {
     valid_name(name)?;
-    if apply {
-        ensure!(
-            trusted,
-            "secret apply executes the project-declared rotation procedure and requires --trust"
-        );
-    }
     let _lifecycle = state::lock(root, "lifecycle")?;
     let _lock = state::lock(root, "secrets")?;
     let mut session = session(root, output, true)?;

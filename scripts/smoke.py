@@ -200,9 +200,7 @@ class Harness:
                 "scalar edit lost YAML comments")
         self.cli(project, "config", "set", "apiPort", "70000", fail=True)
         require(path.read_bytes() == before, "invalid candidate overwrote environment")
-        self.cli(project, "up", fail=True)
-        require(path.read_bytes() == before, "untrusted startup changed environment")
-        self.report.append("fresh checkout schema, incremental config, comments, invalid candidates, trust, no-effect plan")
+        self.report.append("fresh checkout schema, incremental config, comments, invalid candidates, no-effect plan")
 
     def compose_smoke(self):
         first, second = self.checkout("compose-a"), self.checkout("compose-b")
@@ -222,13 +220,13 @@ class Harness:
             listener.listen()
             occupied = listener.getsockname()[1]
             self.setup(blocked, "blocked", port=occupied)
-            error = self.cli(blocked, "up", "--trust", fail=True, timeout=900)
+            error = self.cli(blocked, "up", fail=True, timeout=900)
             require("port" in error["message"].lower() or "address already in use" in error["message"].lower(),
                     "occupied-port failure did not explain the conflict")
             require(listener.fileno() >= 0 and listener.getsockname()[1] == occupied,
                     "startup commandeered unrelated listener")
         for project in (first, second):
-            self.cli(project, "up", "--trust", timeout=900)
+            self.cli(project, "up", timeout=900)
         initial = self.identity(port_a, name_a)
         other = self.identity(port_b, name_b)
         require(initial["migrated"] and other["migrated"], "one-shot migration did not complete")
@@ -243,7 +241,7 @@ class Harness:
         for volume in volumes:
             self.docker("volume", "inspect", volume)
         require(self.secret_ref(first) == refs[0], "down changed secret reference")
-        self.cli(first, "up", "--trust", timeout=900)
+        self.cli(first, "up", timeout=900)
         require(self.identity(port_a, name_a)["secretFingerprint"] == initial["secretFingerprint"],
                 "restart regenerated credential")
         require(self.configured_port(first) == port_a, "restart moved endpoint")
@@ -257,7 +255,7 @@ class Harness:
         require(self.identity(port_b, name_b)["secretFingerprint"] == other["secretFingerprint"],
                 "destroy affected unrelated worktree")
         self.config(first, "failMigration", True)
-        error = self.cli(first, "up", "--trust", fail=True, timeout=900)
+        error = self.cli(first, "up", fail=True, timeout=900)
         require("migrat" in error["message"].lower(),
                 f"migration failure diagnostic omitted service: {json.dumps(error)}")
         logs = self.docker("logs", self.compose_container(name_a, "migrate"))
@@ -265,7 +263,7 @@ class Harness:
                 f"migration error was not readable: {json.dumps(error)}")
         self.config(first, "failMigration", False)
         self.config(first, "failHealth", True)
-        error = self.cli(first, "up", "--trust", fail=True, timeout=900)
+        error = self.cli(first, "up", fail=True, timeout=900)
         require(any(word in error["message"].lower() for word in ("health", "readiness", "api")),
                 f"readiness failure lacked application diagnostic: {json.dumps(error)}")
         self.report.append("Compose image build/HTTP identity, non-root secrets, migrations/watch, isolated worktrees/ports, restart, status/logs/exec/down/destroy, failure diagnostics")
@@ -279,7 +277,7 @@ class Harness:
     def watch_smoke(self, project, port, name):
         log = self.root / "watch.log"
         with log.open("w+") as output:
-            self.watch = subprocess.Popen([self.binary, "-C", str(project), "--non-interactive", "--trust",
+            self.watch = subprocess.Popen([self.binary, "-C", str(project), "--non-interactive",
                                            "--timeout", str(self.args.timeout), "dev"], env=self.env,
                                           stdout=output, stderr=output, start_new_session=True)
             try:
@@ -364,11 +362,11 @@ class Harness:
         self.cli(project, "deploy", "--plan")
         require((project / "env.yaml").read_bytes() == before_plan and self.secret_ref(project) == secret_before,
                 "Swarm plan mutated environment or secret")
-        self.cli(project, "deploy", "--trust", timeout=900)
+        self.cli(project, "deploy", timeout=900)
         identity = self.identity(self.app_port, name)
         # First prove an actual single-node cluster before joining the second node.
         require(len(self.docker("node", "ls", "-q").stdout.split()) == 1, "fixture was not single-node")
-        self.cli(project, "deploy", "--trust", timeout=900)
+        self.cli(project, "deploy", timeout=900)
         require(self.secret_ref(project) == secret_before, "repeated deployment regenerated Swarm secret")
         require(self.identity(self.app_port, name)["secretFingerprint"] == identity["secretFingerprint"],
                 "repeated deployment changed application credential")
@@ -377,7 +375,7 @@ class Harness:
         poll(lambda: self.docker("node", "ls", "--format", "{{.Status}} {{.Availability}}").stdout,
              lambda text: text.count("Ready Active") == 2, "two-node disposable Swarm")
         self.config(project, "workerOnSeparateNode", True)
-        self.cli(project, "deploy", "--trust", timeout=900)
+        self.cli(project, "deploy", timeout=900)
         worker_spec = self.json_docker("service", "inspect", name + "_worker")[0]
         require("@sha256:" in worker_spec["Spec"]["TaskTemplate"]["ContainerSpec"]["Image"],
                 "Swarm build did not deploy immutable digest")
@@ -394,7 +392,7 @@ class Harness:
         require(self.secret_ref(project) == secret_before, "two-node deployment regenerated secret")
         revision = "selected-" + uuid.uuid4().hex[:8]
         (project / "api" / "content" / "revision.txt").write_text(revision + "\n")
-        self.cli(project, "deploy", "api", "--trust", timeout=900)
+        self.cli(project, "deploy", "api", timeout=900)
         selected_identity = self.identity(self.app_port, name, revision)
         require(self.secret_ref(project) == secret_before and
                 selected_identity["secretFingerprint"] == identity["secretFingerprint"],
@@ -405,7 +403,7 @@ class Harness:
         self.cli(project, "status")
         self.cli(project, "logs", "--tail", "20", "api")
         self.config(project, "failHealth", True)
-        error = self.cli(project, "deploy", "api", "--trust", fail=True, timeout=900)
+        error = self.cli(project, "deploy", "api", fail=True, timeout=900)
         require(any(word in error["message"].lower() for word in ("rollout", "task", "health", "converge", "pause")),
                 "failed rollout lacks actionable task/health/convergence error")
         self.cli(project, "down")

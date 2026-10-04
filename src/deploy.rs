@@ -1904,7 +1904,6 @@ pub fn deploy(
     project: &Project,
     selected: &[String],
     plan_only: bool,
-    trusted: bool,
     timeout: u64,
     output: &Output,
 ) -> Result<Value> {
@@ -1919,10 +1918,6 @@ pub fn deploy(
     let _lock = if plan_only {
         None
     } else {
-        ensure!(
-            trusted,
-            "deployment executes Dockerfiles and project prerequisites; explicitly trust the project before deploying"
-        );
         let lock = state::lock(&project.root, "lifecycle")?;
         recheck_environment(project)?;
         Some(lock)
@@ -1940,10 +1935,6 @@ pub fn deploy(
     let owner = if plan_only {
         read_owner(project, &context, false)?
     } else {
-        ensure!(
-            trusted,
-            "deployment executes Dockerfiles and project prerequisites; explicitly trust the project before deploying"
-        );
         runtime::validate_ownership(project, &docker, true)?
     };
     let mut rendered = render_owned(project, &owner)?;
