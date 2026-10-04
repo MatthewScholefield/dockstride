@@ -159,25 +159,25 @@ stage=$(mktemp -d "$output/.release.XXXXXX")
 trap 'rm -rf "$stage"' EXIT HUP INT TERM
 name=dockstride-$version-$target
 package=$stage/$name
-mkdir -p "$package/sample/libs" "$package/sample/app"
+mkdir -p "$package/sample/libs"
 cp "$binary" "$package/dks"
 cp "$root/LICENSE" "$package/LICENSE"
 cp "$root/Cargo.lock" "$package/Cargo.lock"
-# Match dks init: checked-in library, starter configuration, and runnable app.
+# Match dks init: checked-in library, hello-world configuration, and local files.
 cp "$root/assets/dockstride.ncl" "$package/sample/libs/dockstride.ncl"
 cp "$root/assets/compose.ncl" "$package/sample/compose.ncl"
-cp "$root/assets/Dockerfile" "$package/sample/app/Dockerfile"
-cp "$root/assets/server.py" "$package/sample/app/server.py"
+printf '{}\n' > "$package/sample/env.yaml"
+printf '/env.yaml\n/.dockstride/\n' > "$package/sample/.gitignore"
 {
     printf 'package=%s\nversion=%s\ntarget=%s\nsource_revision=%s\nsource_date_epoch=%s\ncompiler_image=%s\n' dockstride "$version" "$target" "$source_revision" "$epoch" "$pinned_image"
     printf 'cargo_lock_sha256=%s\n' "$(sha256sum "$root/Cargo.lock" | cut -d ' ' -f 1)"
     cat "$first/compiler-info.txt"
 } > "$package/BUILD-INFO.txt"
-(cd "$package" && sha256sum dks Cargo.lock LICENSE BUILD-INFO.txt sample/libs/dockstride.ncl sample/compose.ncl sample/app/Dockerfile sample/app/server.py > SHA256SUMS)
-chmod 0755 "$package" "$package/sample" "$package/sample/libs" "$package/sample/app" "$package/dks"
+(cd "$package" && sha256sum dks Cargo.lock LICENSE BUILD-INFO.txt sample/libs/dockstride.ncl sample/compose.ncl sample/env.yaml sample/.gitignore > SHA256SUMS)
+chmod 0755 "$package" "$package/sample" "$package/sample/libs" "$package/dks"
 chmod 0644 "$package/LICENSE" "$package/Cargo.lock" "$package/BUILD-INFO.txt" "$package/SHA256SUMS" \
     "$package/sample/libs/dockstride.ncl" "$package/sample/compose.ncl" \
-    "$package/sample/app/Dockerfile" "$package/sample/app/server.py"
+    "$package/sample/env.yaml" "$package/sample/.gitignore"
 archive=$name.tar.gz
 tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner --format=gnu -C "$stage" -cf "$stage/$name.tar" "$name"
 gzip -n -9 "$stage/$name.tar"

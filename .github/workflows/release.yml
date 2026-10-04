@@ -66,8 +66,8 @@ jobs:
           "$binary" -C "$smoke" --json config schema
           cmp "$package/sample/libs/dockstride.ncl" "$smoke/libs/dockstride.ncl"
           cmp "$package/sample/compose.ncl" "$smoke/compose.ncl"
-          cmp "$package/sample/app/Dockerfile" "$smoke/app/Dockerfile"
-          cmp "$package/sample/app/server.py" "$smoke/app/server.py"
+          cmp "$package/sample/env.yaml" "$smoke/env.yaml"
+          cmp "$package/sample/.gitignore" "$smoke/.gitignore"
       - name: Exercise curl installer against the packaged release
         env:
           TARGET: ${{ matrix.target }}

@@ -124,7 +124,10 @@ def main():
             result = run([str(installed), "-C", str(app), "--json", "config", "schema"], env)
             require(result.returncode == 0, result.stderr)
             fields = json.loads(result.stdout.splitlines()[-1])["result"]["fields"]
-            require(any(item["path"] == "oauth.enabled" and item["default"] is False for item in fields), "installed evaluator lost nested default")
+            require({item["path"] for item in fields} == {"project", "backend", "apiPort"}, "installed starter schema differs")
+            require(any(item["path"] == "project" and item["required"] for item in fields), "installed evaluator lost required project")
+            require(any(item["path"] == "backend" and item["default"] == "compose" for item in fields), "installed evaluator lost backend default")
+            require(any(item["path"] == "apiPort" and item["default"] == 8080 for item in fields), "installed evaluator lost port default")
             print("PASS latest release HTTP download, exact binary install, and embedded configuration schema")
 
             custom = root / "custom bin"

@@ -5,6 +5,61 @@ use std::fs;
 fn fixture() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     nickel::init(root.path()).unwrap();
+    fs::write(root.path().join("compose.ncl"), r#"
+let lib = import "libs/dockstride.ncl" in
+let configContract = {
+  project | String | doc "Unique lowercase Compose project or Swarm stack name.",
+  backend | lib.Backend | doc "Runtime backend." | default = "compose",
+  apiPort | lib.Port | doc "Host HTTP port." | default = 8080,
+  imagePrefix | String | doc "Image repository prefix; use a reachable registry for Swarm." | default = "dockstride-sample",
+  oauth = {
+    enabled | Bool | default = false,
+    issuer | String | default = "",
+  },
+  secrets = {
+    authKey | lib.SecretSource | doc "Authentication signing key (secret reference, never plaintext).",
+  },
+} in
+let env | configContract = import "env.yaml" in
+let dc = lib.forEnvironment env in
+dc.ComposeFile {
+  dockstride | not_exported = {
+    Config = configContract,
+    setup.secrets.authKey = lib.GenerateSecret {bytes = 32, encoding = "hex"},
+    endpoints.api = "http://localhost:%{env.apiPort}",
+  },
+  secrets = env.secrets,
+  services.api = dc.Service {
+    image = dc.image "api",
+    build.context = "./app",
+    # Explicit numeric identity makes the private 0600 development grant verifiable.
+    # The richer sample demonstrates non-root consumers and mapped-group access.
+    user = "0:0",
+    ports = ["%{env.apiPort}:8000"],
+    secrets = dc.grantSecrets ["authKey"],
+    environment = dc.Env {
+      AUTH_KEY_FILE = dc.secretPath "authKey",
+      OAUTH_ENABLED = env.oauth.enabled,
+      OAUTH_ISSUER = env.oauth.issuer,
+    },
+    healthcheck = {
+      test = ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"],
+      interval = "2s",
+      timeout = "3s",
+      retries = 15,
+      start_period = "3s",
+    },
+    # Rebuild avoids archive-copy remounts of read-only secret binds on rootless Docker.
+    develop.watch = [{action = "rebuild", path = "./app/server.py"}],
+    deploy = {
+      replicas = 1,
+      update_config = {order = "start-first", failure_action = "rollback"},
+      restart_policy.condition = "on-failure",
+    },
+  },
+}
+"#).unwrap();
+    fs::remove_file(root.path().join("env.yaml")).unwrap();
     root
 }
 
@@ -342,4 +397,164 @@ fn deserialized_nested_containers_preserve_merge_invariants() {
         serde_json::to_value(result).unwrap(),
         json!({"a":{"b":1,"items":[2,3]},"x":2})
     );
+}
+
+#[test]
+fn init_creates_minimal_scaffold_and_starter_needs_only_project() {
+    let root = tempfile::tempdir().unwrap();
+    let result = nickel::init(root.path()).unwrap();
+    assert_eq!(
+        result["created"],
+        json!([
+            "compose.ncl",
+            "libs/dockstride.ncl",
+            "env.yaml",
+            ".gitignore"
+        ])
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("env.yaml")).unwrap(),
+        "{}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join(".gitignore")).unwrap(),
+        "/env.yaml\n/.dockstride/\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("libs/dockstride.ncl")).unwrap(),
+        include_str!("../assets/dockstride.ncl")
+    );
+    assert!(!root.path().join("app").exists());
+    let fields = nickel::schema(root.path(), None).unwrap();
+    assert_eq!(
+        fields
+            .iter()
+            .map(|field| field.path.as_str())
+            .collect::<Vec<_>>(),
+        ["apiPort", "backend", "project"]
+    );
+    assert_eq!(
+        nickel::setup_metadata(root.path(), None).unwrap(),
+        json!({"setup":{}})
+    );
+    assert!(nickel::evaluate(root.path(), None).is_err());
+    for candidate in [
+        json!({"project":"hello"}),
+        json!({"project":"hello", "backend":"swarm"}),
+    ] {
+        fs::write(
+            root.path().join("env.yaml"),
+            serde_yaml::to_string(&candidate).unwrap(),
+        )
+        .unwrap();
+        let project = nickel::evaluate(root.path(), None).unwrap();
+        assert_eq!(project.env["apiPort"], 8080);
+        assert_eq!(
+            project.metadata["endpoints"]["hello"],
+            "http://localhost:8080"
+        );
+        assert!(project.metadata.get("setup").is_none());
+        for rendered in [project.compose().unwrap(), project.swarm().unwrap()] {
+            assert!(rendered.get("secrets").is_none());
+            assert!(rendered.get("dockstride").is_none());
+            let service = &rendered["services"]["hello"];
+            assert_eq!(service["image"], "hashicorp/http-echo:1.0.0");
+            assert_eq!(
+                service["command"],
+                json!(["-listen=:5678", "-text=Hello world!"])
+            );
+            assert_eq!(service["ports"], json!(["8080:5678"]));
+            for field in ["build", "develop", "secrets"] {
+                assert!(service.get(field).is_none(), "{field}");
+            }
+        }
+    }
+}
+
+#[test]
+fn init_adds_only_missing_ignore_rules_and_preserves_existing_environment() {
+    for (existing, expected) in [
+        ("", "/env.yaml\n/.dockstride/\n"),
+        (
+            "# keep\n*.log\n",
+            "# keep\n*.log\n/env.yaml\n/.dockstride/\n",
+        ),
+        ("# keep\n*.log", "# keep\n*.log\n/env.yaml\n/.dockstride/\n"),
+        ("/env.yaml\n/.dockstride/\n", "/env.yaml\n/.dockstride/\n"),
+        ("env.yaml\n.dockstride/", "env.yaml\n.dockstride/"),
+        ("env.yaml", "env.yaml\n/.dockstride/\n"),
+        ("/.dockstride/\n", "/.dockstride/\n/env.yaml\n"),
+        ("/env.yaml\n.dockstride/\n", "/env.yaml\n.dockstride/\n"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".gitignore"), existing).unwrap();
+        let env = "# preserve values\nproject: existing\napiPort: 9090\n";
+        fs::write(root.path().join("env.yaml"), env).unwrap();
+        let result = nickel::init(root.path()).unwrap();
+        assert_eq!(
+            result["created"],
+            json!(["compose.ncl", "libs/dockstride.ncl"])
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("env.yaml")).unwrap(),
+            env
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join(".gitignore")).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn init_with_existing_environment_reports_only_new_files() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("env.yaml"), "project: preserved\n").unwrap();
+    let result = nickel::init(root.path()).unwrap();
+    assert_eq!(
+        result["created"],
+        json!(["compose.ncl", "libs/dockstride.ncl", ".gitignore"])
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("env.yaml")).unwrap(),
+        "project: preserved\n"
+    );
+}
+
+#[test]
+fn init_refuses_existing_definition_or_library_without_collateral_mutations() {
+    for existing in ["compose.ncl", "libs/dockstride.ncl"] {
+        for local_files in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join(existing);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "preserved\n").unwrap();
+            if local_files {
+                fs::write(root.path().join("env.yaml"), "project: preserved\n").unwrap();
+                fs::write(root.path().join(".gitignore"), "# preserved").unwrap();
+            }
+            assert!(nickel::init(root.path()).is_err());
+            assert_eq!(fs::read_to_string(path).unwrap(), "preserved\n");
+            let other = if existing == "compose.ncl" {
+                "libs/dockstride.ncl"
+            } else {
+                "compose.ncl"
+            };
+            assert!(!root.path().join(other).exists());
+            assert!(!root.path().join("app").exists());
+            if local_files {
+                assert_eq!(
+                    fs::read_to_string(root.path().join("env.yaml")).unwrap(),
+                    "project: preserved\n"
+                );
+                assert_eq!(
+                    fs::read_to_string(root.path().join(".gitignore")).unwrap(),
+                    "# preserved"
+                );
+            } else {
+                assert!(!root.path().join("env.yaml").exists());
+                assert!(!root.path().join(".gitignore").exists());
+            }
+        }
+    }
 }

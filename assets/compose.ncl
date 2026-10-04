@@ -1,52 +1,25 @@
+# The bundled library keeps backend conversion and validation local and inspectable.
 let lib = import "libs/dockstride.ncl" in
+# Declare editable env.yaml values here; dks setup asks for required values.
 let configContract = {
   project | String | doc "Unique lowercase Compose project or Swarm stack name.",
   backend | lib.Backend | doc "Runtime backend." | default = "compose",
   apiPort | lib.Port | doc "Host HTTP port." | default = 8080,
-  imagePrefix | String | doc "Image repository prefix; use a reachable registry for Swarm." | default = "dockstride-sample",
-  oauth = {
-    enabled | Bool | default = false,
-    issuer | String | default = "",
-  },
-  secrets = {
-    authKey | lib.SecretSource | doc "Authentication signing key (secret reference, never plaintext).",
-  },
 } in
+# Environment values are separate from the checked-in architecture.
 let env | configContract = import "env.yaml" in
 let dc = lib.forEnvironment env in
+# ComposeFile renders the same definition for Compose or Swarm.
 dc.ComposeFile {
+  # Dockstride metadata is available to the CLI but not exported to Docker.
   dockstride | not_exported = {
     Config = configContract,
-    setup.secrets.authKey = lib.GenerateSecret {bytes = 32, encoding = "hex"},
-    endpoints.api = "http://localhost:%{env.apiPort}",
+    endpoints.hello = "http://localhost:%{env.apiPort}",
   },
-  secrets = env.secrets,
-  services.api = dc.Service {
-    image = dc.image "api",
-    build.context = "./app",
-    # Explicit numeric identity makes the private 0600 development grant verifiable.
-    # The richer sample demonstrates non-root consumers and mapped-group access.
-    user = "0:0",
-    ports = ["%{env.apiPort}:8000"],
-    secrets = dc.grantSecrets ["authKey"],
-    environment = dc.Env {
-      AUTH_KEY_FILE = dc.secretPath "authKey",
-      OAUTH_ENABLED = env.oauth.enabled,
-      OAUTH_ISSUER = env.oauth.issuer,
-    },
-    healthcheck = {
-      test = ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"],
-      interval = "2s",
-      timeout = "3s",
-      retries = 15,
-      start_period = "3s",
-    },
-    # Rebuild avoids archive-copy remounts of read-only secret binds on rootless Docker.
-    develop.watch = [{action = "rebuild", path = "./app/server.py"}],
-    deploy = {
-      replicas = 1,
-      update_config = {order = "start-first", failure_action = "rollback"},
-      restart_policy.condition = "on-failure",
-    },
+  # Replace this small prebuilt service with your application's services.
+  services.hello = dc.Service {
+    image = "hashicorp/http-echo:1.0.0",
+    command = ["-listen=:5678", "-text=Hello world!"],
+    ports = ["%{env.apiPort}:5678"],
   },
 }

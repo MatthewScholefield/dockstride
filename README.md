@@ -60,20 +60,21 @@ dks init
 dks dev --trust
 ```
 
-`init` refuses to overwrite existing application files. `dev` fills missing ordinary values, provisions secrets once, validates ownership and ports, builds/starts the declared stack, waits for actual readiness, reports endpoints, and enters declared Compose watch or `dockstride.dev.argv`. `up` performs startup without the foreground development loop.
+`init` creates a commented `compose.ncl` with a small prebuilt hello-world service, the bundled `libs/dockstride.ncl` (no submodule), and an empty `env.yaml` mapping if absent. It preserves existing environment values and `.gitignore` contents, adding missing `env.yaml` and `.dockstride/` ignore rules. It refuses to overwrite the project definition or library and generates no Dockerfile or application source. Only `project` is required; `backend` defaults to `compose` and `apiPort` to `8080`.
+
+`dev` fills missing ordinary values, provisions secrets once, validates ownership and ports, builds/starts the declared stack, waits for actual readiness, reports endpoints, and enters declared Compose watch or `dockstride.dev.argv`. `up` performs startup without the foreground development loop.
 
 ```sh
 dks setup                         # Configure/provision without starting containers
 dks config list
-dks config set oauth.enabled true
+dks config set apiPort 8081
 dks config unset apiPort           # Restore the declared default
 dks render
 dks doctor
 dks up --plan                     # Inspection only; unresolved inputs stay unresolved
 dks up --trust
 dks status
-dks logs -f api
-dks exec api sh
+dks logs -f hello
 dks down                          # Preserve volumes, secrets, allocated endpoints
 dks destroy --plan
 dks destroy --yes                 # Delete only owned application data, not secrets

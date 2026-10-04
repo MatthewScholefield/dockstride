@@ -46,15 +46,47 @@ fn success(root: &Path, args: &[&str]) -> Value {
 
 fn initialized() -> TempDir {
     let dir = TempDir::new().unwrap();
-    success(dir.path(), &["init"]);
+    let result = success(dir.path(), &["init"]);
+    assert_eq!(
+        result["created"],
+        serde_json::json!([
+            "compose.ncl",
+            "libs/dockstride.ncl",
+            "env.yaml",
+            ".gitignore"
+        ])
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("env.yaml")).unwrap(),
+        "{}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        "/env.yaml\n/.dockstride/\n"
+    );
+    assert!(dir.path().join("compose.ncl").is_file());
+    assert!(dir.path().join("libs/dockstride.ncl").is_file());
+    assert!(!dir.path().join("app").exists());
     dir
 }
 
 #[test]
-fn schema_and_plan_work_before_environment_without_publishing_configuration() {
+fn schema_and_plan_work_with_empty_environment_without_publishing_configuration() {
     let dir = initialized();
     let schema = success(dir.path(), &["config", "schema"]);
     let fields = schema["fields"].as_array().unwrap();
+    assert_eq!(
+        fields
+            .iter()
+            .map(|field| field["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["apiPort", "backend", "project"]
+    );
+    assert!(
+        fields
+            .iter()
+            .any(|field| field["path"] == "apiPort" && field["default"] == 8080)
+    );
     assert!(
         fields
             .iter()
@@ -68,7 +100,10 @@ fn schema_and_plan_work_before_environment_without_publishing_configuration() {
     let plan = success(dir.path(), &["up", "--plan"]);
     assert_eq!(plan["sideEffects"], false);
     assert!(plan.get("unresolved").is_some());
-    assert!(!dir.path().join("env.yaml").exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("env.yaml")).unwrap(),
+        "{}\n"
+    );
 }
 
 #[test]
@@ -139,18 +174,27 @@ fn managed_execution_requires_consent_before_setup_and_unknown_commands_are_not_
     let output = cli(dir.path(), &["up"]);
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(terminal(&output)["category"], "consent");
-    assert!(!dir.path().join("env.yaml").exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("env.yaml")).unwrap(),
+        "{}\n"
+    );
     let output = cli(dir.path(), &["definitely-not-a-docker-command"]);
     assert!(!output.status.success());
-    assert!(!dir.path().join("env.yaml").exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("env.yaml")).unwrap(),
+        "{}\n"
+    );
 }
 
 #[test]
 fn structured_failure_retains_the_engine_diagnostic_without_unbounded_history() {
     use std::os::unix::fs::PermissionsExt;
     let dir = initialized();
-    fs::write(dir.path().join("env.yaml"),
-        "project: stderr-contract\nbackend: swarm\nsecrets:\n  authKey:\n    external: true\n    name: existing-key\n").unwrap();
+    fs::write(
+        dir.path().join("env.yaml"),
+        "project: stderr-contract\nbackend: swarm\n",
+    )
+    .unwrap();
     let bin = dir.path().join("bin");
     fs::create_dir(&bin).unwrap();
     let docker = bin.join("docker");
@@ -197,4 +241,24 @@ esac
     );
     assert!(!message.contains("OBSOLETE_DIAGNOSTIC"));
     assert!(message.len() < 132_000);
+}
+
+#[test]
+fn starter_renders_with_only_project_configured() {
+    let dir = initialized();
+    success(dir.path(), &["config", "set", "project", "hello-cli"]);
+    for target in ["compose", "swarm"] {
+        let rendered = success(dir.path(), &["render", "--target", target]);
+        assert_eq!(
+            rendered["services"]["hello"]["image"],
+            "hashicorp/http-echo:1.0.0"
+        );
+        assert_eq!(
+            rendered["services"]["hello"]["ports"],
+            serde_json::json!(["8080:5678"])
+        );
+        assert!(rendered.get("secrets").is_none());
+        assert!(rendered["services"]["hello"].get("build").is_none());
+        assert!(rendered["services"]["hello"].get("develop").is_none());
+    }
 }

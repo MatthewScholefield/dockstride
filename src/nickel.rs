@@ -311,8 +311,6 @@ pub fn init(root: &Path) -> Result<Value> {
             "libs/dockstride.ncl",
             include_str!("../assets/dockstride.ncl"),
         ),
-        ("app/Dockerfile", include_str!("../assets/Dockerfile")),
-        ("app/server.py", include_str!("../assets/server.py")),
     ];
     for (name, _) in &files {
         if root.join(name).exists() {
@@ -322,6 +320,7 @@ pub fn init(root: &Path) -> Result<Value> {
             );
         }
     }
+    let mut created = Vec::new();
     for (name, content) in files {
         let path = root.join(name);
         fs::create_dir_all(path.parent().unwrap())?;
@@ -331,9 +330,21 @@ pub fn init(root: &Path) -> Result<Value> {
             .open(path)?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
+        created.push(name);
+    }
+    let env = root.join("env.yaml");
+    if !env.exists() {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(env)?;
+        file.write_all(b"{}\n")?;
+        file.sync_all()?;
+        created.push("env.yaml");
     }
     let ignore = root.join(".gitignore");
-    let existing = if ignore.exists() {
+    let ignore_exists = ignore.exists();
+    let existing = if ignore_exists {
         fs::read_to_string(&ignore)?
     } else {
         String::new()
@@ -342,15 +353,25 @@ pub fn init(root: &Path) -> Result<Value> {
         .create(true)
         .append(true)
         .open(ignore)?;
-    if !existing.is_empty() && !existing.ends_with('\n') {
+    let missing: Vec<_> = ["/env.yaml", "/.dockstride/"]
+        .into_iter()
+        .filter(|pattern| {
+            !existing
+                .lines()
+                .any(|line| line == *pattern || line == &pattern[1..])
+        })
+        .collect();
+    if !missing.is_empty() && !existing.is_empty() && !existing.ends_with('\n') {
         writeln!(file)?;
     }
-    for pattern in ["/env.yaml", "/.dockstride/"] {
-        if !existing.lines().any(|line| line == pattern) {
-            writeln!(file, "{pattern}")?;
-        }
+    for pattern in missing {
+        writeln!(file, "{pattern}")?;
+    }
+    file.sync_all()?;
+    if !ignore_exists {
+        created.push(".gitignore");
     }
     Ok(
-        json!({"created":["compose.ncl","libs/dockstride.ncl","app/Dockerfile","app/server.py"],"evaluator":EVALUATOR_VERSION,"library":LIBRARY_VERSION,"next":"dks setup"}),
+        json!({"created":created,"evaluator":EVALUATOR_VERSION,"library":LIBRARY_VERSION,"next":"dks setup"}),
     )
 }
