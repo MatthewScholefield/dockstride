@@ -35,15 +35,18 @@ fn selection_must_exist_even_for_readonly_plans() {
 }
 
 #[test]
-fn a_compose_prerequisite_is_not_silently_reinterpreted_in_production() {
-    let project = project(
-        json!({"image":"registry.example/api"}),
-        json!({"actions":[{
-            "name":"migration","workflows":["deploy"],"services":["api"],"kind":"run","service":"api"
-        }]}),
-    );
-    let error = deploy::deploy(&project, &["api".into()], true, 5, &output()).unwrap_err();
-    assert!(error.to_string().contains("Swarm migration semantics"));
+fn compose_actions_are_rejected_before_swarm_publication() {
+    for action in [
+        json!({"name":"migration","workflows":["deploy"],"services":["api"],"kind":"run","service":"api"}),
+        json!({"name":"stop","workflows":["deploy"],"kind":"stop","targets":["api"]}),
+        json!({"name":"migration","workflows":["deploy"],"kind":"prerequisite","service":"api","fresh":true}),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut project = project(json!({"image":"registry.example/api"}), json!({"actions":[action],"oneshots":["api"]}));
+        project.root = directory.path().to_owned();
+        assert!(deploy::deploy(&project, &["api".into()], true, 5, &output()).is_err());
+        assert!(!directory.path().join(".dockstride").exists());
+    }
 }
 
 #[test]

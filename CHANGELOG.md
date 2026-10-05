@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Named, argv-only project commands with lazy bootstrap discovery, pinned Docker context, bounded JSON capture, and manual `dks run NAME` execution.
+- Live recursive ordinary-settings sources with provenance, validated local/shared edits, and once-per-invocation missing-value defaults discovery. Explicit empty source selections disable discovery.
+- One cross-cutting mutation lock hierarchy; fingerprint-bound snapshots and unlocked editor execution prevent deadlocks and lost concurrent local/shared updates.
+- Recoverable ordinary-file publication for shared-source creation, settings, and allocations; pending intents retain conservative blockers and external edits are preserved as recoverable conflicts.
+- Saved environment registry, Git worktree discovery, stopped-checkout daemon/project collision enforcement, and explicit resource-safe registration forgetting.
+- Versioned generated/explicit endpoint provenance, invoking-only legacy reconciliation, journaled `ports release`, and conservative recorded-target reservation GC. Required native port fields can be filled during initial setup and after reset without transient placeholder configuration.
+- Native Compose stop/fresh-prerequisite actions with validated dependency scope, exact completion-ID reuse, dependency-ordered `--no-deps` startup, safe consumer restoration, and one lifecycle deadline. Failure/cancellation retains data and logs without resuming stopped consumers or seeding; secret-rotation actions preflight before reference publication.
+- Strict bounded Compose/Swarm status with complete success/failure reports, once-per-service application checks, required dependency/profile scope, saved applied profiles, replica/rollout and successful-task verification, and explicit inspection-only mode.
+- Swarm task containers receive ownership labels; existing unlabeled tasks require exact container/task/service ID linkage to an owned service. Owned sparse Compose rendering no longer creates invalid null resource sections.
+- Validated read-only diagnostic hooks and explicit doctor execution share one bounded phase, forward only verified resource IDs and native secret references, preserve original startup failures, and return inert findings/suggestions or secondary hook failures.
+- Explicit imported-secret synchronization records private canonical file provenance and keyed digests, skips proven unchanged inputs, handles legacy Compose/Swarm baselines honestly, and preserves committed storage after application failure. GC protects registered cross-checkout source paths, aliases, and retained snapshots with fail-closed evidence revalidation.
+- Pin the embedded/sample/reference-consumer library snapshot to 0.2.0. Voxellum uses data-only primary-worktree defaults, native shared preferences/provider inputs, native fresh migrations, read-only service-network PostgreSQL diagnostics, and explicit real-registry E2E retirement.
+- Disappearing Swarm tasks invalidate the entire observation rather than aborting a healthy rollout or claiming stale/zero-task readiness; convergence retains its existing deadline and other Docker failures remain fatal.
+- Owned Swarm network teardown handles exact immutable-ID disappearance without hiding backend failures; known absent removal stops repeated deletion requests and waits for actual inspected absence under the original deadline. Ownership and named-volume recreation checks remain enforced.
+- Expand real consumer smoke coverage and ownership-verified DIND failure retirement. Private bind storage honors `TMPDIR`; unknown nodes or failed native teardown retain recovery state instead of hiding claims or pruning host Docker storage.
+
 ## 0.1.0
 
 Dockstride's first release provides one inspectable project convention from editable configuration to Compose development and Swarm deployment.

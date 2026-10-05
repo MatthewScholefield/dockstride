@@ -1,4 +1,4 @@
-# Dockstride library 0.1.0 — embedded evaluator nickel-lang-core 0.19.0.
+# Dockstride library 0.2.0 — embedded evaluator nickel-lang-core 0.19.0.
 # This file is checked in with the application; evaluation never downloads code.
 # Config annotations are the schema. Advanced contracts stay Nickel's responsibility.
 let choiceContract = fun choices => std.contract.from_predicate (fun value =>
@@ -47,7 +47,7 @@ let swarm = fun canonical =>
         checked.services,
   } in
 {
-  libraryVersion = "0.1.0",
+  libraryVersion = "0.2.0",
   evaluatorVersion = "0.19.0",
   Choice = choiceContract,
   Backend = backendContract,
@@ -81,6 +81,8 @@ let swarm = fun canonical =>
       } in
       let rendered = if env.backend == "swarm" then swarm canonicalModel else canonicalModel in
       rendered & {
+        # commands/setup.defaults/diagnostics remain CLI-only metadata; they never
+        # leak into Docker exports or force services during bootstrap discovery.
         dockstride | not_exported = input.dockstride & {
           canonical | not_exported = canonicalModel,
         },

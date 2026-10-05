@@ -1,4 +1,4 @@
-use dockstride::{config, state};
+use dockstride::{config, publication, state};
 use serde_json::{Value, json};
 use std::fs;
 use std::sync::{Arc, Barrier};
@@ -28,6 +28,16 @@ let env | configContract = import "env.yaml" in
     )
     .unwrap();
     directory
+}
+
+fn fixture_docker(root: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.join("test-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let docker = bin.join("docker");
+    fs::write(&docker, "#!/bin/sh\ncase \"$1\" in\n info) printf 'config-fixture-daemon\\n';;\n *) exit 0;;\nesac\n").unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
+    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
 }
 
 fn field(list: &Value, path: &str) -> Value {
@@ -317,7 +327,7 @@ fn record_replacement_cannot_remove_required_inputs_from_complete_environment() 
 }
 
 #[test]
-fn lifecycle_lock_serializes_identity_edits_but_not_port_updates() {
+fn lifecycle_lock_serializes_configuration_publication_and_identity_checks() {
     let directory = fixture();
     let root = directory.path();
     config::setup(
@@ -326,34 +336,44 @@ fn lifecycle_lock_serializes_identity_edits_but_not_port_updates() {
         true,
     )
     .unwrap();
+    let home = root.join("isolated-home");
+    fs::create_dir(&home).unwrap();
+    let path = fixture_docker(root);
     let lifecycle = state::lock(root, "lifecycle").unwrap();
     let identity_root = root.to_owned();
+    let identity_home = home.clone();
+    let identity_path = path.clone();
     let (identity_tx, identity_rx) = std::sync::mpsc::channel();
     let identity_thread = std::thread::spawn(move || {
         identity_tx
-            .send(config::set(&identity_root, "project", json!("other")))
-            .unwrap();
+            .send(std::process::Command::new(env!("CARGO_BIN_EXE_dks"))
+                .args(["--json", "--non-interactive", "-C"]).arg(identity_root)
+                .args(["config", "set", "project", "other"])
+                .env("PATH", identity_path).env_remove("DOCKER_CONTEXT")
+                .env("DOCKER_HOST", "unix:///config-fixture.sock")
+                .env("HOME", identity_home).output().unwrap().status.success()).unwrap();
     });
     let port_root = root.to_owned();
+    let port_home = home;
     let (port_tx, port_rx) = std::sync::mpsc::channel();
     let port_thread = std::thread::spawn(move || {
         port_tx
-            .send(config::set(&port_root, "apiPort", json!(9091)))
-            .unwrap();
+            .send(std::process::Command::new(env!("CARGO_BIN_EXE_dks"))
+                .args(["--json", "--non-interactive", "-C"]).arg(port_root)
+                .args(["config", "set", "apiPort", "9091"])
+                .env("PATH", path).env_remove("DOCKER_CONTEXT")
+                .env("DOCKER_HOST", "unix:///config-fixture.sock")
+                .env("HOME", port_home).output().unwrap().status.success()).unwrap();
     });
-    let port_result = port_rx.recv_timeout(std::time::Duration::from_secs(5));
-    state::ensure_identity(root, "app", "compose", "default").unwrap();
+    let port_blocked = port_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err();
+    state::ensure_identity(root, "app", "compose", "host;DOCKER_HOST=unix:///config-fixture.sock").unwrap();
     state::mark_resources(root, true).unwrap();
     drop(lifecycle);
-    port_result.unwrap().unwrap();
-    assert!(
-        identity_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap()
-            .is_err()
-    );
+    assert!(port_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+    assert!(!identity_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
     port_thread.join().unwrap();
     identity_thread.join().unwrap();
+    assert!(port_blocked, "configuration changed while lifecycle work held its guard");
     assert_eq!(config::get(root, "project").unwrap()["value"], "app");
     assert_eq!(config::get(root, "apiPort").unwrap()["value"], 9091);
 }
@@ -401,12 +421,13 @@ if [ "$1" = "--context" ]; then
 elif [ "$1" != "context" ]; then
   exit 22
 fi
+if [ "$1" = "context" ] && [ "$2" = "show" ]; then printf 'fixture\n'; exit 0; fi
 if [ "$1" = "context" ] && [ "$2" = "inspect" ]; then
   [ "$3" = "fixture" ] || exit 23
   printf '%s\n' "$FIXTURE_DOCKER_ENDPOINT"
   exit 0
 fi
-case "$1" in ps|volume|network) exit 0;; *) exit 24;; esac
+case "$1" in info) printf 'config-fixture-daemon\n';; ps|volume|network) exit 0;; *) exit 24;; esac
 "#,
     )
     .unwrap();
@@ -423,6 +444,7 @@ case "$1" in ps|volume|network) exit 0;; *) exit 24;; esac
                 name,
             ])
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HOME", root.join("isolated-home"))
             .env_remove("DOCKER_CONTEXT")
             .env_remove("DOCKER_HOST")
             .env("FIXTURE_DOCKER_ENDPOINT", endpoint)
@@ -465,7 +487,7 @@ fn state_inspection_rejects_symlinks_and_does_not_create_absent_state() {
 }
 
 #[test]
-fn transition_probe_pins_recorded_host_and_tls_instead_of_current_context() {
+fn transition_probe_pins_previous_host_and_tls_but_cannot_transfer_to_current_context() {
     use std::os::unix::fs::PermissionsExt;
     let directory = fixture();
     let root = directory.path();
@@ -492,7 +514,7 @@ fn transition_probe_pins_recorded_host_and_tls_instead_of_current_context() {
 [ "$DOCKER_HOST" = "tcp://original-host:2376" ] || exit 32
 [ "$DOCKER_TLS_VERIFY" = "1" ] || exit 33
 [ "$DOCKER_CERT_PATH" = "/fixture/certs" ] || exit 34
-case "$1" in ps|volume|network) exit 0;; *) exit 35;; esac
+case "$1" in info) printf 'config-fixture-daemon\n';; ps|volume|network) exit 0;; *) exit 35;; esac
 "#,
     )
     .unwrap();
@@ -508,6 +530,7 @@ case "$1" in ps|volume|network) exit 0;; *) exit 35;; esac
             "new-app",
         ])
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("HOME", root.join("isolated-home"))
         .env("DOCKER_CONTEXT", "different-context")
         .env("DOCKER_HOST", "tcp://different-host:2376")
         .env("DOCKER_TLS_VERIFY", "1")
@@ -515,11 +538,11 @@ case "$1" in ps|volume|network) exit 0;; *) exit 35;; esac
         .output()
         .unwrap();
     assert!(
-        changed.status.success(),
+        !changed.status.success(),
         "{}",
         String::from_utf8_lossy(&changed.stderr)
     );
-    assert_eq!(config::get(root, "project").unwrap()["value"], "new-app");
+    assert_eq!(config::get(root, "project").unwrap()["value"], "app");
 }
 
 #[test]
@@ -548,4 +571,382 @@ fn flow_root_mapping_edits_preserve_data_and_comments_instead_of_appending_a_sec
             assert!(text.contains(comment), "{text}");
         }
     }
+}
+
+#[test]
+fn recursive_live_layers_replace_units_and_record_winning_and_overridden_origins() {
+    let directory = fixture();
+    let root = directory.path();
+    fs::create_dir(root.join("shared")).unwrap();
+    fs::write(root.join("base.yaml"),"oauth: {enabled: true, issuer: base}\nitems: [one, two]\nnullable: base\n").unwrap();
+    fs::write(root.join("shared/layer.yaml"),"_dockstride:\n  sources: [{path: ../base.yaml}]\noauth: {issuer: inherited}\nitems: [three]\nnullable: null\n").unwrap();
+    fs::write(root.join("env.yaml"),"_dockstride:\n  sources: [{path: shared/layer.yaml}]\nproject: local\noauth: {enabled: false}\n").unwrap();
+    let snapshot = dockstride::sources::snapshot(root,None).unwrap();
+    assert_eq!(snapshot.values,json!({"project":"local","oauth":{"enabled":false,"issuer":"inherited"},"items":["three"],"nullable":null}));
+    let issuer = &snapshot.provenance["oauth.issuer"];
+    assert_eq!(issuer.file,fs::canonicalize(root.join("shared/layer.yaml")).unwrap());
+    assert_eq!(issuer.overridden[0].file,fs::canonicalize(root.join("base.yaml")).unwrap());
+    assert_eq!(snapshot.provenance["oauth.enabled"].file,root.join("env.yaml"));
+    fs::write(root.join("base.yaml"),"oauth: {enabled: true, issuer: changed}\nitems: [new]\nnullable: different\n").unwrap();
+    assert!(snapshot.verify().is_err());
+    fs::write(root.join("shared/layer.yaml"),"_dockstride:\n  sources: [{path: ../base.yaml}]\n").unwrap();
+    assert_eq!(dockstride::sources::snapshot(root,None).unwrap().values["oauth"]["issuer"],"changed");
+}
+
+#[test]
+fn missing_cycle_and_shared_secret_sources_fail_with_paths() {
+    let directory = fixture();
+    let root = directory.path();
+    fs::write(root.join("env.yaml"),"_dockstride:\n  sources: [{path: absent.yaml}]\n").unwrap();
+    let error = format!("{:#}",dockstride::sources::snapshot(root,None).unwrap_err());
+    assert!(error.contains("absent.yaml") && error.contains("env.yaml"),"{error}");
+    fs::write(root.join("a.yaml"),"_dockstride:\n  sources: [{path: b.yaml}]\n").unwrap();
+    fs::write(root.join("b.yaml"),"_dockstride:\n  sources: [{path: a.yaml}]\n").unwrap();
+    fs::write(root.join("env.yaml"),"_dockstride:\n  sources: [{path: a.yaml}]\n").unwrap();
+    let error = format!("{:#}",dockstride::sources::snapshot(root,None).unwrap_err());
+    assert!(error.contains("cycle") && error.contains("a.yaml") && error.contains("b.yaml"),"{error}");
+    fs::write(root.join("a.yaml"),"secrets:\n  token: {file: /private/reference}\n").unwrap();
+    let error = format!("{:#}",dockstride::sources::snapshot(root,None).unwrap_err());
+    assert!(error.contains("a.yaml") && error.contains("checkout-local"),"{error}");
+}
+
+#[test]
+fn shared_changes_are_live_local_unset_reveals_inheritance_and_comments_survive() {
+    let first = fixture();
+    let second = fixture();
+    let source = first.path().join("settings.yaml");
+    fs::write(&source,"# ordinary preferences\napiPort: 8181 # host port\n").unwrap();
+    for root in [first.path(),second.path()] {
+        fs::write(root.join("env.yaml"),"project: shared-test\noauth: {issuer: example}\n").unwrap();
+        config::sources_add(root,&source,false).unwrap();
+    }
+    config::set_shared(first.path(),"apiPort",json!(8282),None).unwrap();
+    assert_eq!(config::get(second.path(),"apiPort").unwrap()["value"],8282);
+    assert_eq!(fs::read_to_string(&source).unwrap(),"# ordinary preferences\napiPort: 8282 # host port\n");
+    config::set(second.path(),"apiPort",json!(8383)).unwrap();
+    let local = config::get(second.path(),"apiPort").unwrap();
+    assert_eq!(local["origin"],"env.yaml");
+    assert_eq!(local["provenance"]["overridden"][0]["file"],json!(source));
+    config::unset(second.path(),"apiPort").unwrap();
+    assert_eq!(config::get(second.path(),"apiPort").unwrap()["value"],8282);
+    let before = fs::read_to_string(&source).unwrap();
+    assert!(config::set_shared(first.path(),"apiPort",json!("wrong"),None).is_err());
+    assert_eq!(fs::read_to_string(&source).unwrap(),before);
+    assert!(config::read_env(second.path()).unwrap().get("apiPort").is_none());
+    assert_eq!(dockstride::nickel::evaluate(second.path(),None).unwrap().env["apiPort"],8282);
+}
+
+#[test]
+fn source_edit_targets_are_direct_explicit_and_empty_selection_persists() {
+    let directory = fixture();
+    let root = directory.path();
+    fs::write(root.join("env.yaml"),"project: source-edit\noauth: {issuer: example}\n").unwrap();
+    fs::write(root.join("transitive.yaml"),"apiPort: 9191\n").unwrap();
+    fs::write(root.join("first.yaml"),"_dockstride:\n  sources: [{path: transitive.yaml}]\n").unwrap();
+    config::sources_add(root,std::path::Path::new("first.yaml"),false).unwrap();
+    config::sources_add(root,std::path::Path::new("second.yaml"),true).unwrap();
+    assert_eq!(fs::read_to_string(root.join("second.yaml")).unwrap(),"{}\n");
+    assert!(config::set_shared(root,"apiPort",json!(9292),None).is_err());
+    assert!(config::set_shared(root,"apiPort",json!(9292),Some(std::path::Path::new("transitive.yaml"))).is_err());
+    config::set_shared(root,"apiPort",json!(9292),Some(std::path::Path::new("second.yaml"))).unwrap();
+    assert_eq!(config::get(root,"apiPort").unwrap()["value"],9292);
+    config::sources_remove(root,std::path::Path::new("second.yaml")).unwrap();
+    assert_eq!(config::get(root,"apiPort").unwrap()["value"],9191);
+    config::sources_remove(root,std::path::Path::new("first.yaml")).unwrap();
+    assert_eq!(config::read_env(root).unwrap()["_dockstride"]["sources"],json!([]));
+    assert_eq!(config::get(root,"apiPort").unwrap()["origin"],"default");
+    assert!(root.join("first.yaml").exists() && root.join("second.yaml").exists());
+}
+
+fn defaults_fixture(script: &str) -> TempDir {
+    let directory = fixture();
+    let definition = fs::read_to_string(directory.path().join("compose.ncl")).unwrap();
+    fs::write(directory.path().join("compose.ncl"),definition.replace(
+        "dockstride | not_exported = { Config = configContract }",
+        "dockstride | not_exported = { Config = configContract, commands.defaults.argv = [\"python3\", \"defaults.py\"], setup.defaults = {command = \"defaults\", fields = [\"project\"], sources = true} }",
+    )).unwrap();
+    fs::write(directory.path().join("defaults.py"),script).unwrap();
+    directory
+}
+
+#[test]
+fn setup_resolves_proposed_sources_before_gaps_and_never_flattens_them() {
+    let directory = defaults_fixture(r#"import json,sys
+json.load(sys.stdin)
+with open('calls','a') as f: f.write('run\n')
+print(json.dumps({'schemaVersion':1,'values':{'project':'generated'},'sources':[{'path':'shared.yaml'}]}))
+"#);
+    let root = directory.path();
+    fs::write(root.join("shared.yaml"),"project: inherited\noauth: {issuer: source-issuer}\n").unwrap();
+    assert_eq!(config::setup(root,&[],true).unwrap()["complete"],true);
+    assert!(config::read_env(root).unwrap().get("project").is_none());
+    assert_eq!(config::get(root,"project").unwrap()["value"],"inherited");
+    config::setup(root,&[],true).unwrap();
+    assert_eq!(fs::read_to_string(root.join("calls")).unwrap(),"run\n");
+}
+
+#[test]
+fn invalid_generated_candidate_creates_no_source_or_hook_values() {
+    let directory = defaults_fixture(r#"import json,sys
+json.load(sys.stdin)
+print(json.dumps({'schemaVersion':1,'values':{'project':27},'sources':[{'path':'new.yaml','createIfMissing':True}]}))
+"#);
+    let root = directory.path();
+    let original = "# explicit settings\noauth: {issuer: example}\n";
+    fs::write(root.join("env.yaml"),original).unwrap();
+    assert!(config::setup(root,&[],true).is_err());
+    assert!(!root.join("new.yaml").exists());
+    assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(),original);
+}
+
+#[test]
+fn reads_render_and_plan_do_not_run_defaults_and_explicit_empty_sources_disable_discovery() {
+    let directory = defaults_fixture("raise RuntimeError('must not run')\n");
+    let root = directory.path();
+    fs::write(root.join("env.yaml"),"project: explicit\noauth: {issuer: example}\n").unwrap();
+    config::list(root).unwrap();
+    config::get(root,"project").unwrap();
+    dockstride::nickel::evaluate(root,None).unwrap();
+    let candidate = config::setup_plan_candidate(root,&["_dockstride.sources=[]".into()]).unwrap();
+    assert_eq!(dockstride::defaults::plan(root,&candidate).unwrap()["wouldRun"],false);
+    config::setup(root,&["_dockstride.sources=[]".into()],true).unwrap();
+    assert_eq!(config::read_env(root).unwrap()["_dockstride"]["sources"],json!([]));
+}
+
+#[test]
+fn concurrent_supplied_values_win_without_rerunning_the_hook() {
+    let directory = defaults_fixture(r#"import json,sys
+from pathlib import Path
+json.load(sys.stdin)
+with open('calls','a') as f: f.write('run\n')
+# Simulate another publisher during the unlocked command execution.
+Path('env.yaml').write_text('project: concurrent\noauth: {issuer: concurrent-issuer}\n_dockstride: {sources: []}\n')
+print(json.dumps({'schemaVersion':1,'values':{'project':'generated'},'sources':[]}))
+"#);
+    let root = directory.path();
+    config::setup(root,&[],true).unwrap();
+    assert_eq!(config::get(root,"project").unwrap()["value"],"concurrent");
+    assert_eq!(fs::read_to_string(root.join("calls")).unwrap(),"run\n");
+}
+
+#[test]
+fn generated_values_rediscover_conditional_requirements_and_keep_incremental_progress() {
+    let directory = defaults_fixture(r#"import json,sys
+json.load(sys.stdin)
+with open('calls','a') as f: f.write('run\n')
+print(json.dumps({'schemaVersion':1,'values':{'project':'generated'},'sources':[]}))
+"#);
+    let root = directory.path();
+    fs::write(root.join("compose.ncl"),r#"
+let input = import "env.yaml" in
+let configContract = {project | String, backend | String | default = "compose"} &
+  (if std.record.has_field "project" input then {flavor | String} else {}) in
+let env | configContract = input in
+{
+  dockstride | not_exported = {
+    Config = configContract,
+    commands.defaults.argv = ["python3", "defaults.py"],
+    setup.defaults = {command = "defaults", fields = ["project"], sources = true},
+  },
+  name = env.project,
+  services.api.image = env.flavor,
+}
+"#).unwrap();
+    let error = config::setup(root,&[],true).unwrap_err();
+    let missing = error.downcast_ref::<config::MissingInputs>().unwrap();
+    assert!(missing.fields.iter().any(|field| field.path == "flavor"));
+    assert_eq!(config::read_env(root).unwrap()["project"],"generated");
+    config::setup(root,&["flavor=nginx:alpine".into()],true).unwrap();
+    assert_eq!(dockstride::nickel::evaluate(root,None).unwrap().model["services"]["api"]["image"],"nginx:alpine");
+    assert_eq!(fs::read_to_string(root.join("calls")).unwrap(),"run\n");
+}
+
+#[test]
+fn editor_can_publish_concurrently_but_cannot_overwrite_the_new_configuration() {
+    for shared in [false, true] {
+        let directory = fixture();
+        let root = directory.path();
+        let home = root.join("home");
+        fs::create_dir(&home).unwrap();
+        let path = fixture_docker(root);
+        fs::write(
+            root.join("env.yaml"),
+            if shared {
+                "project: app\noauth: {issuer: example}\n_dockstride: {sources: [{path: shared.yaml}]}\n"
+            } else {
+                "project: app\noauth: {issuer: example}\napiPort: 8080\n"
+            },
+        )
+        .unwrap();
+        if shared {
+            fs::write(root.join("shared.yaml"), "apiPort: 8080\n").unwrap();
+        }
+        let script = root.join("editor.py");
+        fs::write(
+            &script,
+            r#"import os, pathlib, subprocess, sys
+args = [os.environ["DKS_BINARY"], "--json", "--non-interactive", "-C", os.environ["EDIT_ROOT"], "config", "set", "apiPort", "9091"]
+if os.environ["EDIT_SHARED"] == "true":
+    args.append("--shared")
+subprocess.run(args, check=True, capture_output=True, timeout=20)
+path = pathlib.Path(sys.argv[1])
+path.write_text(path.read_text().replace("8080", "8181"))
+"#,
+        )
+        .unwrap();
+        // The editor entry point requires terminal stdin and human output.
+        // Give only this subprocess a PTY; do not alter the test process's env.
+        let mut command = std::process::Command::new("python3");
+        command
+            .args(["-c", r#"import os, pty, subprocess, sys
+master, slave = pty.openpty()
+try:
+    result = subprocess.run([sys.argv[1], "--no-color", "-C", sys.argv[2], "config", "edit"] + sys.argv[3:], stdin=slave, capture_output=True, timeout=30)
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    sys.exit(result.returncode)
+finally:
+    os.close(slave)
+    os.close(master)
+"#])
+            .arg(env!("CARGO_BIN_EXE_dks"))
+            .arg(root)
+            .env("HOME", &home)
+            .env("PATH", &path).env_remove("DOCKER_CONTEXT")
+            .env("DOCKER_HOST", "unix:///config-fixture.sock")
+            .env("EDITOR", format!("python3 {}", script.display()))
+            .env("DKS_BINARY", env!("CARGO_BIN_EXE_dks"))
+            .env("EDIT_ROOT", root)
+            .env("EDIT_SHARED", shared.to_string());
+        if shared {
+            command.arg("--shared");
+        }
+        let result = command.output().unwrap();
+        assert!(!result.status.success(), "stale editor publication succeeded");
+        let output = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            output.contains("configuration or shared sources changed")
+                || String::from_utf8_lossy(&result.stderr).contains("configuration or shared sources changed"),
+            "editor must run unlocked and reject its stale snapshot: {output}; {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(config::get(root, "apiPort").unwrap()["value"], 9091);
+        let target = if shared { "shared.yaml" } else { "env.yaml" };
+        assert!(!fs::read_to_string(root.join(target)).unwrap().contains("8181"));
+    }
+}
+
+#[test]
+fn interrupted_source_and_setup_publications_recover_without_overwriting_edits() {
+    let directory = tempfile::tempdir().unwrap();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "config_publication_recovery_worker", "--nocapture"])
+        .env("DKS_CONFIG_PUBLICATION_HOME", directory.path())
+        .env("HOME", directory.path())
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+}
+
+#[test]
+fn config_publication_recovery_worker() {
+    use std::os::unix::fs::PermissionsExt;
+    if std::env::var_os("DKS_CONFIG_PUBLICATION_HOME").is_none() {
+        return;
+    }
+    let directory = fixture();
+    let root = directory.path();
+    let source = root.join("shared.yaml");
+    let recovered = "# retained by recovery\nproject: recovered-project\noauth:\n  issuer: example\n_dockstride:\n  sources:\n    - path: shared.yaml\n";
+    {
+        let _lifecycle = state::lock(root, "lifecycle").unwrap();
+        let _global = state::global_lock().unwrap();
+        let _config = state::lock(root, "config").unwrap();
+        publication::stage_locked(root, "setup", vec![
+            publication::Change::create(&source, b"{}\n", 0o600).unwrap(),
+            publication::Change::replace(&root.join("env.yaml"), recovered.as_bytes(), 0o600).unwrap(),
+        ], json!({})).unwrap();
+    }
+    // Neither inspection nor a plan completes a staged operation or exposes its payload.
+    let summary = config::sources_list(root).unwrap();
+    assert_eq!(summary["pending"]["pending"], true);
+    assert!(!serde_json::to_string(&summary["pending"]).unwrap().contains("recovered-project"));
+    config::setup_plan_candidate(root, &[]).unwrap();
+    assert!(!source.exists());
+    assert!(!root.join("env.yaml").exists());
+    // Simulate interruption after the first create, before local selection publication.
+    fs::write(&source, "{}\n").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+    let model = fs::read_to_string(root.join("compose.ncl")).unwrap();
+    fs::write(root.join("compose.ncl"), model.replace(
+        "dockstride | not_exported = { Config = configContract }",
+        "dockstride | not_exported = { Config = configContract, commands.defaults.argv = [\"cat\", \"invalid-response.json\"], setup.defaults = { command = \"defaults\", fields = [\"project\"], sources = true } }",
+    )).unwrap();
+    fs::write(root.join("invalid-response.json"), "invalid hook output").unwrap();
+    // Recovery must precede defaults discovery: the recovered values/selection
+    // satisfy the hook, so the intentionally invalid command is never needed.
+    config::setup(root, &[], true).unwrap();
+    assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), recovered);
+    assert_eq!(config::get(root, "project").unwrap()["value"], "recovered-project");
+    assert_eq!(config::sources_list(root).unwrap()["sources"][0]["resolved"], json!(source));
+
+    let directory = fixture();
+    let root = directory.path();
+    let source = root.join("new-source.yaml");
+    let original = "# original\nproject: app\noauth:\n  issuer: example\n";
+    fs::write(root.join("env.yaml"), original).unwrap();
+    let selected = format!("{original}_dockstride:\n  sources:\n    - path: new-source.yaml\n");
+    {
+        let _lifecycle = state::lock(root, "lifecycle").unwrap();
+        let _global = state::global_lock().unwrap();
+        let _config = state::lock(root, "config").unwrap();
+        publication::stage_locked(root, "config-sources", vec![
+            publication::Change::create(&source, b"{}\n", 0o600).unwrap(),
+            publication::Change::replace(&root.join("env.yaml"), selected.as_bytes(), 0o600).unwrap(),
+        ], json!({})).unwrap();
+    }
+    fs::write(&source, "# external winner\napiPort: 9191\n").unwrap();
+    assert!(config::sources_add(root, &root.join("another.yaml"), true).is_err());
+    assert_eq!(fs::read_to_string(&source).unwrap(), "# external winner\napiPort: 9191\n");
+    assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), original);
+    assert!(!root.join("another.yaml").exists());
+    assert_eq!(config::sources_list(root).unwrap()["pending"]["pending"], true);
+    // Resolve the recorded transition explicitly and prove the next source
+    // mutation recovers before reading its local selection.
+    fs::write(&source, "{}\n").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+    config::sources_remove(root, &source).unwrap();
+    assert_eq!(fs::read_to_string(&source).unwrap(), "{}\n");
+    assert_eq!(config::sources_list(root).unwrap()["sources"], json!([]));
+    assert!(fs::read_to_string(root.join("env.yaml")).unwrap().starts_with("# original\n"));
+
+    let directory = fixture();
+    let root = directory.path();
+    let source = root.join("generated-source.yaml");
+    let model = fs::read_to_string(root.join("compose.ncl")).unwrap();
+    fs::write(root.join("compose.ncl"), model.replace(
+        "dockstride | not_exported = { Config = configContract }",
+        "dockstride | not_exported = { Config = configContract, commands.defaults.argv = [\"python3\", \"hook.py\"], setup.defaults = { command = \"defaults\", fields = [\"project\"], sources = true } }",
+    ).replace("name = env.project", "name | String = if env.project == \"safe\" then env.project else 42")).unwrap();
+    fs::write(root.join("hook.py"), "import json, pathlib, sys\njson.load(sys.stdin)\nsys.stdout.buffer.write(pathlib.Path('response.json').read_bytes())\n").unwrap();
+    let response = |project: &str| {
+        fs::write(root.join("response.json"), serde_json::to_vec(&json!({
+            "schemaVersion": 1,
+            "values": {"project": project},
+            "sources": [{"path": source, "createIfMissing": true}],
+        })).unwrap()).unwrap();
+    };
+    response("invalid");
+    // A field-valid proposal can fail the completed operational model. Neither
+    // its proposed local values nor its empty source may escape that validation.
+    assert!(config::setup(root, &["oauth.issuer=example".into()], true).is_err());
+    assert!(!source.exists());
+    assert!(!root.join("env.yaml").exists());
+    response("safe");
+    config::setup(root, &["oauth.issuer=example".into()], true).unwrap();
+    assert_eq!(fs::read_to_string(&source).unwrap(), "{}\n");
+    assert_eq!(config::get(root, "project").unwrap()["value"], "safe");
+    assert_eq!(config::get(root, "oauth.issuer").unwrap()["value"], "example");
+    assert_eq!(config::sources_list(root).unwrap()["sources"][0]["resolved"], json!(source));
+    assert!(config::sources_list(root).unwrap()["pending"].is_null());
 }

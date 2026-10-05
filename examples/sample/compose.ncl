@@ -53,7 +53,9 @@ let service = fun role => dc.Service {
 dc.ComposeFile {
   dockstride | not_exported = {
     Config = cfg,
+    commands.devDefaults = { argv = ["python3", "dev-defaults.py"], timeoutSeconds = 30 },
     setup = {
+      defaults = { command = "devDefaults", fields = ["project"], sources = true },
       secrets.authKey = lib.GenerateSecret { bytes = 32, encoding = "hex", durable = true, recoveryFile = env.recoveryFile },
       secretAccess.authKey = { uid = env.hostSecretUid, gid = env.hostSecretGid },
       ports.apiPort = { service = "api", target = 8000, from = 49152, to = 65535 },
@@ -64,6 +66,12 @@ dc.ComposeFile {
       status = 200,
       json = { application = "dockstride-sample", project = env.project, uid = env.containerUid },
     },
+    actions = if env.backend == "compose" then [
+      { name = "stop-consumers", kind = "stop", targets = ["api", "worker"],
+        workflows = ["up", "dev"], stage = "before", services = ["api", "worker", "migrate"] },
+      { name = "migrate", kind = "prerequisite", service = "migrate", fresh = true,
+        workflows = ["up", "dev"], stage = "before", services = ["api", "worker", "migrate"] },
+    ] else [],
     oneshots = if env.backend == "compose" then ["migrate"] else [],
   },
   secrets = env.secrets,

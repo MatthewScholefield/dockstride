@@ -1,3 +1,4 @@
+pub mod commands;
 pub mod config;
 pub mod deploy;
 pub mod model;
@@ -6,3 +7,13 @@ pub mod output;
 pub mod runtime;
 pub mod secrets;
 pub mod state;
+pub mod sources;
+pub mod defaults;
+pub mod publication;
+pub mod registry;
+pub mod environment;
+pub mod allocations;
+pub mod ports;
+pub mod status;
+pub mod diagnostics;
+pub(crate) mod secret_protection;

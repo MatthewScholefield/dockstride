@@ -69,6 +69,18 @@ impl Output {
         details: Value,
     ) -> Result<()> {
         if !self.json {
+            if let Some(report) = details.get("ports") {
+                self.result(report)?;
+            }
+            if let Some(report) = details.get("status") {
+                self.result(report)?;
+            }
+            if let Some(report) = details.get("diagnostics") {
+                self.result(report)?;
+            }
+            if let Some(report) = details.get("secretSync") {
+                self.result(report)?;
+            }
             return self.error(category, code, message);
         }
         let mut out = io::stdout().lock();
@@ -82,6 +94,74 @@ impl Output {
 }
 
 fn render_human(out: &mut impl Write, value: &Value) -> Result<bool> {
+    if matches!(value["operation"].as_str(), Some("ports-release" | "ports-gc")) {
+        return Ok(false);
+    }
+    if value["operation"] == "secrets-sync" {
+        if value["comparisonsDeferred"] == true {
+            writeln!(out, "Secret sync plan · credential comparisons deferred")?;
+        }
+        for secret in value["secrets"].as_array().into_iter().flatten() {
+            writeln!(out, "{:<22} {}", secret["name"].as_str().unwrap_or("?"),
+                secret["status"].as_str().unwrap_or("uncommitted"))?;
+            writeln!(out, "  Source: {} · {}", display_value(&secret["source"]["origin"]),
+                display_value(&secret["source"]["canonicalPath"]))?;
+            if secret["consumerRestartNeeded"] == true {
+                writeln!(out, "  Consumer restart/application rotation still required")?;
+            }
+        }
+        for field in ["committed", "uncommitted"] {
+            if let Some(names) = value.get(field) {
+                writeln!(out, "{field:<14} {}", display_value(names))?;
+            }
+        }
+        return Ok(true);
+    }
+    if let Some(diagnostics) = value.get("diagnostics") {
+        for (name, key) in [("Docker", "docker"), ("Configuration", "configuration"), ("Secrets", "secrets")] {
+            let state = if value[key]["ok"].as_bool() == Some(false) { "failed" } else { "checked" };
+            writeln!(out, "{name:<14} {state}")?;
+            if value[key]["ok"].as_bool() == Some(false) {
+                serde_json::to_writer_pretty(&mut *out, &value[key])?;
+                writeln!(out)?;
+            }
+        }
+        if value["configuration"]["runtime"]["ok"].as_bool() == Some(false) {
+            writeln!(out, "Runtime        failed")?;
+            serde_json::to_writer_pretty(&mut *out, &value["configuration"]["runtime"])?;
+            writeln!(out)?;
+        }
+        return render_human(out, diagnostics);
+    }
+    if let Some(hooks) = value.get("plannedHooks") {
+        writeln!(out, "Diagnostics planned · hooks not run")?;
+        serde_json::to_writer_pretty(&mut *out, hooks)?;
+        writeln!(out)?;
+        return Ok(true);
+    }
+    if let Some(findings) = value.get("findings").and_then(Value::as_array) {
+        writeln!(out, "Diagnostics")?;
+        for finding in findings {
+            writeln!(out, "  {} · {} · {}",
+                finding["severity"].as_str().unwrap_or("?"),
+                finding["code"].as_str().unwrap_or("?"),
+                finding["summary"].as_str().unwrap_or("?"))?;
+            writeln!(out, "    Evidence: {}", display_value(&finding["evidence"]))?;
+            for key in ["suggestedCommand", "suggestedAction"] {
+                if let Some(suggestion) = finding.get(key) {
+                    writeln!(out, "    Suggested (not run): {}", display_value(suggestion))?;
+                }
+            }
+        }
+        let failures = value.get("failures").and_then(Value::as_array);
+        for failure in failures.into_iter().flatten() {
+            writeln!(out, "  Hook failed: {}", display_value(failure))?;
+        }
+        if findings.is_empty() && failures.is_none_or(Vec::is_empty) {
+            writeln!(out, "  No findings")?;
+        }
+        return Ok(true);
+    }
     if let Some(fields) = value.get("fields").and_then(Value::as_array) {
         writeln!(
             out,
@@ -251,7 +331,11 @@ fn render_human(out: &mut impl Write, value: &Value) -> Result<bool> {
         }
         writeln!(out, "{:<22} {:<22} READINESS", "SERVICE", "STATUS")?;
         for service in services {
-            let readiness = if service["applicationReady"].as_bool() == Some(true) {
+            let readiness = if service["required"] == false {
+                "excluded"
+            } else if service["applicationReady"].as_bool() == Some(false) {
+                "application failed"
+            } else if service["applicationReady"].as_bool() == Some(true) {
                 "application verified"
             } else if service["containerReady"].as_bool() == Some(true) {
                 "container ready"

@@ -18,6 +18,8 @@ That's it! In addition, Dockstride includes a lot of other useful features like:
 - Secret provisioning and management
 - Building and publishing images for production
 - Deploying individual services
+- Live shared settings with checkout-local overrides
+- Registered environments and explicit generated-endpoint reset
 
 ## Getting Started
 
@@ -81,6 +83,21 @@ The backend defaults to Compose and the port to 8080. You can change them in `en
 
 Commit `compose.ncl` and the library, but not `env.yaml`. Each environment gets its own settings. (`dks init` should have gitignored the file for you)
 
+Settings can also inherit live ordinary sources; local overrides remain local and unsetting one reveals its inherited/default value. Deployed secret references stay checkout-local. See [shared settings and provenance](docs/reference.md#live-shared-settings-and-setup-defaults).
+Imported credential inputs can be refreshed with `dks secrets sync NAME --yes`; ordinary startup never refreshes them implicitly. Comparable unchanged inputs are a no-op; changed storage still needs an explicit consumer remount/application rotation. Registered source dependencies protect old revisions from GC. See [explicit synchronization](docs/reference.md#explicit-imported-secret-synchronization).
+
+Complete setup registers the checkout on its verified Docker daemon, even with no running services. `dks env list --worktrees` combines saved environments with the invoking Git repository's worktrees. Two checkouts cannot claim the same project on one daemon.
+
+When intentionally removing an environment:
+
+```sh
+dks destroy --yes              # Delete owned application data, not credentials
+dks ports release --yes        # Clear generated endpoints; preserve explicit settings
+dks env forget "$PWD" --yes     # Remove registration, not checkout files
+```
+
+Ordinary teardown retains endpoint reservations. Use `ports release --plan` to inspect exact keys and blockers first. Stopped containers also block release; insufficiently identified legacy reservations are protected from automatic GC. See [endpoint reset](docs/reference.md#generated-endpoints-and-explicit-reset).
+
 ### Deploy your services
 
 Start locally:
@@ -93,6 +110,8 @@ curl http://localhost:8080
 You should get `Hello world!`. If you changed the port, use that instead.
 
 Use `dks dev` for a devloop once you've added Compose watch rules or a development command. The starter doesn't have either.
+
+`dks status` now verifies the required service scope and configured application identity, failing with the full report when not ready. `dks status api` narrows the scope; `--inspect-only` skips application probes without claiming they passed. Compose `up`, `dev`, and `status` accept repeatable `--profile NAME`, combined with `COMPOSE_PROFILES`. See [bounded status and profile scope](docs/reference.md#strict-status-and-compose-profiles).
 
 To stop your services:
 

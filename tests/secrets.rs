@@ -36,6 +36,9 @@ elif args[:2]==['context','inspect']:
 elif args[:1]==['info']:
     if args[-1]=='{{json .Swarm}}': print(json.dumps({'LocalNodeState':'active','ControlAvailable':True,'Cluster':{'ID':os.environ.get('FAKE_CLUSTER','cluster-a')}}))
     elif args[-1]=='{{json .SecurityOptions}}': print(json.dumps(['name=rootless'] if os.environ.get('ROOTLESS')=='1' else []))
+    elif args[-1]=='{{.ID}}': print(os.environ.get('FAKE_DAEMON','fixture-daemon'))
+    elif args[-1]=='{{json .ID}}': print(json.dumps(os.environ.get('FAKE_DAEMON','fixture-daemon')))
+    elif args[-1]=='{{.Swarm.LocalNodeState}}': print('active')
     else: raise SystemExit(9)
 elif args[:2]==['secret','create']:
     name=args[-2]; labels={}
@@ -52,14 +55,22 @@ elif args[:2]==['secret','create']:
     p.write_text(json.dumps({'Spec':{'Name':name,'Labels':labels}}));p.chmod(0o600)
     (r/'last-secret-stdin').write_bytes(data);(r/'last-secret-stdin').chmod(0o600)
     print('fake-id')
+elif args[:2]==['secret','ls']: print('\n'.join(p.name for p in (r/'fake-secrets').iterdir()))
+elif args[:2]==['config','ls']: print('')
 elif args[:2]==['secret','inspect']:
-    p=r/'fake-secrets'/args[-1]
+    p=r/'fake-secrets'/(args[2] if '--format' in args else args[-1])
     if not p.exists(): raise SystemExit(1)
-    print('['+p.read_text()+']')
+    if '--format' in args: print(json.dumps(json.loads(p.read_text())['Spec']['Labels']))
+    else: print('['+p.read_text()+']')
 elif args[:2]==['secret','rm']: (r/'fake-secrets'/args[-1]).unlink()
+elif args[:2]==['ps','-aq'] or args[:2] in (['volume','ls'],['network','ls']): print('')
 elif args[:2] in (['service','ls'], ['ps','--all']): print('consumer' if (r/'consumer').exists() else '')
 elif args[:2]==['service','inspect']:
-    print(json.dumps([{'Spec':{'TaskTemplate':{'ContainerSpec':{'Secrets':[{'SecretName':(r/'consumer').read_text()}]}}}}]))
+    if '--format' in args:
+        owner=json.loads((r/'.dockstride/identity.json').read_text())['id']
+        print(json.dumps({'io.dockstride.owner':owner}))
+    else:
+        print(json.dumps([{'Spec':{'TaskTemplate':{'ContainerSpec':{'Secrets':[{'SecretName':(r/'consumer').read_text()}]}}}}]))
 elif args[:1]==['inspect']:
     print(json.dumps([{'Mounts':[{'Source':(r/'consumer').read_text()}]}]))
 else: raise SystemExit(9)
@@ -708,4 +719,38 @@ fn default_store_obeys_xdg_data_home_without_creating_a_home_store() {
         fs::metadata(&expected).unwrap().permissions().mode() & 0o777,
         0o300
     );
+}
+
+#[test]
+fn rotation_preflight_rejects_invalid_or_inapplicable_actions_before_storage_publication() {
+    for invalid_prerequisite in [true, false] {
+        let fixture = Fixture::new("compose", "lib.GenerateSecret {bytes=32,encoding=\"hex\"}", "0", false);
+        let action = if invalid_prerequisite {
+            r#"{name="migration",kind="prerequisite",service="migrate",services=["migrate"],workflows=["rotate-auth"]}"#
+        } else {
+            r#"{name="unrelated",kind="command",argv=["true"],services=["other"],workflows=["rotate-auth"]}"#
+        };
+        let model = fs::read_to_string(fixture.root().join("compose.ncl")).unwrap();
+        fs::write(fixture.root().join("compose.ncl"), format!(r#"{model}
+& {{
+  dockstride = {{
+    setup.rotations.authKey = {{workflow="rotate-auth",services=["api"]}},
+    oneshots = ["migrate"],
+    actions = [{action}],
+  }},
+  services.api.depends_on.migrate.condition = "service_completed_successfully",
+  services.migrate = {{image="alpine",restart="no"}},
+  services.other.image = "alpine",
+}}
+"#)).unwrap();
+        fixture.success(&["setup"], None);
+        let reference = fixture.env()["secrets"]["authKey"].clone();
+        let history = fixture.history();
+        let bytes = fs::read(reference["file"].as_str().unwrap()).unwrap();
+        let result = fixture.command(&["secrets", "replace", "authKey", "--stdin", "--apply"], Some(b"must-not-be-published"));
+        assert!(!result.status.success());
+        assert_eq!(fixture.env()["secrets"]["authKey"], reference);
+        assert_eq!(fixture.history(), history);
+        assert_eq!(fs::read(reference["file"].as_str().unwrap()).unwrap(), bytes);
+    }
 }

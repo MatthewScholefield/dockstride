@@ -12,6 +12,8 @@ use crate::{
     state,
 };
 use anyhow::{Context, Result, bail, ensure};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -35,7 +37,34 @@ pub enum SecretInput {
     File(PathBuf),
     Stdin,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+// Private provenance is intentionally not Debug and never included in reports.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileSource {
+    kind: String,
+    canonical_path: PathBuf,
+    origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keyed_digest: Option<String>,
+}
+struct Input {
+    bytes: Vec<u8>,
+    source: Option<FileSource>,
+}
+impl Input {
+    fn plain(bytes: Vec<u8>) -> Self { Self { bytes, source: None } }
+}
+
+/// Structured context; the original error remains in the anyhow chain.
+#[derive(Debug)]
+pub struct SyncFailed(pub Value);
+impl std::fmt::Display for SyncFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("secret sync failed; inspect committed storage and application state before retry")
+    }
+}
+impl std::error::Error for SyncFailed {}
+#[derive(Clone, Serialize, Deserialize)]
 struct Revision {
     logical: String,
     revision: String,
@@ -50,6 +79,8 @@ struct Revision {
     pending: bool,
     #[serde(default)]
     deleted: bool,
+    #[serde(default, rename = "fileSource", skip_serializing_if = "Option::is_none")]
+    file_source: Option<FileSource>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct History {
@@ -57,7 +88,7 @@ struct History {
     revisions: Vec<Revision>,
 }
 struct Session {
-    env: Value,
+    snapshot: crate::sources::EnvironmentSnapshot,
     metadata: Value,
     fields: Vec<crate::model::Field>,
     docker: Docker,
@@ -74,7 +105,11 @@ pub fn provision(
     inputs: &BTreeMap<String, SecretInput>,
     output: &Output,
 ) -> Result<Value> {
-    let mut session = session(root, output, false)?;
+    let _lifecycle = state::lock(root, "lifecycle")?;
+    let _global = state::global_lock()?;
+    let _config = state::lock(root, "config")?;
+    crate::publication::recover_locked(root)?;
+    let mut session = session(root, output)?;
     let mut policies = policies(&session.metadata)?;
     for field in session.fields.iter().filter(|f| f.kind == "secret") {
         let name = field
@@ -90,7 +125,7 @@ pub fn provision(
         valid_name(name)?;
         ensure!(
             policies.contains_key(name)
-                || session.env.pointer(&format!("/secrets/{name}")).is_some(),
+                || session.snapshot.local.pointer(&format!("/secrets/{name}")).is_some(),
             "unknown initial secret input name {name}"
         );
     }
@@ -102,23 +137,24 @@ pub fn provision(
             <= 1,
         "only one explicit secret input may consume stdin"
     );
-    // Initial revision creation must not race a project/backend transition.
-    let _lifecycle = state::lock(root, "lifecycle")?;
+    let _sources = crate::sources::lock_paths(session.snapshot.fingerprints.keys().cloned())?;
+    session.snapshot.verify().context(
+        "environment changed while waiting for secret publication locks; rerun setup with current configuration",
+    )?;
     let _lock = state::lock(root, "secrets")?;
-    ensure!(
-        config::read_env(root)? == session.env,
-        "environment changed while waiting for secret lifecycle lock; rerun setup with current configuration"
-    );
     let identity =
         state::ensure_identity(root, &session.project, &session.backend, &session.context)?;
     session.owner = identity["id"]
         .as_str()
         .context("identity has no owner id")?
         .to_owned();
+    if runtime::managed_invocation() {
+        crate::registry::check_setup_identity(root, &session.project, &session.owner, &session.docker)?;
+    }
     let mut history = history(root)?;
     reconcile(root, &mut session, &mut history)?;
     let mut results = Vec::new();
-    if let Some(refs) = session.env.get("secrets").and_then(Value::as_object) {
+    if let Some(refs) = session.snapshot.local.get("secrets").and_then(Value::as_object) {
         for (name, reference) in refs {
             valid_name(name)?;
             validate_reference(reference, &session)?;
@@ -132,7 +168,7 @@ pub fn provision(
     }
     let missing: Vec<_> = policies
         .keys()
-        .filter(|name| session.env.pointer(&format!("/secrets/{name}")).is_none())
+        .filter(|name| session.snapshot.local.pointer(&format!("/secrets/{name}")).is_none())
         .cloned()
         .collect();
     let stdin_count = missing
@@ -164,25 +200,37 @@ pub fn provision(
     let mut stdin_used = false;
     for name in missing {
         let policy = &policies[&name];
-        let bytes = match inputs.get(&name) {
+        let input = match inputs.get(&name) {
             Some(input) => obtain_input(input, &mut stdin_used)?,
             None => obtain(root, policy, non_interactive, &mut stdin_used)?,
         };
-        let reference = create_revision(root, &mut session, &mut history, &name, &bytes, policy)?;
+        let reference = create_revision(root, &mut session, &mut history, &name, &input.bytes, policy, input.source)?;
         results.push(json!({"name":name,"status":"provisioned","reference":reference}));
         output.event(
             "secrets",
             &format!("{name} provisioned; only its reference was saved"),
         )?;
     }
-    validate_consumers(root, &session)?;
+    let deferred = if session.backend == "compose" && runtime::managed_invocation() {
+        true
+    } else {
+        let values = config::effective(&session.snapshot.values, &session.fields)?;
+        let missing = session.fields.iter().any(|field| field.required && !field.path.starts_with("secrets.")
+            && field.path.split('.').try_fold(&values, |value, part| value.get(part)).is_none());
+        if missing {
+            let allocations = crate::allocations::eligible_fields(root, &session.snapshot.values, &session.fields)?;
+            session.fields.iter().any(|field| field.required && allocations.contains(&field.path)
+                && field.path.split('.').try_fold(&values, |value, part| value.get(part)).is_none())
+        } else { false }
+    };
+    if !deferred { validate_consumers_with_session(root, &session)?; }
     if !results.is_empty() {
         state::mark_resources(root, true)?;
         if let Some(cluster) = &session.cluster {
             state::pin_secret_cluster(root, cluster)?;
         }
     }
-    Ok(json!({"secrets":results}))
+    Ok(json!({"secrets":results,"consumerValidation":if deferred {"deferred"} else {"validated"}}))
 }
 
 pub fn list(root: &Path) -> Result<Value> {
@@ -190,11 +238,11 @@ pub fn list(root: &Path) -> Result<Value> {
         json: false,
         quiet: true,
     };
-    let session = session(root, &output, false)?;
+    let session = session(root, &output)?;
     let history = history(root)?;
     let consumers = consumers(root)?;
     let mut secrets = Vec::new();
-    for (name, reference) in references(&session.env) {
+    for (name, reference) in references(&session.snapshot.local) {
         let revision = history
             .revisions
             .iter()
@@ -214,10 +262,10 @@ pub fn doctor(root: &Path) -> Result<Value> {
         json: false,
         quiet: true,
     };
-    let session = session(root, &output, false)?;
+    let session = session(root, &output)?;
     let mut issues = Vec::new();
     let history = history(root)?;
-    for (name, reference) in references(&session.env) {
+    for (name, reference) in references(&session.snapshot.local) {
         let revision = history
             .revisions
             .iter()
@@ -229,7 +277,7 @@ pub fn doctor(root: &Path) -> Result<Value> {
     for revision in history.revisions.iter().filter(|r| r.pending) {
         issues.push(json!({"secret":revision.logical,"error":"interrupted operation; run setup to reconcile its owned revision","revision":revision.revision}));
     }
-    if let Err(error) = validate_consumers(root, &session) {
+    if let Err(error) = validate_consumers_with_session(root, &session) {
         issues.push(json!({"error":error.to_string()}));
     }
     Ok(
@@ -240,19 +288,33 @@ pub fn doctor(root: &Path) -> Result<Value> {
 pub fn replace(
     root: &Path,
     name: &str,
-    input: Option<&[u8]>,
+    input: Option<&SecretInput>,
     apply: bool,
     non_interactive: bool,
     output: &Output,
 ) -> Result<Value> {
     valid_name(name)?;
     let _lifecycle = state::lock(root, "lifecycle")?;
-    let _lock = state::lock(root, "secrets")?;
-    let mut session = session(root, output, true)?;
+    let global = state::global_lock()?;
+    let config = state::lock(root, "config")?;
+    crate::publication::recover_locked(root)?;
+    let mut session = session(root, output)?;
+    let sources = crate::sources::lock_paths(session.snapshot.fingerprints.keys().cloned())?;
+    session.snapshot.verify()?;
+    let lock = state::lock(root, "secrets")?;
+    let identity =
+        state::ensure_identity(root, &session.project, &session.backend, &session.context)?;
+    session.owner = identity["id"]
+        .as_str()
+        .context("identity has no owner id")?
+        .to_owned();
+    if runtime::managed_invocation() {
+        crate::registry::check_setup_identity(root, &session.project, &session.owner, &session.docker)?;
+    }
     let mut history = history(root)?;
     reconcile(root, &mut session, &mut history)?;
     let old = session
-        .env
+        .snapshot.local
         .pointer(&format!("/secrets/{name}"))
         .context("secret has no existing reference; run setup first")?
         .clone();
@@ -261,92 +323,254 @@ pub fn replace(
         .iter()
         .find(|r| r.reference == old && !r.deleted);
     verify_reference(&old, &session, owned)?;
-    let rotation = session
-        .metadata
-        .pointer(&format!("/setup/rotations/{name}"))
-        .cloned();
-    if apply {
-        let rotation = rotation.as_ref().context("no safe rotation procedure declared for this secret; storage replacement alone cannot rotate application credentials")?;
-        ensure!(
-            rotation.get("workflow").and_then(Value::as_str).is_some(),
-            "rotation workflow must be declared"
-        );
-        ensure!(
-            rotation.get("services").and_then(Value::as_array).is_some(),
-            "rotation must explicitly declare affected services"
-        );
+    let rotation = if apply {
         let project = nickel::evaluate(root, None)?;
-        let services = rotation["services"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().context("rotation services must be strings"))
-            .collect::<Result<Vec<_>>>()?;
-        ensure!(
-            !services.is_empty(),
-            "rotation must explicitly name affected services"
-        );
-        for service in services {
-            ensure!(
-                project.services()?.contains_key(service),
-                "rotation refers to unknown service {service}"
-            );
-        }
-        let workflow = rotation["workflow"].as_str().unwrap();
-        ensure!(
-            project
-                .metadata
-                .get("actions")
-                .and_then(Value::as_array)
-                .is_some_and(|actions| actions.iter().any(|action| action
-                    .get("workflows")
-                    .and_then(Value::as_array)
-                    .is_some_and(|w| w.iter().any(|w| w.as_str() == Some(workflow))))),
-            "rotation workflow has no explicitly declared actions"
-        );
-        output.event("plan", &format!("replace {name}, retain previous revision, execute declared rotation workflow {workflow}"))?;
-    }
+        Some(rotation_scope(&project, &session.metadata, name)?)
+    } else { None };
     let policy = policies(&session.metadata)?
         .remove(name)
         .unwrap_or_else(|| json!({"kind":"prompt"}));
-    let bytes = match input {
-        Some(bytes) => {
-            ensure!(
-                !bytes.is_empty() && bytes.len() <= 1_048_576,
-                "secret input must contain 1..1048576 bytes"
-            );
-            std::borrow::Cow::Borrowed(bytes)
-        }
-        None => std::borrow::Cow::Owned(obtain(root, &policy, non_interactive, &mut false)?),
+    let input = match input {
+        Some(input) => obtain_input(input, &mut false)?,
+        None => obtain(root, &policy, non_interactive, &mut false)?,
     };
-    let reference = create_revision(root, &mut session, &mut history, name, &bytes, &policy)?;
-    validate_consumers(root, &session)?;
+    let reference = create_revision(root, &mut session, &mut history, name, &input.bytes, &policy, input.source)?;
+    validate_consumers_with_session(root, &session)?;
     let affected = consumers(root)?.remove(name).unwrap_or_default();
+    // Storage is committed before trusted project commands run. Keep only lifecycle
+    // serialization; commands must not hold allocation/configuration publication locks.
+    drop(lock);
+    drop(sources);
+    drop(config);
+    drop(global);
     if apply {
-        let rotation = rotation.as_ref().unwrap();
-        let services = rotation["services"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| {
-                v.as_str()
-                    .map(str::to_owned)
-                    .context("rotation services must be strings")
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let (workflow, services) = rotation.as_ref().unwrap();
         let project = nickel::evaluate(root, None)?;
-        for service in &services {
-            ensure!(
-                project.services()?.contains_key(service),
-                "rotation refers to unknown service {service}"
-            );
-        }
-        runtime::execute_actions(&project, rotation["workflow"].as_str().unwrap(), &services, &session.docker, output)
+        runtime::execute_actions(&project, workflow, services, &session.docker, output)
             .context("storage replacement committed and previous revision retained; declared application rotation failed, inspect/recover application before retry")?;
     }
     Ok(
         json!({"name":name,"reference":reference,"previous":old,"consumers":affected,"applied":apply,"rotation":"application-specific; no universal regeneration or rollback"}),
     )
+}
+
+struct SyncSelection {
+    name: String,
+    policy: Value,
+    previous: Value,
+    source: FileSource,
+    input: Option<Vec<u8>>,
+    unchanged: bool,
+    baseline: bool,
+    prior_comparable: bool,
+    owned_index: Option<usize>,
+    rotation: Option<(String, Vec<String>)>,
+}
+
+fn rotation_scope(project: &crate::model::Project, metadata: &Value, name: &str) -> Result<(String, Vec<String>)> {
+    let rotation = metadata.pointer(&format!("/setup/rotations/{name}"))
+        .context("no safe rotation procedure declared for this secret; storage replacement alone cannot rotate application credentials")?;
+    let workflow = rotation.get("workflow").and_then(Value::as_str)
+        .context("rotation workflow must be declared")?.to_owned();
+    let services = rotation.get("services").and_then(Value::as_array)
+        .context("rotation must explicitly declare affected services")?.iter()
+        .map(|value| value.as_str().map(str::to_owned).context("rotation services must be strings"))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(!services.is_empty(), "rotation must explicitly name affected services");
+    for service in &services {
+        ensure!(project.services()?.contains_key(service), "rotation refers to unknown service {service}");
+    }
+    ensure!(runtime::planned_actions(project, &workflow, &services)?.iter().any(|action|
+        action["workflows"].as_array().is_some_and(|workflows|
+            workflows.iter().any(|entry| entry.as_str() == Some(workflow.as_str())))),
+        "rotation workflow has no explicitly declared actions in its planned service scope");
+    Ok((workflow, services))
+}
+
+fn sync_report(rows: &[Value], plan_only: bool, committed: &[String], applied: &[String], names: &[String]) -> Value {
+    let uncommitted: Vec<_> = names.iter().filter(|name| !committed.contains(name)
+        && !rows.iter().any(|row| row["name"].as_str() == Some(name.as_str()) && row["status"] == "unchanged")).collect();
+    json!({"operation":"secrets-sync","sideEffects":!plan_only,
+        "comparisonsDeferred":plan_only,"secrets":rows,
+        "committed":committed,"uncommitted":uncommitted,"applied":applied})
+}
+
+pub fn sync(
+    root: &Path,
+    names: &[String],
+    plan_only: bool,
+    confirmed: bool,
+    apply: bool,
+    output: &Output,
+) -> Result<Value> {
+    ensure!(!names.is_empty(), "secret sync requires explicit names");
+    ensure!(plan_only || confirmed, "secret sync requires explicit confirmation");
+    let mut unique = std::collections::BTreeSet::new();
+    for name in names {
+        valid_name(name)?;
+        ensure!(unique.insert(name), "duplicate secret sync selection {name}");
+    }
+    let _lifecycle = if plan_only { None } else { Some(state::lock(root, "lifecycle")?) };
+    let global = if plan_only { None } else { Some(state::global_lock()?) };
+    let config = if plan_only { None } else { Some(state::lock(root, "config")?) };
+    if !plan_only { crate::publication::recover_locked(root)?; }
+    let mut session = session(root, output)?;
+    let sources = if plan_only { None } else {
+        let locks = crate::sources::lock_paths(session.snapshot.fingerprints.keys().cloned())?;
+        session.snapshot.verify()?;
+        Some(locks)
+    };
+    let lock = if plan_only { None } else { Some(state::lock(root, "secrets")?) };
+    let mut history = history(root)?;
+    if !plan_only {
+        ensure!(!session.owner.is_empty(), "secret sync requires a recorded ownership identity");
+        reconcile(root, &mut session, &mut history)?;
+    }
+    let policies = policies(&session.metadata)?;
+    let mut selections = Vec::with_capacity(names.len());
+    let mut rows = Vec::with_capacity(names.len());
+    // Resolve every selection before reading any credential or creating the HMAC key.
+    for name in names {
+        let previous = session.snapshot.local.pointer(&format!("/secrets/{name}"))
+            .with_context(|| format!("secret {name} has no existing reference; run setup first"))?.clone();
+        let owned_index = history.revisions.iter().rposition(|revision|
+            revision.logical == *name && revision.reference == previous && !revision.deleted);
+        let owned = owned_index.map(|index| &history.revisions[index]);
+        verify_reference(&previous, &session, owned)?;
+        let policy = policies.get(name).cloned().unwrap_or_else(|| json!({"kind":"prompt"}));
+        let (path, origin) = if policy_kind(&policy) == "file" {
+            (declared_path(root, &policy)?, "declared-file")
+        } else {
+            let source = owned.and_then(|revision| revision.file_source.as_ref())
+                .filter(|source| source.kind == "file" && source.origin == "cli-file")
+                .with_context(|| format!("secret {name} has no current declared or explicit CLI file source"))?;
+            (source.canonical_path.clone(), "cli-file")
+        };
+        // Metadata-only planning does not open or read source credential content.
+        reject_symlinks(&path)?;
+        let canonical_path = path.canonicalize().context("cannot resolve secret sync source")?;
+        let source = FileSource { kind: "file".into(), canonical_path, origin: origin.into(), keyed_digest: None };
+        rows.push(json!({"name":name,"source":{"kind":"file","canonicalPath":source.canonical_path,
+            "origin":source.origin},"status":"comparison-deferred","reference":previous}));
+        selections.push(SyncSelection { name: name.clone(), policy, previous, source, input: None,
+            unchanged: false, baseline: false, prior_comparable: false, owned_index, rotation: None });
+    }
+    if plan_only { return Ok(sync_report(&rows, true, &[], &[], names)); }
+    let key = source_key()?;
+    // Preflight all sources and exact bytes before the first new revision is published.
+    for selection in &mut selections {
+        let path = if selection.source.origin == "declared-file" {
+            declared_path(root, &selection.policy)?
+        } else { selection.source.canonical_path.clone() };
+        let (file, canonical_path) = open_input(&path, None)?;
+        ensure!(canonical_path == selection.source.canonical_path, "secret sync source identity changed");
+        let bytes = read_bounded(file)?;
+        let mac = content_mac(&key, &bytes);
+        let revision = selection.owned_index.map(|index| &history.revisions[index]);
+        if let Some(digest) = revision.and_then(|revision| revision.file_source.as_ref())
+            .and_then(|source| source.keyed_digest.as_deref()) {
+            if let Some(matches) = digest_matches(&mac, digest) {
+                selection.prior_comparable = true;
+                selection.unchanged = matches;
+            }
+        }
+        if !selection.prior_comparable && session.backend == "compose" && revision.is_some() {
+            let path = Path::new(selection.previous["file"].as_str().context("managed reference has no file")?);
+            let (file, _) = open_input(path, Some(access(&session, &selection.name)?))?;
+            let baseline = read_bounded(file)?;
+            selection.prior_comparable = true;
+            selection.unchanged = bytes == baseline;
+            selection.baseline = selection.unchanged;
+        }
+        selection.source.keyed_digest = Some(hex::encode(mac.finalize().into_bytes()));
+        selection.input = Some(bytes);
+    }
+    let project = if apply && selections.iter().any(|selection| !selection.unchanged) {
+        Some(nickel::evaluate(root, None)?)
+    } else { None };
+    if let Some(project) = &project {
+        for selection in selections.iter_mut().filter(|selection| !selection.unchanged) {
+            selection.rotation = Some(rotation_scope(project, &session.metadata, &selection.name)?);
+        }
+    }
+    let mut committed = Vec::new();
+    let mut applied = Vec::new();
+    for (selection, row) in selections.iter().zip(&mut rows) {
+        if selection.unchanged {
+            row["status"] = json!("unchanged");
+            row["consumerRestartNeeded"] = json!(false);
+            if selection.baseline { row["baselineEstablished"] = json!(true); }
+        } else {
+            row["status"] = json!("not-published");
+            row["priorContentComparable"] = json!(selection.prior_comparable);
+        }
+    }
+    // Source provenance may change even when storage contents do not.
+    let mut provenance_changed = false;
+    for selection in selections.iter().filter(|selection| selection.unchanged) {
+        if let Some(index) = selection.owned_index {
+            if history.revisions[index].file_source.as_ref() != Some(&selection.source) {
+                history.revisions[index].file_source = Some(selection.source.clone());
+                provenance_changed = true;
+            }
+        }
+    }
+    if provenance_changed {
+        save_history(root, &history).map_err(|error|
+            error.context(SyncFailed(sync_report(&rows, false, &committed, &applied, names))))?;
+    }
+    for (index, selection) in selections.iter().enumerate().filter(|(_, selection)| !selection.unchanged) {
+        let created = create_revision(root, &mut session, &mut history, &selection.name,
+            selection.input.as_deref().unwrap(), &selection.policy, Some(selection.source.clone()));
+        match created {
+            Ok(reference) => {
+                committed.push(selection.name.clone());
+                rows[index]["status"] = json!("replaced");
+                rows[index]["reference"] = reference;
+                rows[index]["previous"] = selection.previous.clone();
+                rows[index]["applied"] = json!(false);
+                rows[index]["consumerRestartNeeded"] = json!(true);
+                rows[index]["priorContentComparable"] = json!(selection.prior_comparable);
+            }
+            Err(error) => {
+                // Publication may fail after env.yaml was durably changed. Observe
+                // that exact transition rather than calling a failed batch atomic.
+                if let Some(record) = history.revisions.last()
+                    && record.logical == selection.name && record.reference != selection.previous
+                    && (!record.pending || config::read_env(root).is_ok_and(|local|
+                        local.pointer(&format!("/secrets/{}", selection.name)) == Some(&record.reference))) {
+                    committed.push(selection.name.clone());
+                    rows[index]["status"] = json!("replaced");
+                    rows[index]["reference"] = record.reference.clone();
+                    rows[index]["previous"] = selection.previous.clone();
+                    rows[index]["applied"] = json!(false);
+                    rows[index]["consumerRestartNeeded"] = json!(true);
+                }
+                return Err(error.context(SyncFailed(sync_report(&rows, false, &committed, &applied, names))));
+            }
+        }
+    }
+    validate_consumers_with_session(root, &session).map_err(|error|
+        error.context(SyncFailed(sync_report(&rows, false, &committed, &applied, names))))?;
+    // Trusted rotation commands do not need retained plaintext in this process.
+    for selection in &mut selections { selection.input = None; }
+    drop(lock);
+    drop(sources);
+    drop(config);
+    drop(global);
+    if apply && !committed.is_empty() {
+        let project = nickel::evaluate(root, None).map_err(|error|
+            error.context(SyncFailed(sync_report(&rows, false, &committed, &applied, names))))?;
+        for (index, selection) in selections.iter().enumerate().filter(|(_, selection)| !selection.unchanged) {
+            let (workflow, services) = selection.rotation.as_ref().unwrap();
+            runtime::execute_actions(&project, workflow, services, &session.docker, output).map_err(|error|
+                error.context(SyncFailed(sync_report(&rows, false, &committed, &applied, names))))?;
+            applied.push(selection.name.clone());
+            rows[index]["applied"] = json!(true);
+            rows[index]["consumerRestartNeeded"] = json!(false);
+        }
+    }
+    Ok(sync_report(&rows, false, &committed, &applied, names))
 }
 
 pub fn gc(
@@ -369,12 +593,30 @@ pub fn gc(
     } else {
         Some(state::lock(root, "lifecycle")?)
     };
+    let _global = if plan_only {
+        None
+    } else {
+        Some(state::global_lock()?)
+    };
+    let _config = if plan_only {
+        None
+    } else {
+        Some(state::lock(root, "config")?)
+    };
+    if !plan_only { crate::publication::recover_locked(root)?; }
+    let mut session = session(root, output)?;
+    let _sources = if plan_only {
+        None
+    } else {
+        let locks = crate::sources::lock_paths(session.snapshot.fingerprints.keys().cloned())?;
+        session.snapshot.verify()?;
+        Some(locks)
+    };
     let _lock = if plan_only {
         None
     } else {
         Some(state::lock(root, "secrets")?)
     };
-    let mut session = session(root, output, false)?;
     let mut history = history(root)?;
     if !plan_only {
         ensure!(
@@ -383,7 +625,8 @@ pub fn gc(
         );
         reconcile(root, &mut session, &mut history)?;
     }
-    let current: Vec<_> = references(&session.env)
+    let mut protection = crate::secret_protection::observe(root)?;
+    let current: Vec<_> = references(&session.snapshot.local)
         .map(|(_, value)| value.clone())
         .collect();
     let mut plan = Vec::new();
@@ -412,7 +655,7 @@ pub fn gc(
         } else if referenced_snapshot(root, &revision.reference)? {
             Some("retained deployment snapshot")
         } else {
-            None
+            protection.reason(&revision.reference)
         };
         let mut eligible = reason.is_none();
         let mut detail = reason.map(str::to_owned);
@@ -450,6 +693,8 @@ pub fn gc(
     }
     if !plan_only {
         for index in selected {
+            session.snapshot.verify()?;
+            protection.verify()?;
             let revision = &mut history.revisions[index];
             if revision.backend == "swarm" {
                 session.docker.run(
@@ -465,6 +710,7 @@ pub fn gc(
             }
             revision.deleted = true;
             save_history(root, &history)?;
+            protection.refresh_own_history(root)?;
         }
         output.event(
             "secrets",
@@ -474,12 +720,14 @@ pub fn gc(
     Ok(json!({"plan":plan,"applied":!plan_only}))
 }
 
-fn session(root: &Path, output: &Output, create_identity: bool) -> Result<Session> {
-    let env = config::read_env(root)?;
-    let metadata = nickel::setup_metadata(root, Some(&env))?;
-    let fields = nickel::schema(root, Some(&env))?;
+fn session(root: &Path, output: &Output) -> Result<Session> {
+    let snapshot = crate::sources::snapshot(root, None)?;
+    let env = &snapshot.local;
+    let layered = &snapshot.values;
+    let metadata = nickel::setup_metadata(root, Some(env))?;
+    let fields = nickel::schema(root, Some(env))?;
     let effective = |path: &str| {
-        env.get(path).or_else(|| {
+        layered.get(path).or_else(|| {
             fields
                 .iter()
                 .find(|field| field.path == path)
@@ -527,11 +775,7 @@ fn session(root: &Path, output: &Output, create_identity: bool) -> Result<Sessio
     } else {
         None
     };
-    let identity = if create_identity {
-        state::ensure_identity(root, &project, &backend, &context)?
-    } else {
-        state::read(root, "identity")?
-    };
+    let identity = state::read(root, "identity")?;
     if identity.get("id").is_some() {
         ensure!(
             identity["project"].as_str() == Some(&project)
@@ -558,7 +802,7 @@ fn session(root: &Path, output: &Output, create_identity: bool) -> Result<Sessio
         .unwrap_or("")
         .to_owned();
     Ok(Session {
-        env,
+        snapshot,
         metadata,
         fields,
         docker,
@@ -641,16 +885,10 @@ fn retained(history: &History, logical: &str, current: &Value, owner: &str) -> V
     }
     result
 }
-fn obtain_input(input: &SecretInput, stdin_used: &mut bool) -> Result<Vec<u8>> {
+fn obtain_input(input: &SecretInput, stdin_used: &mut bool) -> Result<Input> {
     match input {
-        SecretInput::File(path) => {
-            ensure!(
-                path.is_absolute(),
-                "explicit secret input paths must be absolute"
-            );
-            read_input(path)
-        }
-        SecretInput::Stdin => read_stdin(stdin_used),
+        SecretInput::File(path) => import_file(path, "cli-file"),
+        SecretInput::Stdin => Ok(Input::plain(read_stdin(stdin_used)?)),
     }
 }
 fn read_stdin(stdin_used: &mut bool) -> Result<Vec<u8>> {
@@ -676,7 +914,7 @@ fn obtain(
     policy: &Value,
     non_interactive: bool,
     stdin_used: &mut bool,
-) -> Result<Vec<u8>> {
+) -> Result<Input> {
     let bytes = match policy_kind(policy) {
         "generate" => {
             let size = policy.get("bytes").and_then(Value::as_u64).unwrap_or(32);
@@ -698,17 +936,8 @@ fn obtain(
             }
         }
         "file" => {
-            let path = Path::new(
-                policy
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .context("file secret policy requires path")?,
-            );
-            read_input(&if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                root.join(path)
-            })?
+            let path = declared_path(root, policy)?;
+            return import_file(&path, "declared-file");
         }
         "stdin" => read_stdin(stdin_used)?,
         "prompt" => {
@@ -726,32 +955,89 @@ fn obtain(
         !bytes.is_empty() && bytes.len() <= 1_048_576,
         "secret must contain 1..1048576 bytes"
     );
-    Ok(bytes)
+    Ok(Input::plain(bytes))
 }
-pub fn read_input(path: &Path) -> Result<Vec<u8>> {
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    reject_symlinks(&path)?;
-    let mut file =
-        open_secure_file(&path, libc::O_RDONLY, 0).context("cannot open secret input file")?;
+
+fn declared_path(root: &Path, policy: &Value) -> Result<PathBuf> {
+    let path = Path::new(policy.get("path").and_then(Value::as_str)
+        .context("file secret policy requires path")?);
+    Ok(if path.is_absolute() { path.to_owned() } else { root.join(path) })
+}
+
+fn open_input(path: &Path, managed_mode: Option<(u32, u32, u32)>) -> Result<(File, PathBuf)> {
+    // Open the original spelling before canonicalization, with every component
+    // anchored and no-follow. Canonicalizing first would launder symlinks.
+    let path = if path.is_absolute() { path.to_owned() } else { std::env::current_dir()?.join(path) };
+    let file = open_secure_file(&path, libc::O_RDONLY, 0).context("cannot open secret input file")?;
     let metadata = file.metadata()?;
     ensure!(metadata.is_file(), "secret input must be a regular file");
-    ensure!(
-        metadata.mode() & 0o077 == 0,
-        "secret input/recovery file must not be accessible to group or other users"
-    );
+    ensure!(metadata.uid() == unsafe { libc::geteuid() }, "secret input must be owned by the current user");
+    match managed_mode {
+        Some((uid, gid, mode)) => ensure!(metadata.uid() == uid && metadata.gid() == gid
+            && metadata.mode() & 0o777 == mode, "managed baseline access differs from declared policy"),
+        None => ensure!(metadata.mode() & 0o077 == 0,
+            "secret input/recovery file must not be accessible to group or other users"),
+    }
+    let canonical = path.canonicalize().context("cannot resolve secret input identity")?;
+    let target = open_secure_file(&canonical, libc::O_RDONLY, 0)?.metadata()?;
+    ensure!(metadata.dev() == target.dev() && metadata.ino() == target.ino(),
+        "secret input identity changed during import");
+    Ok((file, canonical))
+}
+
+fn read_bounded(mut file: File) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
-        .take(1_048_577)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        !bytes.is_empty() && bytes.len() <= 1_048_576,
-        "secret input size invalid"
-    );
+    Read::by_ref(&mut file).take(1_048_577).read_to_end(&mut bytes)?;
+    ensure!(!bytes.is_empty() && bytes.len() <= 1_048_576, "secret input size invalid");
     Ok(bytes)
+}
+
+// All callers that create/read this key hold the shared global publication guard.
+fn source_key() -> Result<[u8; 32]> {
+    let directory = state::global_root()?.join(".dockstride");
+    let path = directory.join("secret-source-key");
+    let mut key = [0u8; 32];
+    match open_secure_file(&path, libc::O_RDONLY, 0) {
+        Ok(mut file) => {
+            let metadata = file.metadata()?;
+            ensure!(metadata.is_file() && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o777 == 0o600 && metadata.len() == 32,
+                "secret source key ownership, permissions, or length invalid");
+            file.read_exact(&mut key)?;
+        }
+        Err(error) if error.downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {
+            getrandom::fill(&mut key).map_err(|_| anyhow::anyhow!("cryptographic random generation failed"))?;
+            let mut file = open_secure_file(&path, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)?;
+            file.write_all(&key)?;
+            file.sync_all()?;
+            File::open(directory)?.sync_all()?;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(key)
+}
+
+fn content_mac(key: &[u8; 32], bytes: &[u8]) -> Hmac<Sha256> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts 32-byte keys");
+    mac.update(bytes);
+    mac
+}
+fn content_digest(key: &[u8; 32], bytes: &[u8]) -> String {
+    hex::encode(content_mac(key, bytes).finalize().into_bytes())
+}
+fn digest_matches(mac: &Hmac<Sha256>, digest: &str) -> Option<bool> {
+    let mut decoded = [0u8; 32];
+    hex::decode_to_slice(digest, &mut decoded).ok()?;
+    Some(mac.clone().verify_slice(&decoded).is_ok())
+}
+fn import_file(path: &Path, origin: &str) -> Result<Input> {
+    let (file, canonical_path) = open_input(path, None)?;
+    let bytes = read_bounded(file)?;
+    let keyed_digest = Some(content_digest(&source_key()?, &bytes));
+    Ok(Input { bytes, source: Some(FileSource {
+        kind: "file".into(), canonical_path, origin: origin.into(), keyed_digest,
+    }) })
 }
 fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -804,8 +1090,10 @@ fn create_revision(
     name: &str,
     bytes: &[u8],
     policy: &Value,
+    file_source: Option<FileSource>,
 ) -> Result<Value> {
     valid_name(name)?;
+    session.snapshot.verify()?;
     let revision = state::random_id()?;
     let filename = format!("{name}--{revision}");
     let reference = if session.backend == "swarm" {
@@ -832,6 +1120,7 @@ fn create_revision(
     };
     if session.backend == "swarm"
         && policy_kind(policy) == "generate"
+        && file_source.is_none()
         && policy
             .get("durable")
             .and_then(Value::as_bool)
@@ -853,9 +1142,10 @@ fn create_revision(
         owner: session.owner.clone(),
         context: session.context.clone(),
         cluster: session.cluster.clone(),
-        previous: session.env.pointer(&format!("/secrets/{name}")).cloned(),
+        previous: session.snapshot.local.pointer(&format!("/secrets/{name}")).cloned(),
         pending: true,
         deleted: false,
+        file_source,
     };
     history.revisions.push(record.clone());
     save_history(root, history)?;
@@ -886,10 +1176,11 @@ fn create_revision(
         write_private(&reference, bytes, session, name)?;
     }
     verify_reference(&reference, session, Some(&record))?;
-    config::set_secret_reference(root, name, &reference)?;
+    session.snapshot.verify()?;
+    config::set_secret_reference_locked(root, name, &reference)?;
     history.revisions.last_mut().unwrap().pending = false;
     save_history(root, history)?;
-    session.env = config::read_env(root)?;
+    session.snapshot = crate::sources::snapshot(root, None)?;
     Ok(reference)
 }
 fn reconcile(root: &Path, session: &mut Session, history: &mut History) -> Result<()> {
@@ -898,6 +1189,7 @@ fn reconcile(root: &Path, session: &mut Session, history: &mut History) -> Resul
         if !record.pending || record.deleted {
             continue;
         }
+        session.snapshot.verify()?;
         ensure!(
             record.owner == session.owner
                 && record.context == session.context
@@ -905,17 +1197,18 @@ fn reconcile(root: &Path, session: &mut Session, history: &mut History) -> Resul
             "interrupted secret operation belongs to a different owner/context/cluster"
         );
         verify_reference(&record.reference, session, Some(record)).context("interrupted secret revision is absent or unverifiable; recover from the declared private recovery source, do not regenerate an established credential")?;
-        let current = session.env.pointer(&format!("/secrets/{}", record.logical));
+        let current = session.snapshot.local.pointer(&format!("/secrets/{}", record.logical));
         ensure!(
             current == Some(&record.reference) || current == record.previous.as_ref(),
             "secret reference changed during interrupted operation; manual recovery required"
         );
         if current != Some(&record.reference) {
-            config::set_secret_reference(root, &record.logical, &record.reference)?;
+            session.snapshot.verify()?;
+            config::set_secret_reference_locked(root, &record.logical, &record.reference)?;
         }
         history.revisions[index].pending = false;
         save_history(root, history)?;
-        session.env = config::read_env(root)?;
+        session.snapshot = crate::sources::snapshot(root, None)?;
     }
     Ok(())
 }
@@ -1234,11 +1527,9 @@ fn open_secure_file(path: &Path, flags: i32, mode: u32) -> Result<File> {
             mode,
         )
     };
-    ensure!(
-        descriptor >= 0,
-        "secure secret file access failed: {}",
-        std::io::Error::last_os_error()
-    );
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error()).context("secure secret file access failed");
+    }
     Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 fn write_private(reference: &Value, bytes: &[u8], session: &Session, logical: &str) -> Result<()> {
@@ -1363,7 +1654,12 @@ fn consumers(root: &Path) -> Result<BTreeMap<String, Vec<String>>> {
     }
     Ok(result)
 }
-fn validate_consumers(root: &Path, session: &Session) -> Result<()> {
+/// Finish consumer permission validation after native allocations complete setup.
+pub fn validate_consumers(root: &Path, output: &Output) -> Result<()> {
+    validate_consumers_with_session(root, &session(root, output)?)
+}
+
+fn validate_consumers_with_session(root: &Path, session: &Session) -> Result<()> {
     if session.backend != "compose" {
         return Ok(());
     }
@@ -1382,7 +1678,7 @@ fn validate_consumers(root: &Path, session: &Session) -> Result<()> {
                 .or_else(|| secret.get("source").and_then(Value::as_str))
                 .context("invalid service secret grant")?;
             let reference = session
-                .env
+                .snapshot.local
                 .pointer(&format!("/secrets/{logical}"))
                 .context("service secret grant has no reference")?;
             let metadata = fs::metadata(

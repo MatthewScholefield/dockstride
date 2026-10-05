@@ -23,7 +23,7 @@ use std::{fs, io::Write, path::Path};
 
 type Program = nickel_lang_core::program::Program<CacheImpl>;
 pub const EVALUATOR_VERSION: &str = "0.19.0";
-pub const LIBRARY_VERSION: &str = "0.1.0";
+pub const LIBRARY_VERSION: &str = "0.2.0";
 
 #[derive(Debug)]
 pub struct NickelError {
@@ -44,25 +44,12 @@ fn diagnostic(program: &Program, error: Error) -> anyhow::Error {
 }
 
 fn env_data(root: &Path, candidate: Option<&Value>) -> Result<Value> {
-    if let Some(candidate) = candidate {
-        return Ok(candidate.clone());
-    }
-    let path = root.join("env.yaml");
-    if !path.exists() {
-        return Ok(json!({}));
-    }
-    let value: Value = serde_yaml::from_str(&fs::read_to_string(&path)?)
-        .with_context(|| format!("reading {}", path.display()))?;
-    if value.is_null() {
-        Ok(json!({}))
-    } else {
-        Ok(value)
-    }
+    Ok(crate::sources::snapshot(root, candidate)?.values)
 }
 
-fn program(root: &Path, candidate: Option<&Value>, expression: Option<&str>) -> Result<Program> {
+
+fn program_values(root: &Path, env: &Value, expression: Option<&str>) -> Result<Program> {
     let root = fs::canonicalize(root).context("opening project directory")?;
-    let env = env_data(&root, candidate)?;
     if !env.is_object() {
         bail!("env.yaml must contain a YAML mapping");
     }
@@ -92,7 +79,12 @@ fn program(root: &Path, candidate: Option<&Value>, expression: Option<&str>) -> 
 }
 
 fn export(root: &Path, candidate: Option<&Value>, expression: &str) -> Result<Value> {
-    let mut program = program(root, candidate, Some(expression))?;
+    let snapshot = crate::sources::snapshot(root, candidate)?;
+    export_values(root, &snapshot.values, expression).with_context(|| format!("evaluating environment with shared sources {:?}", snapshot.sources))
+}
+
+fn export_values(root: &Path, values: &Value, expression: &str) -> Result<Value> {
+    let mut program = program_values(root, values, Some(expression))?;
     let value = program
         .eval_full_for_export()
         .map_err(|error| diagnostic(&program, error))?;
@@ -230,7 +222,12 @@ fn discover(data: &RecordData, prefix: &str, fields: &mut Vec<Field>) {
 }
 
 pub fn schema(root: &Path, candidate: Option<&Value>) -> Result<Vec<Field>> {
-    let mut program = program(root, candidate, None)?;
+    let snapshot = crate::sources::snapshot(root, candidate)?;
+    schema_values(root, &snapshot.values).with_context(|| format!("discovering configuration with shared sources {:?}", snapshot.sources))
+}
+
+pub(crate) fn schema_values(root: &Path, values: &Value) -> Result<Vec<Field>> {
+    let mut program = program_values(root, values, None)?;
     program.field = program
         .parse_field_path(format!("{}.dockstride.Config", program.field))
         .map_err(|error| diagnostic(&program, error.into()))?;
@@ -239,8 +236,14 @@ pub fn schema(root: &Path, candidate: Option<&Value>) -> Result<Vec<Field>> {
         .map_err(|error| diagnostic(&program, error))?;
     let data =
         record(&spine).ok_or_else(|| anyhow!("dockstride.Config must be a record contract"))?;
+    if data.fields.keys().any(|name| name.label() == "_dockstride") {
+        bail!("dockstride.Config cannot define reserved _dockstride metadata");
+    }
     let mut fields = Vec::new();
     discover(data, "", &mut fields);
+    if fields.iter().any(|field| field.path == "_dockstride" || field.path.starts_with("_dockstride.")) {
+        bail!("dockstride.Config cannot define reserved _dockstride metadata");
+    }
     fields.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(fields)
 }
@@ -253,6 +256,19 @@ pub fn setup_metadata(root: &Path, candidate: Option<&Value>) -> Result<Value> {
     )
 }
 
+/// Discover allocation names without forcing policy values or unrelated setup.
+pub(crate) fn allocation_fields_values(root: &Path, values: &Value) -> Result<Vec<String>> {
+    let fields = export_values(root, values,
+        "let p = import \"compose.ncl\" in if std.record.has_field \"setup\" p.dockstride && std.record.has_field \"ports\" p.dockstride.setup then std.record.fields p.dockstride.setup.ports else []")?;
+    serde_json::from_value(fields).context("setup port fields must be strings")
+}
+
+/// Discover commands/defaults without forcing operational metadata or service inputs.
+pub fn bootstrap_metadata(root: &Path, candidate: Option<&Value>) -> Result<Value> {
+    export(root, candidate,
+        "let p = import \"compose.ncl\" in let m = p.dockstride in {commands = if std.record.has_field \"commands\" m then m.commands else {}, setup = {defaults = if std.record.has_field \"setup\" m && std.record.has_field \"defaults\" m.setup then m.setup.defaults else null}}")
+}
+
 pub fn metadata(root: &Path, candidate: Option<&Value>) -> Result<Value> {
     // Operational metadata is evaluated only after complete input validation. Setup
     // callers use setup_metadata so missing action/readiness inputs stay unforced.
@@ -261,8 +277,13 @@ pub fn metadata(root: &Path, candidate: Option<&Value>) -> Result<Value> {
 }
 
 pub fn validate_field(root: &Path, path: &str, value: &Value, candidate: &Value) -> Result<()> {
+    let values = env_data(root, Some(candidate))?;
+    validate_field_values(root, path, value, &values)
+}
+
+pub(crate) fn validate_field_values(root: &Path, path: &str, value: &Value, values: &Value) -> Result<()> {
     let selector = field_expr(path)?;
-    let fields = schema(root, Some(candidate))?;
+    let fields = schema_values(root, values)?;
     if !fields.iter().any(|field| field.path == path) {
         bail!("unknown configuration field {path}; inspect dks config schema");
     }
@@ -271,7 +292,7 @@ pub fn validate_field(root: &Path, path: &str, value: &Value, candidate: &Value)
     let expression = format!(
         "let p = import \"compose.ncl\" in let env | p.dockstride.Config = import \"env.yaml\" in env.{selector}"
     );
-    let checked = export(root, Some(candidate), &expression).with_context(|| {
+    let checked = export_values(root, values, &expression).with_context(|| {
         format!("invalid env.yaml field {path}; correct with dks config set {path} <value>")
     })?;
     // The explicit value protects callers accidentally validating a different candidate.
@@ -282,18 +303,23 @@ pub fn validate_field(root: &Path, path: &str, value: &Value, candidate: &Value)
 }
 
 pub fn evaluate(root: &Path, candidate: Option<&Value>) -> Result<Project> {
-    let env = export(root, candidate, "let p = import \"compose.ncl\" in let env | p.dockstride.Config = import \"env.yaml\" in env")
+    let snapshot = crate::sources::snapshot(root, candidate)?;
+    evaluate_values(root, &snapshot.values).with_context(|| format!("evaluating environment with shared sources {:?}", snapshot.sources))
+}
+
+pub(crate) fn evaluate_values(root: &Path, values: &Value) -> Result<Project> {
+    let env = export_values(root, values, "let p = import \"compose.ncl\" in let env | p.dockstride.Config = import \"env.yaml\" in env")
         .context("validating complete env.yaml; run dks setup for missing inputs")?;
-    let metadata = metadata(root, Some(&env))?;
+    // The contract-expanded environment is already effective: never resolve it as a
+    // local document, which would lose inherited provenance and source declarations.
+    let metadata = export_values(root, &env, "let p = import \"compose.ncl\" in let m = p.dockstride in let remove = fun k r => if std.record.has_field k r then std.record.remove k r else r in m |> remove \"Config\" |> remove \"canonical\"")?;
     if !metadata.is_object() {
         bail!("dockstride metadata must be a record");
     }
-    let model = export(
-        root,
-        Some(&env),
+    let model = export_values(root, &env,
         "let p = import \"compose.ncl\" in if std.record.has_field \"canonical\" p.dockstride then p.dockstride.canonical else p",
     )?;
-    let fields = schema(root, Some(&env))?;
+    let fields = schema_values(root, &env)?;
     Ok(Project {
         root: fs::canonicalize(root)?,
         env,

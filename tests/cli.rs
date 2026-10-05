@@ -7,12 +7,24 @@ use std::{
 use tempfile::TempDir;
 
 fn cli(root: &Path, args: &[&str]) -> Output {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.join("test-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let docker = bin.join("docker");
+    if !docker.exists() {
+        fs::write(&docker, "#!/bin/sh\ncase \"$1\" in\n info) printf 'cli-fixture-daemon\\n';;\n *) exit 0;;\nesac\n").unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     Command::new(env!("CARGO_BIN_EXE_dks"))
         .arg("--directory")
         .arg(root)
         .args(["--json", "--non-interactive", "--no-color"])
         .args(args)
         .env("NO_COLOR", "1")
+        .env("HOME", root.join("test-home"))
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .env_remove("DOCKER_CONTEXT")
+        .env("DOCKER_HOST", "unix:///cli-fixture.sock")
         .output()
         .expect("start dks")
 }
@@ -221,6 +233,7 @@ esac
         .arg("-C")
         .arg(dir.path())
         .args(["--json", "--non-interactive", "stack", "services"])
+        .env("HOME", dir.path().join("test-home"))
         .env(
             "PATH",
             format!(
@@ -262,5 +275,59 @@ fn starter_renders_with_only_project_configured() {
         assert!(rendered.get("secrets").is_none());
         assert!(rendered["services"]["hello"].get("build").is_none());
         assert!(rendered["services"]["hello"].get("develop").is_none());
+    }
+}
+
+#[test]
+fn named_command_runs_with_incomplete_configuration_without_applying_proposals() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("env.yaml"), "# untouched\n{}\n").unwrap();
+    fs::write(dir.path().join("compose.ncl"), r#"
+let env = import "env.yaml" in {
+  dockstride = {
+    Config = { project | String },
+    commands.probe.argv = ["python3", "probe.py"],
+    actions = [{argv = [env.project]}],
+  },
+  services.api.image = env.project,
+}
+"#).unwrap();
+    fs::write(dir.path().join("probe.py"), r#"import json, os, sys
+context = json.load(sys.stdin)
+assert context["purpose"] == "manual"
+assert "secrets" not in context["settings"]
+print(json.dumps({"schemaVersion":1,"values":{"project":context["projectProposal"]},"connection":os.environ["DOCKER_HOST"]}))
+"#).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_dks"))
+        .args(["--json", "--non-interactive", "-C"]).arg(dir.path())
+        .args(["run", "probe"])
+        .env_remove("DOCKER_CONTEXT").env("DOCKER_HOST", "unix:///not-a-daemon.sock")
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+    let result = terminal(&output);
+    assert_eq!(result["result"]["connection"], "unix:///not-a-daemon.sock");
+    assert_eq!(fs::read_to_string(dir.path().join("env.yaml")).unwrap(), "# untouched\n{}\n");
+}
+
+#[test]
+fn named_command_rejects_oversized_or_multiple_json_documents() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("compose.ncl"), r#"{
+  dockstride = {Config = {}, commands.probe.argv = ["python3", "probe.py"]},
+  services = {},
+}"#).unwrap();
+    for source in [
+        "print('{\"schemaVersion\":1} {\"schemaVersion\":1}')",
+        "print('{\"schemaVersion\":1,\"data\":\"' + 'a'*1048576 + '\"}')",
+    ] {
+        fs::write(dir.path().join("probe.py"), source).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_dks"))
+            .args(["--json", "--non-interactive", "-C"]).arg(dir.path())
+            .args(["run", "probe"])
+            .env_remove("DOCKER_CONTEXT").env("DOCKER_HOST", "unix:///not-a-daemon.sock")
+            .output().unwrap();
+        assert!(!output.status.success());
+        assert_eq!(terminal(&output)["type"], "error");
+        assert!(!dir.path().join("env.yaml").exists());
     }
 }

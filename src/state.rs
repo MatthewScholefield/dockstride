@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -48,6 +49,11 @@ fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Prepare private scratch storage without retaining a publication lock.
+pub(crate) fn prepare(root: &Path) -> Result<()> {
+    private_dir(&root.join(".dockstride"))
+}
+
 pub fn lock(root: &Path, name: &str) -> Result<Lock> {
     valid_name(name)?;
     private_dir(&root.join(".dockstride"))?;
@@ -69,6 +75,18 @@ pub fn lock(root: &Path, name: &str) -> Result<Lock> {
     file.lock_exclusive()
         .context("acquire project operation lock")?;
     Ok(Lock { file })
+}
+
+/// Shared registry/allocation coordination. Keep HOME-based compatibility explicit.
+pub fn global_root() -> Result<PathBuf> {
+    Ok(PathBuf::from(std::env::var_os("HOME").context("HOME required for environment/allocation coordination")?)
+        .join(".local/share/dockstride"))
+}
+
+/// Caller must hold its own checkout lifecycle lock before taking this lock.
+/// Never acquire a different checkout lifecycle lock while holding it.
+pub fn global_lock() -> Result<Lock> {
+    lock(&global_root()?, "environment-allocation")
 }
 
 pub fn random_id() -> Result<String> {
@@ -186,6 +204,19 @@ pub fn read(root: &Path, name: &str) -> Result<Value> {
             serde_json::from_slice(&bytes).with_context(|| format!("read state {}", path.display()))
         }
         None => Ok(Value::Null),
+    }
+}
+
+/// Parse and fingerprint the same secure observation for publication planning.
+pub(crate) fn read_fingerprinted(root: &Path, name: &str) -> Result<(Value, Option<String>)> {
+    let path = state_path(root, name)?;
+    match read_private(root, &path)? {
+        Some(bytes) => {
+            let value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("read state {}", path.display()))?;
+            Ok((value, Some(hex::encode(Sha256::digest(&bytes)))))
+        }
+        None => Ok((Value::Null, None)),
     }
 }
 

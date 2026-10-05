@@ -558,3 +558,30 @@ fn init_refuses_existing_definition_or_library_without_collateral_mutations() {
         }
     }
 }
+
+#[test]
+fn candidate_sources_are_live_stripped_and_not_reinterpreted_after_contract_expansion() {
+    let root = fixture();
+    fs::write(root.path().join("shared.yaml"),"project: inherited\napiPort: 8181\n").unwrap();
+    let original = "project: on-disk\napiPort: 7000\n_dockstride: {sources: []}\n";
+    fs::write(root.path().join("env.yaml"),original).unwrap();
+    let candidate = json!({"_dockstride":{"sources":[{"path":"shared.yaml"}]},"secrets":{"authKey":{"file":"/private/key"}}});
+    let project = nickel::evaluate(root.path(),Some(&candidate)).unwrap();
+    assert_eq!(project.env["project"],"inherited");
+    assert_eq!(project.env["apiPort"],8181);
+    assert!(project.env.get("_dockstride").is_none());
+    assert_eq!(project.model["services"]["api"]["ports"],json!(["8181:8000"]));
+    fs::write(root.path().join("shared.yaml"),"project: changed\napiPort: 8282\n").unwrap();
+    let project = nickel::evaluate(root.path(),Some(&candidate)).unwrap();
+    assert_eq!(project.env["project"],"changed");
+    assert_eq!(project.metadata["endpoints"]["api"],"http://localhost:8282");
+    assert_eq!(fs::read_to_string(root.path().join("env.yaml")).unwrap(),original);
+}
+
+#[test]
+fn application_contract_cannot_claim_reserved_metadata_even_as_an_empty_record() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("compose.ncl"),"let configContract = {_dockstride = {}} in {dockstride | not_exported = {Config = configContract}, services = {}}\n").unwrap();
+    let error = format!("{:#}",nickel::schema(root.path(),None).unwrap_err());
+    assert!(error.contains("reserved _dockstride"),"{error}");
+}

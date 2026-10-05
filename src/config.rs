@@ -1,11 +1,12 @@
-use crate::{model::Field, nickel, state};
+use crate::{model::Field, nickel, state, sources, publication, output::Output};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::collections::BTreeMap;
 
 #[derive(Debug)]
 pub struct MissingInputs {
@@ -26,7 +27,7 @@ impl std::fmt::Display for MissingInputs {
 }
 impl std::error::Error for MissingInputs {}
 
-fn parse_document(text: &str) -> Result<Value> {
+pub(crate) fn parse_document(text: &str) -> Result<Value> {
     let value: Value = serde_yaml::from_str(text).context("invalid env.yaml")?;
     if value.is_null() {
         return Ok(json!({}));
@@ -36,6 +37,7 @@ fn parse_document(text: &str) -> Result<Value> {
         "env.yaml must contain a mapping of configuration fields"
     );
     check_secrets(&value)?;
+    sources::descriptors(&value)?;
     Ok(value)
 }
 
@@ -68,7 +70,7 @@ fn at<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
         .try_fold(value, |value, key| value.as_object()?.get(key))
 }
 
-fn put(value: &mut Value, path: &str, replacement: Option<Value>) -> Result<()> {
+pub(crate) fn put(value: &mut Value, path: &str, replacement: Option<Value>) -> Result<()> {
     let keys = parts(path)?;
     let mut object = value
         .as_object_mut()
@@ -90,7 +92,7 @@ fn put(value: &mut Value, path: &str, replacement: Option<Value>) -> Result<()> 
     Ok(())
 }
 
-fn effective(env: &Value, fields: &[Field]) -> Result<Value> {
+pub(crate) fn effective(env: &Value, fields: &[Field]) -> Result<Value> {
     let mut value = env.clone();
     // Parents precede children so a nested default never hides an explicit child value.
     let mut defaults: Vec<_> = fields.iter().filter(|f| f.default.is_some()).collect();
@@ -131,7 +133,7 @@ fn secret_reference(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn check_secrets(value: &Value) -> Result<()> {
+pub(crate) fn check_secrets(value: &Value) -> Result<()> {
     if let Some(secrets) = value.get("secrets") {
         for (name, reference) in secrets
             .as_object()
@@ -150,33 +152,43 @@ fn missing(env: &Value, fields: &[Field], include_secrets: bool) -> Result<Vec<V
 }
 
 pub fn list(root: &Path) -> Result<Value> {
-    let env = read_env(root)?;
-    let fields = nickel::schema(root, Some(&env))?;
-    let values = effective(&env, &fields)?;
+    let snapshot = sources::snapshot(root, None)?;
+    let env = &snapshot.values;
+    let fields = nickel::schema_values(root, env)?;
+    let values = effective(env, &fields)?;
     let entries: Vec<_> = fields.iter().map(|field| {
-        let explicit = at(&env, &field.path);
+        let explicit = at(env, &field.path);
         let value = at(&values, &field.path);
         json!({"path":field.path,"kind":field.kind,"value":value,"default":field.default,"doc":field.doc,"required":field.required,"choices":field.choices,
-            "origin":if explicit.is_some(){"env.yaml"}else if value.is_some(){"default"}else{"missing"},"secret":is_secret(&field.path)})
+            "origin":if explicit.is_some(){origin(&snapshot,&field.path)}else if value.is_some(){"default".to_owned()}else{"missing".to_owned()},"provenance":snapshot.provenance.get(&field.path),"secret":is_secret(&field.path)})
     }).collect();
-    Ok(json!({"fields":entries,"missing":missing(&env,&fields,true)?}))
+    Ok(json!({"fields":entries,"missing":missing(env,&fields,true)?,"pending":publication::pending(root)?}))
 }
 
 pub fn get(root: &Path, path: &str) -> Result<Value> {
     parts(path)?;
-    let env = read_env(root)?;
-    let fields = nickel::schema(root, Some(&env))?;
-    let values = effective(&env, &fields)?;
+    let snapshot = sources::snapshot(root, None)?;
+    let env = &snapshot.values;
+    let fields = nickel::schema_values(root, env)?;
+    let values = effective(env, &fields)?;
     ensure!(
         fields
             .iter()
             .any(|f| f.path == path || f.path.starts_with(&format!("{path}.")))
-            || at(&env, path).is_some(),
+            || at(env, path).is_some(),
         "unknown configuration field {path}"
     );
     Ok(
-        json!({"path":path,"value":at(&values,path),"origin":if at(&env,path).is_some(){"env.yaml"}else if at(&values,path).is_some(){"default"}else{"missing"}}),
+        json!({"path":path,"value":at(&values,path),"origin":if at(env,path).is_some(){origin(&snapshot,path)}else if at(&values,path).is_some(){"default".to_owned()}else{"missing".to_owned()},"provenance":snapshot.provenance.get(path),"pending":publication::pending(root)?}),
     )
+}
+
+fn origin(snapshot: &sources::EnvironmentSnapshot, path: &str) -> String {
+    snapshot.provenance.get(path).map(|origin| {
+        if origin.file == snapshot.local_file {
+            "env.yaml".to_owned()
+        } else { origin.file.display().to_string() }
+    }).unwrap_or_else(|| "missing".to_owned())
 }
 
 fn live_owned_resources(root: &Path, identity: &Value) -> Result<bool> {
@@ -241,24 +253,29 @@ fn protect_identity(root: &Path, before: &Value, after: &Value, fields: &[Field]
 
 fn validate_candidate(root: &Path, before: &Value, candidate: &Value) -> Result<Vec<Field>> {
     check_secrets(candidate)?;
-    let fields = nickel::schema(root, Some(candidate))?;
-    let previous_fields = nickel::schema(root, Some(before))?;
+    let old = sources::snapshot(root, Some(before))?;
+    let new = sources::snapshot(root, Some(candidate))?;
+    validate_values(root, &old.values, &new.values)
+}
+
+fn validate_values(root: &Path, before: &Value, candidate: &Value) -> Result<Vec<Field>> {
+    let fields = nickel::schema_values(root, candidate)?;
+    let previous_fields = nickel::schema_values(root, before)?;
     ensure!(
         !missing(before, &previous_fields, true)?.is_empty()
             || missing(candidate, &fields, true)?.is_empty(),
-        "candidate removes required inputs from a complete environment; env.yaml was not changed"
+        "candidate removes required inputs from a complete environment; configuration was not changed"
     );
     protect_identity(root, before, candidate, &fields)?;
-    // Nickel remains authoritative, even while unrelated required inputs are absent.
     for field in &fields {
         if let Some(value) = at(candidate, &field.path) {
-            nickel::validate_field(root, &field.path, value, candidate)
+            nickel::validate_field_values(root, &field.path, value, candidate)
                 .with_context(|| format!("invalid configuration field {}", field.path))?;
         }
     }
     if missing(candidate, &fields, true)?.is_empty() {
-        nickel::evaluate(root, Some(candidate))
-            .context("candidate environment evaluation failed; env.yaml was not changed")?;
+        nickel::evaluate_values(root, candidate)
+            .context("candidate environment evaluation failed; configuration was not changed")?;
     }
     Ok(fields)
 }
@@ -337,12 +354,25 @@ fn entries(text: &str) -> Result<Vec<Entry>> {
     let mut parents: Vec<(usize, String)> = Vec::new();
     let mut offset = 0;
     let mut scalar_indent = None;
+    let mut sequence_indent = None;
     for line in text.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
         let indent = content.len() - content.trim_start_matches(' ').len();
         let body = &content[indent..];
         let significant = !body.is_empty() && !body.starts_with('#');
         if scalar_indent.is_some_and(|parent| !significant || indent > parent) {
+            offset += line.len();
+            continue;
+        }
+        if sequence_indent.is_some_and(|parent| !significant || indent > parent || (indent == parent && body.starts_with('-'))) {
+            offset += line.len();
+            continue;
+        }
+        sequence_indent = None;
+        // YAML permits indentless block sequences at the mapping value's indent.
+        // Their rows and nested fields belong to that value, not sibling mappings.
+        if body.starts_with("- ") || body == "-" {
+            sequence_indent = Some(indent);
             offset += line.len();
             continue;
         }
@@ -574,20 +604,68 @@ fn edit_document(
     Ok(edited)
 }
 
+/// Recover under a short publication hierarchy before reading candidates or
+/// running trusted project/editor processes without those guards.
+fn recover(root: &Path) -> Result<()> {
+    let _lifecycle = state::lock(root, "lifecycle")?;
+    let _global = state::global_lock()?;
+    let _allocation = state::lock(root, "port-allocation")?;
+    let _config = state::lock(root, "config")?;
+    publication::recover_locked(root)?;
+    Ok(())
+}
+
+/// Attach authoritative registry state only at the complete managed boundary.
+/// Snapshot values are evaluated, never persisted as flattened local overrides.
+fn publish_candidate(root: &Path, operation: &str, mut changes: Vec<publication::Change>, snapshot: &sources::EnvironmentSnapshot, allocations: Option<&Value>) -> Result<()> {
+    let mut claims = json!({});
+    if crate::runtime::managed_invocation() {
+        let fields = nickel::schema_values(root, &snapshot.values)?;
+        if missing(&snapshot.values, &fields, true)?.is_empty() {
+            let project = nickel::evaluate_values(root, &snapshot.values)?;
+            let registration = crate::registry::prepare(&project, &snapshot.sources, allocations)?;
+            changes.extend(registration.changes);
+            claims = registration.claims;
+        }
+    }
+    snapshot.verify()?;
+    if !changes.is_empty() {
+        publication::publish(root, operation, changes, claims)?;
+    }
+    Ok(())
+}
+
 fn mutate(root: &Path, path: &str, replacement: Option<Value>, secret: bool) -> Result<Value> {
     parts(path)?;
     ensure!(
         secret || !is_secret(path),
         "secret configuration is reference-only; use dks secrets replace or dks setup"
     );
-    let _lifecycle = if path == "project" || path == "backend" {
-        Some(state::lock(root, "lifecycle")?)
-    } else {
-        None
-    };
-    let _lock = state::lock(root, "config")?;
+    let _lifecycle = state::lock(root, "lifecycle")?;
+    let _global = state::global_lock()?;
+    let _allocation = state::lock(root, "port-allocation")?;
+    let _config = state::lock(root, "config")?;
+    publication::recover_locked(root)?;
+    let snapshot = sources::snapshot(root, None)?;
+    let _sources = sources::lock_paths(snapshot.fingerprints.keys().cloned())?;
+    snapshot.verify()?;
+    mutate_locked(root, path, replacement, secret)
+}
+
+/// Publish a local edit with the invoking lifecycle, global, config coordination,
+/// and canonical local/source graph guards already held, in that order.
+/// This helper acquires none of those guards; validation and fingerprint checks
+/// remain active so callers must not pass an unprotected effective snapshot.
+fn mutate_locked(root: &Path, path: &str, replacement: Option<Value>, secret: bool) -> Result<Value> {
+    parts(path)?;
+    ensure!(
+        secret || !is_secret(path),
+        "secret configuration is reference-only; use dks secrets replace or dks setup"
+    );
     let text = document(root)?;
     let before = parse_document(&text)?;
+    let snapshot = sources::snapshot(root, Some(&before))?;
+    snapshot.verify_text(&snapshot.local_file, &text)?;
     let schema = nickel::schema(root, Some(&before))?;
     ensure!(
         schema
@@ -599,7 +677,7 @@ fn mutate(root: &Path, path: &str, replacement: Option<Value>, secret: bool) -> 
     let mut candidate = before.clone();
     put(&mut candidate, path, replacement.clone())?;
     if replacement.is_none() {
-        let values = effective(&candidate, &schema)?;
+        let values = effective(&sources::snapshot(root, Some(&candidate))?.values, &schema)?;
         ensure!(
             !schema.iter().any(|f| f.required
                 && (f.path == path || f.path.starts_with(&format!("{path}.")))
@@ -609,10 +687,18 @@ fn mutate(root: &Path, path: &str, replacement: Option<Value>, secret: bool) -> 
     }
     let fields = validate_candidate(root, &before, &candidate)?;
     let edited = edit_document(&text, &before, &candidate, path, replacement.as_ref())?;
-    state::atomic_write(&root.join("env.yaml"), edited.as_bytes(), 0o600)?;
-    let values = effective(&candidate, &fields)?;
+    snapshot.verify()?;
+    let change = publication::Change::replace(&root.join("env.yaml"), edited.as_bytes(), 0o600)?;
+    snapshot.verify()?;
+    let candidate_snapshot = sources::snapshot(root, Some(&candidate))?;
+    let mut changes = vec![change];
+    let allocation_edit = crate::allocations::prepare_local_edit(root, &before, &candidate, &[path.to_owned()])?;
+    if let Some((change, _)) = &allocation_edit { changes.push(change.clone()); }
+    publish_candidate(root, "config-set", changes, &candidate_snapshot, allocation_edit.as_ref().map(|(_, allocations)| allocations))?;
+    let snapshot = sources::snapshot(root, Some(&candidate))?;
+    let values = effective(&snapshot.values, &fields)?;
     Ok(
-        json!({"path":path,"value":at(&values,path),"origin":if at(&candidate,path).is_some(){"env.yaml"}else if at(&values,path).is_some(){"default"}else{"missing"},"missing":missing(&candidate,&fields,true)?,"applied":false}),
+        json!({"path":path,"value":at(&values,path),"origin":if at(&snapshot.values,path).is_some(){origin(&snapshot,path)}else if at(&values,path).is_some(){"default".to_owned()}else{"missing".to_owned()},"provenance":snapshot.provenance.get(path),"missing":missing(&snapshot.values,&fields,true)?,"applied":false}),
     )
 }
 
@@ -622,13 +708,71 @@ pub fn set(root: &Path, path: &str, value: Value) -> Result<Value> {
 pub fn unset(root: &Path, path: &str) -> Result<Value> {
     mutate(root, path, None, false)
 }
-pub fn set_secret_reference(root: &Path, name: &str, reference: &Value) -> Result<()> {
+
+/// Prepare a single validated document transition for an allocation batch.
+pub(crate) fn prepare_sets_locked(root: &Path, updates: &[(String, Value)]) -> Result<publication::Change> {
+    let text = document(root)?;
+    let before = parse_document(&text)?;
+    let snapshot = sources::snapshot(root, Some(&before))?;
+    snapshot.verify_text(&snapshot.local_file, &text)?;
+    let mut candidate = before.clone();
+    let mut edited = text;
+    for (path, value) in updates {
+        parts(path)?;
+        ensure!(!is_secret(path), "secret configuration is reference-only; use dks secrets replace or dks setup");
+        let previous = candidate.clone();
+        put(&mut candidate, path, Some(value.clone()))?;
+        edited = edit_document(&edited, &previous, &candidate, path, Some(value))?;
+    }
+    let fields = validate_candidate(root, &before, &candidate)?;
+    for (path, _) in updates {
+        ensure!(fields.iter().any(|field| field.path == *path || field.path.starts_with(&format!("{path}."))), "unknown configuration field {path}");
+    }
+    let change = publication::Change::replace(&root.join("env.yaml"), edited.as_bytes(), 0o600)?;
+    snapshot.verify()?;
+    Ok(change)
+}
+
+/// Prepare generated-field removal without publishing or reacquiring caller guards.
+pub fn prepare_removals_locked(root: &Path, paths: &[String]) -> Result<publication::Change> {
+    let text = document(root)?;
+    let before = parse_document(&text)?;
+    let snapshot = sources::snapshot(root, Some(&before))?;
+    snapshot.verify_text(&snapshot.local_file, &text)?;
+    let mut candidate = before.clone();
+    let mut edited = text;
+    for path in paths {
+        parts(path)?;
+        ensure!(!is_secret(path), "port release cannot remove secret references");
+        let previous = candidate.clone();
+        put(&mut candidate, path, None)?;
+        edited = edit_document(&edited, &previous, &candidate, path, None)?;
+    }
+    // Endpoint reset may intentionally make a required generated field missing.
+    // Validate remaining values without requiring complete-environment rendering.
+    let after = sources::snapshot(root, Some(&candidate))?;
+    let fields = nickel::schema_values(root, &after.values)?;
+    protect_identity(root, &snapshot.values, &after.values, &fields)?;
+    for field in &fields {
+        if let Some(value) = at(&after.values, &field.path) {
+            nickel::validate_field_values(root, &field.path, value, &after.values)?;
+        }
+    }
+    let change = publication::Change::replace(&root.join("env.yaml"), edited.as_bytes(), 0o600)?;
+    snapshot.verify()?;
+    Ok(change)
+}
+
+/// Publish a checkout-local secret reference under caller-owned publication guards.
+/// The required guards and acquisition order are identical to `set_locked`;
+/// this function never acquires lifecycle/global/config/source locks itself.
+pub(crate) fn set_secret_reference_locked(root: &Path, name: &str, reference: &Value) -> Result<()> {
     ensure!(
         !name.is_empty() && !name.contains('.'),
         "secret name must be a single configuration key"
     );
     secret_reference(reference)?;
-    mutate(
+    mutate_locked(
         root,
         &format!("secrets.{name}"),
         Some(reference.clone()),
@@ -638,14 +782,16 @@ pub fn set_secret_reference(root: &Path, name: &str, reference: &Value) -> Resul
 }
 
 pub fn edit(root: &Path) -> Result<Value> {
-    let _lifecycle = state::lock(root, "lifecycle")?;
-    let _lock = state::lock(root, "config")?;
+    recover(root)?;
     let text = document(root)?;
     let before = parse_document(&text)?;
+    let snapshot = sources::snapshot(root, Some(&before))?;
+    snapshot.verify_text(&snapshot.local_file, &text)?;
     let editor = std::env::var("EDITOR")
         .context("EDITOR is not set; set it to an executable and optional arguments")?;
     let argv = shell_words::split(&editor).context("invalid EDITOR argument quoting")?;
     ensure!(!argv.is_empty(), "EDITOR must name an executable");
+    state::prepare(root)?;
     let temporary = root
         .join(".dockstride")
         .join(format!("edit-{}.yaml", state::random_id()?));
@@ -662,9 +808,26 @@ pub fn edit(root: &Path) -> Result<Value> {
         );
         let edited = fs::read_to_string(&temporary)?;
         let candidate = parse_document(&edited)?;
+        let after = sources::snapshot(root, Some(&candidate))?;
+        let _lifecycle = state::lock(root, "lifecycle")?;
+        let _global = state::global_lock()?;
+        let _allocation = state::lock(root, "port-allocation")?;
+        let _config = state::lock(root, "config")?;
+        publication::recover_locked(root)?;
+        let _sources = sources::lock_paths(snapshot.fingerprints.keys().chain(after.fingerprints.keys()).cloned())?;
+        snapshot.verify()?;
+        after.verify()?;
         let fields = validate_candidate(root, &before, &candidate)?;
-        state::atomic_write(&root.join("env.yaml"), edited.as_bytes(), 0o600)?;
-        Ok(json!({"edited":true,"missing":missing(&candidate,&fields,true)?,"applied":false}))
+        snapshot.verify()?;
+        after.verify()?;
+        let change = publication::Change::replace(&root.join("env.yaml"), edited.as_bytes(), 0o600)?;
+        snapshot.verify()?;
+        after.verify()?;
+        let mut changes = vec![change];
+        let allocation_edit = crate::allocations::prepare_local_edit(root, &before, &candidate, &[])?;
+        if let Some((change, _)) = &allocation_edit { changes.push(change.clone()); }
+        publish_candidate(root, "config-edit", changes, &after, allocation_edit.as_ref().map(|(_, allocations)| allocations))?;
+        Ok(json!({"edited":true,"missing":missing(&sources::snapshot(root,Some(&candidate))?.values,&fields,true)?,"applied":false}))
     })();
     let _ = fs::remove_file(temporary);
     result
@@ -697,40 +860,88 @@ pub fn project_proposal(root: &Path) -> Result<String> {
 }
 
 pub fn setup(root: &Path, inputs: &[String], non_interactive: bool) -> Result<Value> {
+    setup_with_options(root, inputs, non_interactive, 30, &Output::default())
+}
+
+pub fn setup_with_options(root: &Path, inputs: &[String], non_interactive: bool, timeout: u64, output: &Output) -> Result<Value> {
+    setup_with_context(root, inputs, non_interactive, timeout, output, "setup")
+}
+
+pub fn setup_with_context(root: &Path, inputs: &[String], non_interactive: bool, timeout: u64, output: &Output, purpose: &str) -> Result<Value> {
+    recover(root)?;
+    let hook_candidate = setup_plan_candidate(root, inputs)?;
+    let explicit = parse_inputs(inputs)?;
+    // Trusted child execution must never happen under publication/allocation locks.
+    let proposal = crate::defaults::propose_for(root, &hook_candidate, purpose, timeout, output)?;
     let _lifecycle = state::lock(root, "lifecycle")?;
+    let _global = state::global_lock()?;
+    let _allocation = state::lock(root, "port-allocation")?;
     let _lock = state::lock(root, "config")?;
+    publication::recover_locked(root)?;
     let original = document(root)?;
     let before = parse_document(&original)?;
     let mut candidate = before.clone();
     let mut edited = original.clone();
-    let fields = nickel::schema(root, Some(&before))?;
-    for input in inputs {
-        let (path, source) = input
-            .split_once('=')
-            .with_context(|| format!("input {input:?} must be path=value"))?;
-        ensure!(
-            !is_secret(path),
-            "use secret provisioning rather than plaintext setup inputs"
-        );
-        ensure!(
-            fields
-                .iter()
-                .any(|f| f.path == path || f.path.starts_with(&format!("{path}."))),
-            "unknown configuration field {path}"
-        );
-        let value: Value =
-            serde_yaml::from_str(source).with_context(|| format!("invalid value for {path}"))?;
+    for (path, value) in &explicit {
         let previous = candidate.clone();
         put(&mut candidate, path, Some(value.clone()))?;
-        validate_candidate(root, &before, &candidate)?;
-        edited = edit_document(&edited, &previous, &candidate, path, Some(&value))?;
+        edited = edit_document(&edited, &previous, &candidate, path, Some(value))?;
     }
+    // Re-read all live layers after the hook; accepted concurrent settings beat proposals.
+    let explicit_candidate = candidate.clone();
+    let mut overrides = BTreeMap::new();
+    let mut creations = Vec::new();
+    if sources::descriptors(&candidate)?.is_none() {
+        if let Some(descriptors) = &proposal.sources {
+            let mut selected = Vec::new();
+            for descriptor in descriptors {
+                let path = if descriptor.path.is_absolute() { descriptor.path.clone() } else { root.join(&descriptor.path) };
+                let path = sources::identity(&path)?;
+                if !path.exists() {
+                    ensure!(descriptor.create_if_missing, "proposed source {} does not exist", path.display());
+                    overrides.insert(path.clone(), json!({}));
+                    creations.push(path.clone());
+                }
+                selected.push(json!({"path":path}));
+            }
+            let previous = candidate.clone();
+            let selected = Value::Array(selected);
+            put(&mut candidate, "_dockstride.sources", Some(selected.clone()))?;
+            edited = edit_document(&edited, &previous, &candidate, "_dockstride.sources", Some(&selected))?;
+        }
+    }
+    let (refreshed, _sources) = loop {
+        // Source creators or shared editors can race lock acquisition. Refresh
+        // their settings, not the command. Canonical graph changes reacquire the
+        // whole sorted lock set instead of introducing an out-of-order lock.
+        overrides.retain(|path, _| !path.exists());
+        let refreshed = sources::snapshot(root, Some(&explicit_candidate))?;
+        let layered = sources::snapshot_with_overrides(root, Some(&candidate), &overrides)?;
+        let locks = sources::lock_paths(refreshed.fingerprints.keys().chain(layered.fingerprints.keys()).cloned())?;
+        if sources::unchanged(&refreshed)? && sources::unchanged(&layered)?
+            && overrides.keys().all(|path| layered.fingerprints.get(path) == Some(&None)) {
+            break (refreshed, locks);
+        }
+        drop(locks);
+    };
+    refreshed.verify_text(&refreshed.local_file, &original)?;
+    creations.retain(|path| overrides.contains_key(path));
+    apply_proposals(root, &mut candidate, &mut edited, &proposal.values, &overrides)?;
+    let candidate_snapshot = sources::snapshot_with_overrides(root, Some(&candidate), &overrides)?;
+    // Validate the complete proposed publication before creating any source file.
+    validate_values(root, &refreshed.values, &candidate_snapshot.values)?;
+    let publication_snapshot = candidate_snapshot;
+    let fields = nickel::schema_values(root, &publication_snapshot.values)?;
+    let allocated_fields = if purpose != "deploy" {
+        crate::allocations::eligible_fields(root, &publication_snapshot.values, &fields)?
+    } else { Vec::new() };
     let interactive = !non_interactive && io::stdin().is_terminal();
     if interactive {
         for field in &fields {
             if !field.required
                 || is_secret(&field.path)
-                || at(&effective(&candidate, &fields)?, &field.path).is_some()
+                || allocated_fields.contains(&field.path)
+                || at(&effective(&sources::snapshot_with_overrides(root,Some(&candidate),&overrides)?.values, &fields)?, &field.path).is_some()
             {
                 continue;
             }
@@ -782,7 +993,8 @@ pub fn setup(root: &Path, inputs: &[String], non_interactive: bool) -> Result<Va
                 };
                 let previous = candidate.clone();
                 put(&mut candidate, &field.path, Some(value.clone()))?;
-                match validate_candidate(root, &before, &candidate) {
+                let proposed = sources::snapshot_with_overrides(root, Some(&candidate), &overrides)?;
+                match validate_values(root, &refreshed.values, &proposed.values) {
                     Ok(_) => {
                         edited = edit_document(
                             &edited,
@@ -801,12 +1013,27 @@ pub fn setup(root: &Path, inputs: &[String], non_interactive: bool) -> Result<Va
             }
         }
     }
-    let fields = validate_candidate(root, &before, &candidate)?;
+    let final_snapshot = sources::snapshot_with_overrides(root, Some(&candidate), &overrides)?;
+    let fields = validate_values(root, &refreshed.values, &final_snapshot.values)?;
+    publication_snapshot.verify()?;
+    final_snapshot.verify()?;
+    refreshed.verify()?;
+    let mut changes = creations.iter().map(|path| publication::Change::create(path, b"{}\n", 0o600)).collect::<Result<Vec<_>>>()?;
     if edited != original {
-        state::atomic_write(&root.join("env.yaml"), edited.as_bytes(), 0o600)?;
+        changes.push(publication::Change::replace(&root.join("env.yaml"), edited.as_bytes(), 0o600)?);
     }
-    let missing = missing(&candidate, &fields, false)?;
-    let secret_missing = self::missing(&candidate, &fields, true)?
+    publication_snapshot.verify()?;
+    final_snapshot.verify()?;
+    refreshed.verify()?;
+    let touched = explicit.iter().map(|(path, _)| path.clone()).collect::<Vec<_>>();
+    let allocation_edit = crate::allocations::prepare_local_edit(root, &before, &candidate, &touched)?;
+    if let Some((change, _)) = &allocation_edit { changes.push(change.clone()); }
+    publish_candidate(root, "setup", changes, &final_snapshot, allocation_edit.as_ref().map(|(_, allocations)| allocations))?;
+    let values = final_snapshot.values;
+    let mut missing = missing(&values, &fields, false)?;
+    let deferred_ports = missing.iter().filter(|entry| entry["path"].as_str().is_some_and(|path| allocated_fields.iter().any(|field| field == path))).cloned().collect::<Vec<_>>();
+    missing.retain(|entry| !entry["path"].as_str().is_some_and(|path| allocated_fields.iter().any(|field| field == path)));
+    let secret_missing = self::missing(&values, &fields, true)?
         .into_iter()
         .filter(|entry| entry["path"].as_str().is_some_and(is_secret))
         .collect::<Vec<_>>();
@@ -825,6 +1052,248 @@ pub fn setup(root: &Path, inputs: &[String], non_interactive: bool) -> Result<Va
         .into());
     }
     Ok(
-        json!({"status":if missing.is_empty(){"configured"}else{"missing"},"complete":missing.is_empty() && secret_missing.is_empty(),"missing":missing,"secret_missing":secret_missing,"project_proposal":project_proposal(root)?,"changed":edited!=original}),
+        json!({"status":if deferred_ports.is_empty(){"configured"}else{"allocation-required"},"complete":secret_missing.is_empty() && deferred_ports.is_empty(),"missing":missing,"deferredPorts":deferred_ports,"secret_missing":secret_missing,"project_proposal":project_proposal(root)?,"changed":edited!=original}),
     )
+}
+
+fn parse_inputs(inputs: &[String]) -> Result<Vec<(String,Value)>> {
+    inputs.iter().map(|input| {
+        let (path, source) = input.split_once('=').with_context(|| format!("input {input:?} must be path=value"))?;
+        ensure!(!is_secret(path), "use secret provisioning rather than plaintext setup inputs");
+        let value: Value = serde_yaml::from_str(source).with_context(|| format!("invalid value for {path}"))?;
+        ensure!(path != "_dockstride.sources" || value == json!([]), "setup source input only supports _dockstride.sources=[]; use dks config sources add");
+        ensure!(!(path == "_dockstride" || path.starts_with("_dockstride.")) || path == "_dockstride.sources", "reserved configuration path {path}");
+        Ok((path.to_owned(),value))
+    }).collect()
+}
+
+pub fn setup_plan_candidate(root: &Path, inputs: &[String]) -> Result<Value> {
+    let before = read_env(root)?;
+    let mut candidate = before.clone();
+    let explicit = parse_inputs(inputs)?;
+    for (path,value) in &explicit { put(&mut candidate,path,Some(value.clone()))?; }
+    let fields = nickel::schema(root,Some(&candidate))?;
+    for (path,_) in &explicit {
+        ensure!(path == "_dockstride.sources" || fields.iter().any(|field| field.path == *path || field.path.starts_with(&format!("{path}."))), "unknown configuration field {path}");
+    }
+    validate_candidate(root,&before,&candidate)?;
+    Ok(candidate)
+}
+
+fn proposal_entries(value: &Value, prefix: &str, entries: &mut Vec<(String, Value)>) {
+    if let Some(mapping) = value.as_object().filter(|mapping| !mapping.is_empty()) {
+        for (key, value) in mapping {
+            proposal_entries(value, &if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") }, entries);
+        }
+    } else if !prefix.is_empty() { entries.push((prefix.to_owned(), value.clone())); }
+}
+
+fn apply_proposals(root: &Path, candidate: &mut Value, edited: &mut String, values: &Value, overrides: &BTreeMap<PathBuf,Value>) -> Result<()> {
+    let snapshot = sources::snapshot_with_overrides(root, Some(candidate), overrides)?;
+    let fields = nickel::schema_values(root, &snapshot.values)?;
+    let mut effective_values = effective(&snapshot.values, &fields)?;
+    let mut entries = Vec::new();
+    proposal_entries(values, "", &mut entries);
+    for (path, value) in entries {
+        // Explicit null is a value. Inherited and contract defaults are satisfied.
+        if at(&effective_values, &path).is_some() { continue; }
+        // A non-record ancestor is a replacement boundary, not a missing child.
+        let parts = parts(&path)?;
+        if (1..parts.len()).any(|end| at(&effective_values,&parts[..end].join(".")).is_some_and(|v| !v.is_object())) { continue; }
+        let previous = candidate.clone();
+        put(candidate, &path, Some(value.clone()))?;
+        put(&mut effective_values, &path, Some(value.clone()))?;
+        *edited = edit_document(edited, &previous, candidate, &path, Some(&value))?;
+    }
+    Ok(())
+}
+
+pub fn sources_list(root: &Path) -> Result<Value> {
+    let snapshot = sources::snapshot(root, None)?;
+    let direct = sources::descriptors(&snapshot.local)?.unwrap_or_default();
+    Ok(json!({"declared":sources::descriptors(&snapshot.local)?.is_some(),"sources":direct.iter().map(|path| json!({"path":path,"resolved":sources::identity(&if path.is_absolute(){path.clone()}else{root.join(path)}).ok()})).collect::<Vec<_>>(),"resolved":snapshot.sources,"pending":publication::pending(root)?}))
+}
+
+pub fn sources_add(root: &Path, path: &Path, create: bool) -> Result<Value> {
+    change_sources(root, path, Some(create))
+}
+
+pub fn sources_remove(root: &Path, path: &Path) -> Result<Value> {
+    change_sources(root, path, None)
+}
+
+fn change_sources(root: &Path, path: &Path, add: Option<bool>) -> Result<Value> {
+    let _lifecycle = state::lock(root,"lifecycle")?;
+    let _global = state::global_lock()?;
+    let _config = state::lock(root,"config")?;
+    publication::recover_locked(root)?;
+    let text = document(root)?;
+    let before = parse_document(&text)?;
+    let previous = sources::snapshot(root,Some(&before))?;
+    previous.verify_text(&previous.local_file, &text)?;
+    let target = sources::identity(&if path.is_absolute(){path.to_owned()}else{root.join(path)})?;
+    let mut selected = sources::descriptors(&before)?.unwrap_or_default();
+    let matches = |path: &PathBuf| sources::identity(&if path.is_absolute(){path.clone()}else{root.join(path)}).map(|path| path == target);
+    let mut overrides = BTreeMap::new();
+    let mut create = false;
+    if let Some(allow_create) = add {
+        ensure!(!selected.iter().map(matches).collect::<Result<Vec<_>>>()?.contains(&true), "shared source {} is already selected", target.display());
+        if !target.exists() {
+            ensure!(allow_create,"shared source {} does not exist; use --create",target.display());
+            overrides.insert(target.clone(),json!({}));
+            create = true;
+        }
+        selected.push(target.clone());
+    } else {
+        let mut retained = Vec::new();
+        let mut removed = false;
+        for path in selected { if matches(&path)? { removed = true; } else { retained.push(path); } }
+        ensure!(removed,"{} is not a directly selected shared source",target.display());
+        selected = retained;
+    }
+    let selection = json!(selected.into_iter().map(|path| json!({"path":path})).collect::<Vec<_>>());
+    let mut candidate = before.clone();
+    put(&mut candidate,"_dockstride.sources",Some(selection.clone()))?;
+    let (previous, next, _locks) = loop {
+        // A winner observed before staging is inherited and validated normally;
+        // a later create-new conflict belongs to pending recovery.
+        overrides.retain(|path, _| !path.exists());
+        let previous = sources::snapshot(root, Some(&before))?;
+        let next = sources::snapshot_with_overrides(root, Some(&candidate), &overrides)?;
+        let locks = sources::lock_paths(previous.fingerprints.keys().chain(next.fingerprints.keys()).cloned())?;
+        if sources::unchanged(&previous)? && sources::unchanged(&next)?
+            && overrides.keys().all(|path| next.fingerprints.get(path) == Some(&None)) {
+            break (previous, next, locks);
+        }
+        drop(locks);
+    };
+    previous.verify_text(&previous.local_file, &text)?;
+    validate_values(root,&previous.values,&next.values)?;
+    let edited = edit_document(&text,&before,&candidate,"_dockstride.sources",Some(&selection))?;
+    previous.verify()?;
+    next.verify()?;
+    let mut changes = Vec::new();
+    if create && overrides.contains_key(&target) {
+        changes.push(publication::Change::create(&target, b"{}\n", 0o600)?);
+    }
+    changes.push(publication::Change::replace(&root.join("env.yaml"),edited.as_bytes(),0o600)?);
+    previous.verify()?;
+    next.verify()?;
+    publish_candidate(root, "config-sources", changes, &next, None)?;
+    sources_list(root)
+}
+
+fn shared_target(root: &Path, local: &Value, source: Option<&Path>) -> Result<PathBuf> {
+    let direct = sources::descriptors(local)?.unwrap_or_default().into_iter().map(|path| sources::identity(&if path.is_absolute(){path}else{root.join(path)})).collect::<Result<Vec<_>>>()?;
+    if let Some(source) = source {
+        let source = sources::identity(&if source.is_absolute(){source.to_owned()}else{root.join(source)})?;
+        ensure!(direct.contains(&source),"{} is not a directly selected source; transitive sources are not edit targets",source.display());
+        Ok(source)
+    } else {
+        ensure!(direct.len() == 1,"shared edits require exactly one direct source or --source FILE");
+        Ok(direct[0].clone())
+    }
+}
+
+pub fn set_shared(root: &Path, path: &str, value: Value, source: Option<&Path>) -> Result<Value> {
+    mutate_shared(root,path,Some(value),source)
+}
+
+pub fn unset_shared(root: &Path, path: &str, source: Option<&Path>) -> Result<Value> {
+    mutate_shared(root,path,None,source)
+}
+
+fn mutate_shared(root: &Path, path: &str, replacement: Option<Value>, source: Option<&Path>) -> Result<Value> {
+    parts(path)?;
+    ensure!(!is_secret(path) && path != "_dockstride" && !path.starts_with("_dockstride."),"shared edits only accept ordinary configuration fields");
+    let _lifecycle = state::lock(root,"lifecycle")?;
+    let _global = state::global_lock()?;
+    let _config = state::lock(root,"config")?;
+    publication::recover_locked(root)?;
+    let before = sources::snapshot(root,None)?;
+    let target = shared_target(root,&before.local,source)?;
+    let text = fs::read_to_string(&target)?;
+    before.verify_text(&target, &text)?;
+    let raw = sources::parse(&text,&target,true)?;
+    let fields = nickel::schema_values(root,&before.values)?;
+    ensure!(fields.iter().any(|field| field.path == path || field.path.starts_with(&format!("{path}."))),"unknown configuration field {path}");
+    let mut candidate = raw.clone();
+    put(&mut candidate,path,replacement.clone())?;
+    let after = sources::snapshot_with_overrides(root,Some(&before.local),&BTreeMap::from([(target.clone(),candidate.clone())]))?;
+    let _locks = sources::lock_paths(before.fingerprints.keys().chain(after.fingerprints.keys()).cloned())?;
+    before.verify()?;
+    after.verify()?;
+    validate_values(root,&before.values,&after.values).with_context(|| format!("invalid shared candidate {}",target.display()))?;
+    // Validate the edited field even if a local override hides it in this checkout.
+    if let Some(value) = &replacement {
+        let mut validation = after.values.clone();
+        put(&mut validation,path,Some(value.clone()))?;
+        let fields = nickel::schema_values(root,&validation)?;
+        for field in fields.iter().filter(|field| field.path == path || field.path.starts_with(&format!("{path}."))) {
+            if let Some(value) = at(&validation,&field.path) { nickel::validate_field_values(root,&field.path,value,&validation)?; }
+        }
+    }
+    let edited = edit_document(&text,&raw,&candidate,path,replacement.as_ref())?;
+    before.verify()?;
+    after.verify()?;
+    let change = publication::Change::replace(&target,edited.as_bytes(),0o600)?;
+    before.verify()?;
+    after.verify()?;
+    publish_candidate(root, "config-shared", vec![change], &after, None)?;
+    let mut result = get(root,path)?;
+    result["editedSource"] = json!(target);
+    result["applied"] = json!(false);
+    Ok(result)
+}
+
+pub fn edit_shared(root: &Path, source: Option<&Path>) -> Result<Value> {
+    recover(root)?;
+    let before = sources::snapshot(root,None)?;
+    let target = shared_target(root,&before.local,source)?;
+    let text = fs::read_to_string(&target)?;
+    before.verify_text(&target, &text)?;
+    let editor = std::env::var("EDITOR").context("EDITOR is not set; set it to an executable and optional arguments")?;
+    let argv = shell_words::split(&editor).context("invalid EDITOR argument quoting")?;
+    ensure!(!argv.is_empty(),"EDITOR must name an executable");
+    state::prepare(root)?;
+    let temporary = root.join(".dockstride").join(format!("edit-{}.yaml",state::random_id()?));
+    state::atomic_write(&temporary,text.as_bytes(),0o600)?;
+    let result = (|| -> Result<Value> {
+        let status = Command::new(&argv[0]).args(&argv[1..]).arg(&temporary).status().context("launch EDITOR executable")?;
+        ensure!(status.success(),"editor exited with {status}; shared source was not changed");
+        let edited = fs::read_to_string(&temporary)?;
+        let candidate = sources::parse(&edited,&target,true)?;
+        let after = sources::snapshot_with_overrides(root,Some(&before.local),&BTreeMap::from([(target.clone(),candidate.clone())]))?;
+        let _lifecycle = state::lock(root, "lifecycle")?;
+        let _global = state::global_lock()?;
+        let _config = state::lock(root, "config")?;
+        publication::recover_locked(root)?;
+        let _locks = sources::lock_paths(before.fingerprints.keys().chain(after.fingerprints.keys()).cloned())?;
+        before.verify()?;
+        after.verify()?;
+        let fields = validate_values(root,&before.values,&after.values).with_context(|| format!("invalid shared candidate {}",target.display()))?;
+        validate_shared_fields(root,&after.values,&candidate)?;
+        before.verify()?;
+        after.verify()?;
+        let change = publication::Change::replace(&target,edited.as_bytes(),0o600)?;
+        before.verify()?;
+        after.verify()?;
+        publish_candidate(root, "config-shared-edit", vec![change], &after, None)?;
+        Ok(json!({"edited":true,"editedSource":target,"missing":missing(&after.values,&fields,true)?,"applied":false}))
+    })();
+    let _ = fs::remove_file(temporary);
+    result
+}
+
+fn validate_shared_fields(root: &Path, effective: &Value, shared: &Value) -> Result<()> {
+    let mut shared = shared.clone();
+    shared.as_object_mut().unwrap().remove("_dockstride");
+    let mut values = effective.clone();
+    sources::merge(&mut values,&shared);
+    for field in nickel::schema_values(root,&values)? {
+        if let Some(value) = at(&values,&field.path) {
+            nickel::validate_field_values(root,&field.path,value,&values)?;
+        }
+    }
+    Ok(())
 }

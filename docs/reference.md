@@ -40,6 +40,8 @@ Nickel records are recursive: `Config = Config` would shadow an outer binding an
 
 Library interfaces: `Choice`, `Backend`, `Port`, `SecretSource`, `GenerateSecret`, `PromptSecret`, `FileSecret`, `StdinSecret`, and `forEnvironment`, whose record provides `ComposeFile`, `Service`, `Env`, `image`, `grantSecrets`, and `secretPath`. `Env` converts scalars into Docker environment strings. `_FILE` handling is application code, not Docker magic.
 
+The pinned library snapshot is version `0.2.0`, evaluated by embedded Nickel `0.19.0`. Keep the application's checked-in copy aligned with the CLI's embedded library; evaluation never fetches a newer snapshot.
+
 The reserved `dockstride` record is non-exported. Its `Config` is queried independently before environment values exist. Supported reflection includes primitive fields, nested records, defaults/docs, choices, ports, and secret sources. Arbitrary function contracts remain Nickel's validation responsibility; their YAML values are not promised an automatically generated form.
 
 The adapter pre-registers candidate `env.yaml` contents in memory; it never rewrites Nickel strings or temporarily changes the user's file. Complete execution validates the entire environment and canonical model. Partial setup permits filling independent fields, but replacing a valid complete environment with one missing required inputs is refused.
@@ -58,6 +60,81 @@ Block-YAML scalar edits preserve comments/order; replacing complex collections m
 
 The illustrative secret consumer above declares numeric `user = "0:0"` so its private `0600` development secret is verifiably readable rather than assuming the image's default USER. The richer sample demonstrates UID-1000 consumers with explicit restrictive group access. The minimal initialized starter declares no secrets; these examples are not production-hardening claims.
 
+### Named project commands
+
+`dockstride.commands.NAME = { argv = ["python3", "scripts/command.py"], timeoutSeconds = 30 }` declares a trusted checkout command. `dks run NAME` executes it without applying returned configuration. Commands run with the pinned Docker connection, cancellation/process-group handling, bounded stderr diagnostics, and a JSON context on stdin. Successful stdout must be one JSON object containing `schemaVersion: 1`, at most 1 MiB. No implicit shell is invoked. Declared timeouts range from 1 to 300 seconds and are shortened by the invocation timeout.
+
+Command discovery is lazy: missing service settings and credentials do not force operational metadata merely to locate a named command.
+
+### Live shared settings and setup defaults
+
+Local `env.yaml` may declare ordered ordinary-setting sources:
+
+```yaml
+_dockstride:
+  sources:
+    - path: ../main-checkout/env.shared.yaml
+```
+
+Sources resolve relative to their declaring file and may select other sources. Recursive mappings merge; scalars, lists, and explicit null replace entire values. Precedence is Config defaults, ordered sources, local overrides, then explicit invocation inputs. Cycles, missing declared files, incompatible live settings, and shared `secrets.*` deployed references fail explicitly. `_dockstride` is reserved and removed before applying the application contract or rendering Docker data.
+
+```sh
+dks config sources list
+dks config sources add ../main-checkout/env.shared.yaml --create
+dks config sources remove ../main-checkout/env.shared.yaml
+dks config set oauth.enabled true --shared
+dks config set oauth.issuer example --shared --source ../main-checkout/env.shared.yaml
+dks config unset oauth.enabled
+dks config edit --shared
+```
+
+Ordinary edits change local overrides. Unsetting an override reveals inheritance/defaults. Shared edits target one direct source; multiple direct sources require `--source`, never an inferred transitive winner. The invoking checkout validates a shared edit; other checkouts validate the live update on their next command. List/get include winning file/path and overridden origins. Existing scalar YAML comments are preserved.
+
+`setup.defaults = { command = "devDefaults", fields = ["project"], sources = true }` permits one named command to fill missing allowlisted ordinary settings and discover sources when no selection is declared. Input includes effective non-secret settings, provenance, selected paths, missing fields, and Dockstride's path-hashed `projectProposal`. Output is `{ "schemaVersion": 1, "values": { "project": "proposal" }, "sources": [{ "path": "/absolute/env.shared.yaml", "createIfMissing": true }] }`. Dockstride validates the entire proposal before create-new source publication; inherited/default/explicit/concurrently supplied values win. Accepted local values are persisted without flattening inherited settings.
+
+`setup`, `up`, `dev`, and `deploy` may execute defaults; configuration reads, render, status, doctor, and `--plan` do not. Plans report whether discovery would run. Hook failure is explicit, not a fallback to guessed values. `dks setup --no-shared-sources` persists an explicit empty selection and disables discovery. Shared credential inputs are private file-path settings, not credential contents or shared backend-owned deployed references.
+
+Shared scalar strings are ordinary values, not automatically rebased file paths. A project sharing credential-input paths should require absolute paths in its field contract; generic declared `FileSecret` still permits project-relative input paths.
+
+Mutation lock order is checkout lifecycle, per-user environment/allocation coordination, local allocation when required, canonical configuration/source files in sorted path order, then individual state files. No operation acquires another checkout's lifecycle lock under the global lock. Defaults and editors run outside publication locks; fingerprint revalidation prevents stale editor output from replacing a concurrent update. Allocation and secret publication use internal already-locked helpers rather than reacquiring advisory locks.
+
+Ordinary multi-file settings/allocation transitions use a private versioned pending-publication journal. Intended claims are recorded globally before local files; registry commits come last. Interrupted mutations resume only when every file matches its recorded before/after fingerprint. External edits produce an actionable conflict and retain conservative pending blockers, never an overwrite or implicit release. Read-only commands and plans report pending paths/claims without recovery writes. Managed mutations recover before executing defaults.
+
+
+### Registered environments
+
+```sh
+dks env list
+dks env list --worktrees
+dks env forget /absolute/checkout --plan
+dks env forget /absolute/checkout --yes
+```
+
+Complete managed setup registers even stopped environments under `$HOME/.local/share/dockstride/.dockstride/`. Project claims are scoped by the verified Docker daemon ID, not just a context name: aliases cannot let another checkout claim the same project. Ownership checks still reject foreign Docker resources. Registry entries retain checkout/owner identity, backend/project, pinned connection, daemon ID, source paths, and endpoints. A moved checkout is not an ownership transfer.
+
+Listing reads saved records without Docker or Nickel evaluation and reports missing, stale, unreadable, and pending entries. `--worktrees` augments the invoking Git repository's worktrees, including unregistered configuration presence; non-Git registration/listing remain supported. Arbitrary historical directories are not retroactively discovered. Older configured checkouts register on their next successful managed command.
+
+Forgetting removes only registration, never checkout files or private credential revisions. Stopped containers, networks, volumes, owned Swarm objects, pending publications, and reservations block it. An unreachable recorded connection cannot prove resource absence. Plans list exact blockers and perform no writes.
+
+### Generated endpoints and explicit reset
+
+```sh
+dks ports release --plan
+dks ports release --yes
+dks ports gc --plan
+dks ports gc --yes
+```
+
+Declared native port policies allocate checkout-local values during setup, including required Config port fields. Inherited and explicit local values win over automatic allocation. Allocation metadata records the reservation key, generated/explicit provenance, owner, verified daemon, and pinned connection. Global `port-reservations.json` and local `ports.json` use `schemaVersion: 1`, with `reservations` and `allocations` mappings respectively.
+
+Normal `down` and `destroy` retain endpoints and credentials. Release is the explicit endpoint reset: its plan shows exact keys, generated fields, preserved overrides, protected reservations, and Docker blockers. Plans never acquire mutation locks, execute defaults, read credential contents, or allocate. Running or stopped owned containers and Swarm service publications block release; retained volumes, networks, and unused credential files do not themselves consume endpoints. Recorded-target failures retain claims rather than treating an unreachable daemon as empty.
+
+Release publishes reservation removal, local metadata, generated YAML removal, and registry endpoints through the recoverable journal. It removes only a still-generated local value matching its allocation. Intentional local edits, including setting the same value, mark that field explicit; shared writes do not change local generated provenance. Releasing an explicit override retains its YAML value while freeing the old generated reservation. Removing a generated local override can reveal a shared/default value without copying it locally.
+
+Next setup allocates eligible missing fields again; it may reuse a freed port. Existing unversioned global maps and integer local allocations remain readable. Only a matching historical saved local allocation can be reconciled as generated; mismatches are conflicts, not permission to erase settings. Unlinked legacy reservations remain protected.
+
+GC collects only absent-checkout or retired-registration reservations with sufficient recorded owner/target evidence and verified resource absence. It never locks or edits another checkout's local files. Legacy records without that evidence and unreachable or replaced daemons fail closed.
+
 ## Lifecycle metadata
 
 Native Compose healthchecks, `depends_on` conditions, one-shot services, and `develop.watch` are preferred. A small ordered action list fills gaps; it is not a workflow programming language.
@@ -66,8 +143,10 @@ Native Compose healthchecks, `depends_on` conditions, one-shot services, and `de
 # Inside dockstride:
 actions = [
   { name = "database", workflows = ["up", "dev"], kind = "up", service = "db" },
+  { name = "stop-consumers", workflows = ["up", "dev"], services = ["api"],
+    kind = "stop", targets = ["api", "worker"] },
   { name = "migrate", workflows = ["up", "dev"], services = ["api"],
-    kind = "run", service = "migrate", argv = [] },
+    kind = "prerequisite", service = "migrate", fresh = true },
   { name = "seed", workflows = ["up", "dev"], services = ["api"],
     stage = "after", kind = "command", argv = ["./scripts/seed-development"] },
 ],
@@ -78,9 +157,13 @@ readiness.api = {
 },
 ```
 
-Actions have `name`, `workflows`, optional selected `services`, `stage` (`before`, default; or `after`), `kind` (`up`, `run`, `exec`, `command`), and service/argv as applicable. `command` executes project argv with no implicit shell. Readiness can use HTTP status, text `contains`, deep JSON-subset `json`, and/or `command` argv. Runtime failures identify the service/phase; successful exited one-shots are not treated as crashed applications.
+Actions have `name`, `workflows`, optional applicability `services`, `stage` (`before`, default; or `after`), `kind` (`up`, `run`, `exec`, `command`, `stop`, `prerequisite`), and service/argv as applicable. Applicability includes the selected services' required dependency closure. Stop `targets` are separate from applicability: only actually running targets stop, and absent targets are never created. `command` executes project argv with no implicit shell.
 
-`dockstride.oneshots = ["migrate"]` can explicitly designate completion services; native `service_completed_successfully` dependencies are also recognized. Swarm production prerequisites require explicit deploy-workflow `command` actions; Compose up/run/exec and `depends_on` are not production ordering guarantees.
+A `prerequisite` requires a declared one-shot service, an explicit boolean `fresh`, and the `before` stage. With `fresh = true`, Dockstride builds/recreates a normal detached Compose service once for this invocation, waits for successful completion, and retains its container/logs. Remaining dependency-ordered startup uses `--no-deps` and revalidates that exact completed container instead of letting Compose rerun the prerequisite. Previously running stopped consumers, including out-of-scope consumers and affected restart relationships, resume only after verified success. Failure or cancellation does not resume them or run after-stage seeding; a detached prerequisite may still run after cancellation. Successful side effects and data are not rolled back.
+
+Validate selections, required dependency cycles, conditions, native actions, and declared one-shots before stopping consumers. Optional `required = false` dependencies do not expand scope unless independently selected. One absolute lifecycle deadline covers actions, builds, dependency waits, and final HTTP/command readiness; it ends before the foreground development/watch loop. Prerequisite exit failures are operation errors with `details.prerequisite` containing safe container IDs/state/exit codes, not fabricated Docker process errors.
+
+Readiness supports HTTP status, text `contains`, deep JSON-subset `json`, and/or `command` argv. `dockstride.oneshots = ["migrate"]` and required `service_completed_successfully` dependencies designate completion services; arbitrary exited-zero applications do not. Swarm production prerequisites require explicit deploy-workflow `command` actions; missing deploy applicability, Compose up/run/exec/stop/prerequisite, profiles, and `depends_on` are not production ordering guarantees. Secret replacement with `--apply` validates its workflow and service scope before publishing a new reference; a later rotation failure remains a committed replacement, not a rollback.
 
 `dockstride.dev.argv = ["./scripts/develop"]` selects an explicit foreground development loop after readiness. Otherwise `dev` runs native Compose watch when declared; without either, it honestly reports detached operation rather than inventing synchronization. Cancellation leaves detached containers and completed side effects in place.
 
@@ -95,6 +178,59 @@ setup.ports.apiPort = {
 ```
 
 Automatic allocation is explicit, local-context-only, locked, globally reserved per invoking user, and persisted in YAML/operation state. Setup/startup never moves an existing endpoint silently. Explicit ports win; fixed occupied ports fail without stopping/reusing the occupying process. Docker is the final authority on binding. Remote contexts require explicit port choices and cannot be checked by binding a local socket.
+
+## Strict status and Compose profiles
+
+```sh
+dks up --profile debug
+dks dev --profile debug --profile tools api
+dks status
+dks status api --profile debug
+dks status --inspect-only
+```
+
+`status` observes once, not startup polling. One deadline covers Docker/context/ownership observations and application probes: 10 seconds by default, shortened by a smaller `--timeout`. Each reachable configured HTTP/command check runs once. Missing services, failed exits, OOM, unhealthy containers, unsuccessful prerequisites, wrong application identity, replica shortfall, and failed rollout produce an operation error.
+
+Compose's default required scope is unprofiled services plus active-profile services and their required dependencies. Explicit service selection includes its required dependency closure even when that service has an inactive profile. Repeatable flags and `COMPOSE_PROFILES` form a union, including `*`; an explicitly empty environment selection suppresses saved-profile fallback. Startup without a profile selection uses none. Only unqualified status falls back to the last applied profiles; the scope is recorded after successful resource application, before application readiness, and survives teardown or failures before application. Inactive services remain visible as excluded. Unknown selections, dependency cycles, malformed declarations, and zero required services are configuration errors.
+
+Swarm observes the accumulated applied service scope, not merely the last selected update; without a deployment it observes desired configured services and reports the missing deployment. Explicit selection narrows that scope. It does not acquire Compose profiles or dependency semantics. Compare owned service/task IDs, applied image revisions, desired replicas, distinct current task slots, and rollout state. Declared one-shots require successful expected completed tasks; deployment convergence and status share that rule.
+
+If Swarm retires a listed task before task inspection, the entire task collection is unobserved (`tasksObserved: false`), not a verified empty collection. Strict status does not claim native/application readiness from it, including zero-replica or one-shot cases. Deployment convergence re-observes under its existing deadline. Mixed errors, unrelated missing IDs, transport/permission failures, and malformed successful responses remain failures.
+
+Reports distinguish `containerReady`, nullable `applicationReady`, required/excluded scope, and exhausted/unobserved checks. `--inspect-only` skips application probes and readiness-based failure, but genuine Docker/configuration/ownership errors still fail. Unprobed configured applications remain unverified (`applicationReady: null`, aggregate `ready: false`); inspection success does not claim application readiness.
+
+Successful JSON status is one terminal result. Failed readiness is one operation error with the complete report in `details.status`; Docker failures retain their category and actual underlying process status plus available partial observations. Human output prints the same rows before the error. Status does not run defaults, allocate, provision credentials, or implicitly execute diagnostic hooks.
+
+
+## Structured project diagnostics
+
+Declare read-only hooks using named argv commands:
+
+```nickel
+commands.diagnosePostgres = {
+  argv = ["python3", "scripts/diagnose-postgres.py"],
+  timeoutSeconds = 10,
+},
+diagnostics.postgres = {
+  command = "diagnosePostgres",
+  services = ["postgres"],
+  on = ["unhealthy", "readiness-failed", "startup-failed"],
+},
+```
+
+Declarations are validated before managed resources start. After a startup failure, hook applicability includes the attempted dependency scope: a healthy database can explain a failed migration. `unhealthy` and `readiness-failed` use safe observed state, including the original application-probe result, without repeating application probes. Explicit `dks doctor` runs relevant hooks even when their automatic filters do not match; `dks doctor --plan` lists hooks without executing them. Status, render, and startup plans never dispatch diagnostic commands. Cancellation does not start a new diagnostic phase.
+
+JSON stdin extends the common non-secret command context with `diagnostics`: trigger/triggers, hook, services, sanitized observations, failed services, secret references, and the primary failure kind. Service observations carry ownership-verified container IDs; Swarm additionally requires immutable service/task/container linkage. A saved registration's Docker daemon and connection must still match. Native secret references identify source, mounted target, and file path or external name; no credential bytes, Docker environment, health logs, private digests, or keys are forwarded. Commands inherit the captured Docker connection.
+
+Hooks return one bounded JSON object:
+
+```json
+{"schemaVersion":1,"findings":[{"code":"postgres.auth.failed","severity":"error","summary":"Mounted credential cannot authenticate","evidence":{"database":"application"},"suggestedAction":"Inspect credential-volume mismatch before choosing explicit recovery"}]}
+```
+
+Severity is `info`, `warning`, or `error`. Findings require a stable nonempty code, summary, and evidence; optional `suggestedCommand` and `suggestedAction` remain inert data. Commands are trusted repository code under a read-only contract, not a sandbox: they must not repair credentials, recreate databases, or destroy resources.
+
+One fresh diagnostic phase has a shared 10-second deadline, shortened by a smaller invocation timeout, covering context, ownership observations, and all hooks. This phase can run after the original startup deadline expires; it does not extend or restart startup. Capture is limited to 1 MiB. Malformed/duplicate JSON, nonzero exits, and timeouts become diagnostic failure entries. Startup retains its original category, exit code, Docker status, prerequisite details, and safe stop/seed behavior; findings attach at `details.diagnostics`. Doctor attaches them to its result. Human output shows findings and explicitly marks suggestions as not executed.
 
 ## Secrets
 
@@ -148,6 +284,26 @@ Replacement creates a new revision, atomically updates the reference, and retain
 
 `--apply` requires `setup.rotations.<name> = {workflow = "rotate-auth", services = ["api"]}` plus explicit actions for that workflow. Credential rotation can fail after storage replacement; the CLI reports committed storage and retained previous revision without pretending database/encryption changes are transactional.
 
+### Explicit imported-secret synchronization
+
+File imports record their canonical input path and origin privately with the immutable revision. Ordinary setup/startup reuses the deployed reference even when that input changes. Synchronization is explicit and names every selected secret:
+
+```sh
+dks secrets sync apiToken --plan
+dks secrets sync apiToken --yes
+dks secrets sync apiToken --yes --apply
+```
+
+The current declared `FileSecret` takes precedence; otherwise sync uses the current revision's explicit CLI-file origin. A stdin replacement does not inherit an older file origin. Source settings are never rewritten. Files must remain private, current-user-owned regular files; symlinks, empty/oversized inputs, and unavailable origins fail before publication. All selected sources and required rotation declarations are checked before the first replacement.
+
+Unchanged comparable inputs reuse their revisions. Private history stores an HMAC-SHA-256 digest, keyed by a durable owner-only `0600` key at `$HOME/.local/share/dockstride/.dockstride/secret-source-key`; neither digests, key material, nor credential bytes enter results. Legacy Compose revisions can establish a baseline by securely comparing their owned managed file. A legacy Swarm revision cannot prove content equality: sync creates a new immutable revision and reports `priorContentComparable: false`. Plans inspect source metadata without reading credential contents or creating a key, and report `comparison-deferred`, never a speculative unchanged/changed result.
+
+Without `--apply`, changed storage reports `consumerRestartNeeded: true`. An ordinary Compose `up` can retain an existing bind-backed secret mount; use the project's declared rotation procedure or an explicit `down`/`up` to remount a new revision. Storage replacement alone does not rotate a database password or re-encrypt stored data. Unchanged `--apply` skips rotation. Failures retain the original error and `details.secretSync` with exact committed, uncommitted, and successfully applied names; already published references and previous revisions are retained.
+
+### Protected revision GC
+
+Registered checkouts' effective declared file inputs, current revision file origins, current/pending references, and retained operation/deployment snapshots protect matching paths and inode aliases. Live consumer mounts and Swarm service grants remain blockers. GC observes foreign checkout metadata without acquiring foreign lifecycle locks or enumerating mode-`0300` credential stores, and revalidates its evidence before each deletion. Missing, moved, unreadable, unsafe, or externally changed evidence fails closed. Explicit registry forget removes that checkout's protection only after its owned resources have been cleared.
+
 GC plans list exact `revision` identifiers and reasons for ineligibility. Actual deletion requires explicit identifiers and confirmation:
 
 ```sh
@@ -156,6 +312,8 @@ dks secrets gc EXACT_REVISION_FROM_PLAN --yes
 ```
 
 Current env references, retained snapshots, live Docker consumers, pending journals, or foreign ownership prevent deletion. GC and replacement serialize with lifecycle changes. `down` and data destruction preserve secret references. Snapshot retention is deliberately conservative; no blind orphan scanning or automatic cleanup runs at startup.
+
+Completed deployment journals also retain the operation's previous/planned/applied secret snapshots. Successful down does not erase that historical protection. The disposable smoke explicitly retires entire verified inactive, reference-bearing deployment journals; it does not rewrite historical events, alter revision history, disable GC protections, or expose a public snapshot-retirement command.
 
 ## Swarm deployment and selected scope
 
@@ -168,6 +326,8 @@ Selected apply supports image/environment/argv, user/workdir/hostname, read-only
 Owned live service specifications are reconciled before selected updates. Durable pre-apply intent and applied checkpoints cover daemon acceptance before CLI acknowledgement, so retries remove unrecorded extra env/mount/network/secret/config grants. Only selected services are updated. Convergence reports failed/restarting/rejected tasks and update pause/rollback states; migrations are never automatically undone.
 
 Destructive teardown uses ownership checks, pinned connections, immutable service/network/config IDs, and reinspection. Docker volumes have names rather than immutable IDs, so fingerprints are rechecked; there is no atomic compare-and-delete guarantee against another privileged Docker client. Multi-node destructive volume teardown is explicitly rejected. External resources are not commandeered or deleted.
+
+Previously verified owned networks are removed by captured immutable ID. Exact backend absence completes teardown only once inspection proves the object is gone. If removal reports absence while a local inspection still sees the object, teardown stops sending deletion requests and continues ownership-checked inspection under the existing deadline. Permission/transport failures remain fatal; named-volume recreation fingerprints remain mandatory.
 
 ## Machine interface
 
@@ -190,7 +350,7 @@ Exit categories: `0` success; `1` operation failure; `2` usage/configuration; `3
 cargo test --locked --all-targets
 cargo build --locked --bin dks
 scripts/smoke.py --dks target/debug/dks --compose
-scripts/smoke.py --dks target/debug/dks --swarm
+scripts/smoke.py --dks target/debug/dks --swarm --timeout 600
 scripts/release.sh --container --verify-reproducible
 ```
 
@@ -213,9 +373,24 @@ Installer acceptance serves real native archives over local HTTP, with only curl
 
 Smoke fixtures create real worktrees, containers, secrets, migrations, HTTP identities, watch-driven rebuilds, and failures. Compose uses UUID-labelled resources on the selected daemon. Both `HOME` and XDG storage roots are private fixture paths; the original Docker configuration remains available for contexts/credentials. Swarm uses separate disposable Docker-in-Docker manager/worker/registry containers and contexts, never initializes the original daemon, and verifies actual worker image/secret distribution before claiming multi-node readiness. Infrastructure failure is a failing check, not a silently skipped test. Cleanup is ownership/UUID scoped.
 
+The DIND daemons keep their data in bind-mounted, run-owned directories under the fixture's temporary root. Set `TMPDIR` to a private directory on a POSIX filesystem with enough capacity when the host Docker filesystem is constrained. Cleanup stops the disposable daemons before removing mapped-UID files through an isolated helper; it never prunes host Docker storage. Successful runs retire owned resources, release reservations, forget registrations, verify zero remaining claims, and remove their temporary storage. Failed runs retain evidence. If native teardown fails, the pinned DIND contexts/daemons and private configuration are retained for explicit recovery instead of hiding leaked claims.
+
+Failure cleanup verifies exact outer container IDs/UUID labels, private mounts, pinned daemon/cluster identities, and the complete disposable node membership before mutation. It downs registered owned services and retires only the verified disposable worker before native manager-only destroy. Unknown or unreachable nodes retain recovery state; the product's conservative multi-node volume-deletion refusal is not bypassed.
+
 The rich sample's `swarmDirectNetworking` defaults to false (normal ingress/VIP). The isolated rootless fixture explicitly sets it true: host-mode API publication on a manager and `deploy.endpoint_mode = "dnsrr"` avoid IPVS. Both disposable daemons explicitly enable userland proxy and create an ICC-enabled `docker_gwbridge`; their outer UUID network is the isolation boundary. Real two-node image/secret distribution and selected updates are verified with this direct profile. Ingress routing-mesh behavior is not claimed verified: this host's nested rootless namespace reports IPVS service creation `operation not permitted`. No host module change or ignored Docker netfilter error is used.
 
 The pinned evaluator source includes a documented one-invariant upstream repair; [provenance](../vendor/nickel-lang-core/PATCHES.md) and executable nested-YAML/array regression remain in the repository. Evaluator/library upgrades require compatibility fixtures, not assumptions about reflection APIs.
+
+### Observed unreleased workflow verification
+
+- Initial `cargo test --locked --all-targets`: 203 passed across 21 suites. Final `cargo test --locked --release --all-targets`: 205 passed across 21 suites, with three ignored child-process helpers exercised by their parent tests. The optimized CLI build and normal-PATH installation passed.
+- The real Compose fixture proved stopped shared-source worktrees retain distinct registrations/ports, exact strict identity and unhealthy/missing reports, fresh migration once per startup, exit-23/cancellation preservation of stopped consumers and database data, and explicit release/forget/recreate isolation.
+- Actual file-secret synchronization proved unchanged-input no-op, explicit changed revision publication, old live/snapshot/source-path protection, and eligible old-revision GC.
+- Real PostgreSQL startup diagnostics distinguished initialization, a missing database, and an incorrect mounted password through read-only service-network connections; original failures and stored role/data survived recovery.
+- The isolated Voxellum stack preserved its account and database sentinel across repeated startup and down/up, rejected a deliberately failed migration without restarting consumers, and recovered after restoring the declared command. The evaluation environment loader observed live shared preferences and local overrides. The existing Chromium page-assistant E2E passed, followed by owned resource, registry, and reservation retirement.
+- A real selected two-node rollout with aggressive task-history retirement verified the bounded task-observation fix, exact new HTTP revision, strict readiness, and the retained application-volume sentinel. The early-failed multi-node fixture then retired its verified worker and completed native/outer/private-storage cleanup with zero claims.
+- Real old-revision Swarm GC remained blocked by terminal deployment-journal snapshots after down; explicit verified fixture-only journal retirement made the selected old revision eligible without changing the committed revision/history. Native down and complete retained-fixture cleanup passed after the conservative network-absence fix.
+- The complete final disposable single-node/two-node Swarm harness passed: immutable digest distribution, repeated/scoped deployment, strict native/application readiness and fault restoration, failed-rollout data retention, conservative multi-node destroy, private file-secret synchronization and committed failed-apply retention, live/snapshot GC protection, eligible old-revision retirement, and complete owned resource cleanup. The original host daemon remained outside Swarm.
 
 ### Observed 0.1.0 verification
 

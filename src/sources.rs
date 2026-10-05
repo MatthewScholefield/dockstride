@@ -1,0 +1,192 @@
+//! Live, recursive ordinary-settings layers. Raw documents stay separate from effective values.
+use anyhow::{Context, Result, ensure, bail};
+use serde::Serialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{collections::{BTreeMap, BTreeSet}, fs, io, path::{Path, PathBuf}};
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Origin { pub file: PathBuf, pub path: String }
+#[derive(Clone, Debug, Serialize)]
+pub struct Provenance { pub file: PathBuf, pub path: String, pub overridden: Vec<Origin> }
+#[derive(Clone, Debug)]
+pub struct EnvironmentSnapshot {
+    pub local: Value,
+    pub local_file: PathBuf,
+    pub values: Value,
+    pub sources: Vec<PathBuf>,
+    pub provenance: BTreeMap<String, Provenance>,
+    pub fingerprints: BTreeMap<PathBuf, Option<String>>,
+}
+
+impl EnvironmentSnapshot {
+    pub fn verify(&self) -> Result<()> {
+        ensure!(unchanged(self)?, "configuration or shared sources changed; rerun with current settings");
+        Ok(())
+    }
+
+    /// Ensure an editable raw document belongs to this observation, not a
+    /// different read performed before or after the snapshot was captured.
+    pub(crate) fn verify_text(&self, path: &Path, text: &str) -> Result<()> {
+        let expected = self.fingerprints.get(path)
+            .context("editable document is outside the configuration snapshot")?;
+        let matches = match expected {
+            Some(expected) => *expected == hex::encode(Sha256::digest(text.as_bytes())),
+            None => path == self.local_file && text.is_empty(),
+        };
+        ensure!(matches, "configuration or shared sources changed; rerun with current settings");
+        Ok(())
+    }
+}
+
+pub(crate) fn identity(path: &Path) -> Result<PathBuf> {
+    if path.exists() { Ok(fs::canonicalize(path)?) }
+    else { Ok(fs::canonicalize(path.parent().context("configuration path has no parent")?)?.join(path.file_name().context("configuration path has no name")?)) }
+}
+
+pub fn fingerprint(path: &Path) -> Result<Option<String>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(hex::encode(Sha256::digest(bytes)))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading configuration {}", path.display())),
+    }
+}
+
+/// Bind the observed value to the exact bytes used for its fingerprint.
+fn read_document(path: &Path, shared: bool) -> Result<(Value, Option<String>)> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if !shared && error.kind() == io::ErrorKind::NotFound => return Ok((json!({}), None)),
+        Err(error) => return Err(error).with_context(|| format!("reading configuration {}", path.display())),
+    };
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("configuration {} is not UTF-8", path.display()))?;
+    let value = if shared { parse(text, path, true)? } else { crate::config::parse_document(text)? };
+    Ok((value, Some(hex::encode(Sha256::digest(&bytes)))))
+}
+
+pub fn parse(text: &str, path: &Path, shared: bool) -> Result<Value> {
+    let mut value: Value = serde_yaml::from_str(text).with_context(|| format!("invalid configuration {}", path.display()))?;
+    if value.is_null() { value = json!({}); }
+    ensure!(value.is_object(), "{} must contain a configuration mapping", path.display());
+    ensure!(!shared || value.get("secrets").is_none(), "shared source {} cannot contain secrets; deployed references must remain checkout-local", path.display());
+    descriptors(&value)?;
+    Ok(value)
+}
+
+pub fn descriptors(local: &Value) -> Result<Option<Vec<PathBuf>>> {
+    let Some(metadata) = local.get("_dockstride") else { return Ok(None) };
+    let metadata = metadata.as_object().context("_dockstride must be a mapping")?;
+    ensure!(metadata.keys().all(|key| key == "sources"), "unknown _dockstride metadata key");
+    let Some(sources) = metadata.get("sources") else { return Ok(None) };
+    let sources = sources.as_array().context("_dockstride.sources must be a list")?;
+    sources.iter().map(|source| {
+        let descriptor = source.as_object().context("each shared source must be a {path: file} mapping")?;
+        ensure!(descriptor.len() == 1 && descriptor.contains_key("path"), "persisted source descriptors permit only path");
+        let path = descriptor["path"].as_str().filter(|path| !path.is_empty()).context("source path must be a nonempty string")?;
+        Ok(PathBuf::from(path))
+    }).collect::<Result<Vec<_>>>().map(Some)
+}
+
+pub fn merge(target: &mut Value, overlay: &Value) {
+    if let (Some(target), Some(overlay)) = (target.as_object_mut(), overlay.as_object()) {
+        for (key, value) in overlay {
+            match target.get_mut(key) { Some(old) => merge(old, value), None => { target.insert(key.clone(), value.clone()); } }
+        }
+    } else { *target = overlay.clone(); }
+}
+
+fn origin_paths(value: &Value, prefix: &str, result: &mut Vec<String>) {
+    if !prefix.is_empty() { result.push(prefix.to_owned()); }
+    if let Some(object) = value.as_object() {
+        for (key, value) in object { origin_paths(value, &if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") }, result); }
+    }
+}
+
+fn apply(snapshot: &mut EnvironmentSnapshot, value: &Value, file: &Path) {
+    let mut value = value.clone();
+    value.as_object_mut().unwrap().remove("_dockstride");
+    let mut paths = Vec::new();
+    origin_paths(&value, "", &mut paths);
+    // A scalar/list/null replaces the entire subtree, including its winning origins.
+    for path in &paths {
+        let selected = path.split('.').try_fold(&value, |value, key| value.get(key));
+        if selected.is_some_and(|value| !value.is_object()) {
+            snapshot.provenance.retain(|old, _| !old.strip_prefix(path.as_str()).is_some_and(|suffix| suffix.starts_with('.')));
+        }
+    }
+    for path in paths {
+        let mut overridden = Vec::new();
+        if let Some(old) = snapshot.provenance.remove(&path) {
+            overridden = old.overridden;
+            overridden.push(Origin { file: old.file, path: old.path });
+        }
+        snapshot.provenance.insert(path.clone(), Provenance { file: file.to_owned(), path, overridden });
+    }
+    merge(&mut snapshot.values, &value);
+}
+
+fn resolve(snapshot: &mut EnvironmentSnapshot, file: &Path, value: Value, stack: &mut Vec<PathBuf>, overrides: &BTreeMap<PathBuf, Value>) -> Result<()> {
+    if stack.iter().any(|entry| entry == file) {
+        let chain = stack.iter().map(PathBuf::as_path).chain(std::iter::once(file)).map(|path| path.display().to_string()).collect::<Vec<_>>().join(" -> ");
+        bail!("shared source cycle: {chain}");
+    }
+    stack.push(file.to_owned());
+    for source in descriptors(&value)?.unwrap_or_default() {
+        let source = if source.is_absolute() { source } else { file.parent().unwrap().join(source) };
+        let canonical = identity(&source).with_context(|| format!("resolving shared source {} declared by {}", source.display(), file.display()))?;
+        let (child, fingerprint) = if let Some(value) = overrides.get(&canonical) {
+            (value.clone(), fingerprint(&canonical)?)
+        } else {
+            read_document(&canonical, true)
+                .with_context(|| format!("reading shared source {} declared by {}", canonical.display(), file.display()))?
+        };
+        ensure!(child.get("secrets").is_none(), "shared source {} cannot contain secrets", canonical.display());
+        snapshot.fingerprints.insert(canonical.clone(), fingerprint);
+        if !snapshot.sources.contains(&canonical) { snapshot.sources.push(canonical.clone()); }
+        resolve(snapshot, &canonical, child, stack, overrides)?;
+    }
+    apply(snapshot, &value, file);
+    stack.pop();
+    Ok(())
+}
+
+pub fn snapshot(root: &Path, candidate: Option<&Value>) -> Result<EnvironmentSnapshot> {
+    snapshot_with_overrides(root, candidate, &BTreeMap::new())
+}
+
+pub(crate) fn snapshot_with_overrides(root: &Path, candidate: Option<&Value>, overrides: &BTreeMap<PathBuf, Value>) -> Result<EnvironmentSnapshot> {
+    let root = fs::canonicalize(root).context("opening checkout for shared configuration")?;
+    let file = root.join("env.yaml");
+    let (local, fingerprint) = match candidate {
+        Some(candidate) => (candidate.clone(), fingerprint(&file)?),
+        None => read_document(&file, false)?,
+    };
+    ensure!(local.is_object(), "env.yaml must contain a configuration mapping");
+    let mut snapshot = EnvironmentSnapshot { local: local.clone(), local_file: file.clone(), values: json!({}), sources: Vec::new(), provenance: BTreeMap::new(), fingerprints: BTreeMap::from([(file.clone(), fingerprint)]) };
+    resolve(&mut snapshot, &file, local, &mut Vec::new(), overrides)?;
+    Ok(snapshot)
+}
+
+pub fn unchanged(snapshot: &EnvironmentSnapshot) -> Result<bool> {
+    for (path, before) in &snapshot.fingerprints { if fingerprint(path)? != *before { return Ok(false); } }
+    Ok(true)
+}
+
+/// Canonical identities, sorted independently of source declaration/precedence order.
+/// Caller first holds the invoking checkout's lifecycle, global environment/
+/// allocation, optional local allocation, and config coordination guards.
+/// Include the local document and every source in both the current and proposed
+/// graph. This acquires only canonical file guards, never another lifecycle lock.
+/// Verify the snapshot after acquisition before publishing any document.
+pub(crate) fn lock_paths(paths: impl IntoIterator<Item=PathBuf>) -> Result<Vec<crate::state::Lock>> {
+    let mut canonical = BTreeSet::new();
+    for path in paths {
+        let path = identity(&path)?;
+        canonical.insert(path);
+    }
+    canonical.into_iter().map(|path| {
+        let name = format!("source-{}", hex::encode(Sha256::digest(path.as_os_str().as_encoded_bytes())));
+        crate::state::lock(path.parent().unwrap(), &name)
+    }).collect()
+}

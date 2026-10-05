@@ -4,7 +4,7 @@ use dockstride::{config, deploy, model::Project, nickel, output::Output, runtime
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    io::{self, IsTerminal, Read, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
 };
 
@@ -46,21 +46,50 @@ struct Cli {
 enum Commands {
     /// Create a starter configuration and checked-in pinned Nickel library.
     Init,
+    /// Execute a named project command without applying its returned settings.
+    Run { name: String },
+    /// List configured environments or explicitly forget a resource-free registration.
+    Env {
+        #[command(subcommand)]
+        command: EnvironmentCommand,
+    },
+    /// Explicitly release generated endpoints or collect proven-stale reservations.
+    Ports {
+        #[command(subcommand)]
+        command: PortCommand,
+    },
     /// Fill missing environment values and provision declared secrets, without starting containers.
     Setup {
         #[arg(long = "set", value_name = "PATH=VALUE")]
         inputs: Vec<String>,
+        /// Disable automatic shared-source discovery for this checkout.
+        #[arg(long)]
+        no_shared_sources: bool,
     },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
     /// Set up, build, start, and verify a Compose development stack.
-    Up { services: Vec<String> },
+    Up {
+        #[arg(long = "profile", value_name = "NAME")]
+        profiles: Vec<String>,
+        services: Vec<String>,
+    },
     /// Start and verify, then enter the declared development loop.
-    Dev { services: Vec<String> },
-    /// Inspect running services in the configured backend.
-    Status,
+    Dev {
+        #[arg(long = "profile", value_name = "NAME")]
+        profiles: Vec<String>,
+        services: Vec<String>,
+    },
+    /// Verify the required backend scope and application readiness within one bounded observation.
+    Status {
+        #[arg(long = "profile", value_name = "NAME")]
+        profiles: Vec<String>,
+        #[arg(long)]
+        inspect_only: bool,
+        services: Vec<String>,
+    },
     /// Stream Docker logs for the configured backend.
     Logs {
         #[arg(short = 'f', long)]
@@ -110,8 +139,37 @@ enum Commands {
 }
 
 #[derive(Subcommand, Debug)]
+enum EnvironmentCommand {
+    List {
+        #[arg(long)]
+        worktrees: bool,
+    },
+    Forget {
+        path: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PortCommand {
+    Release {
+        #[arg(long)]
+        yes: bool,
+    },
+    Gc {
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ConfigCommand {
     List,
+    Sources {
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
     Get {
         path: String,
     },
@@ -120,12 +178,36 @@ enum ConfigCommand {
         value: Option<String>,
         #[arg(long, conflicts_with = "value")]
         file: Option<PathBuf>,
+        #[arg(long)]
+        shared: bool,
+        #[arg(long, requires = "shared")]
+        source: Option<PathBuf>,
     },
     Unset {
         path: String,
+        #[arg(long)]
+        shared: bool,
+        #[arg(long, requires = "shared")]
+        source: Option<PathBuf>,
     },
-    Edit,
+    Edit {
+        #[arg(long)]
+        shared: bool,
+        #[arg(long, requires = "shared")]
+        source: Option<PathBuf>,
+    },
     Schema,
+}
+
+#[derive(Subcommand, Debug)]
+enum SourceCommand {
+    List,
+    Add {
+        path: PathBuf,
+        #[arg(long)]
+        create: bool,
+    },
+    Remove { path: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -137,6 +219,15 @@ enum SecretCommand {
         file: Option<PathBuf>,
         #[arg(long)]
         stdin: bool,
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Explicitly compare imported private files and publish changed revisions.
+    Sync {
+        #[arg(required = true)]
+        names: Vec<String>,
+        #[arg(long)]
+        yes: bool,
         #[arg(long)]
         apply: bool,
     },
@@ -188,13 +279,40 @@ fn main() {
             } else {
                 format!("{error:#}")
             };
-            let details = if let Some(missing) = error.downcast_ref::<config::MissingInputs>() {
-                json!({"missingInputs":missing.fields})
-            } else if let Some(docker) = error.downcast_ref::<runtime::DockerError>() {
-                json!({"underlyingDockerStatus":docker.status,"operation":docker.args})
-            } else {
-                json!({})
-            };
+            let mut details = json!({});
+            if let Some(missing) = error.downcast_ref::<config::MissingInputs>() {
+                details["missingInputs"] = json!(missing.fields);
+            }
+            if let Some(docker) = error.downcast_ref::<runtime::DockerError>() {
+                details["underlyingDockerStatus"] = json!(docker.status);
+                details["operation"] = json!(docker.args);
+            }
+            if let Some(prerequisite) = error.downcast_ref::<runtime::PrerequisiteFailed>() {
+                details["prerequisite"] = prerequisite.0.clone();
+            }
+            if let Some(blocked) = error.downcast_ref::<dockstride::environment::ForgetBlocked>() {
+                details["environment"] = blocked.0.clone();
+            }
+            if let Some(blocked) = error.downcast_ref::<dockstride::ports::PortsBlocked>() {
+                details["ports"] = blocked.0.clone();
+            }
+            if let Some(failed) = error.downcast_ref::<dockstride::status::StatusFailed>() {
+                details["status"] = failed.0.clone();
+            }
+            if let Some(report) = error.downcast_ref::<dockstride::status::StatusReport>() {
+                details["status"] = report.0.clone();
+            }
+            if let Some(report) = error.downcast_ref::<dockstride::diagnostics::DiagnosticReport>() {
+                details["diagnostics"] = report.0.clone();
+            }
+            if let Some(report) = error.downcast_ref::<secrets::SyncFailed>() {
+                details["secretSync"] = report.0.clone();
+            }
+            if let Ok(pending) = dockstride::publication::pending(&cli.directory)
+                && !pending.is_null()
+            {
+                details["pendingPublication"] = pending;
+            }
             let _ = output.diagnostic(category, code, &message, details);
             std::process::exit(code);
         }
@@ -217,6 +335,18 @@ fn classify(error: &anyhow::Error) -> (&'static str, i32) {
         } else {
             ("docker", 4)
         };
+    }
+    if error.is::<runtime::PrerequisiteFailed>() {
+        return ("operation", 1);
+    }
+    if error.is::<dockstride::status::StatusConfiguration>() {
+        return ("configuration", 2);
+    }
+    if error.is::<dockstride::status::StatusFailed>() {
+        return ("operation", 1);
+    }
+    if error.is::<dockstride::diagnostics::DiagnosticConfiguration>() {
+        return ("configuration", 2);
     }
     let mut message = format!("{error:#}");
     message.make_ascii_lowercase();
@@ -259,6 +389,11 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
             cli.directory.display()
         )
     })?;
+    runtime::pin_invocation();
+    let pending = dockstride::publication::pending(&root)?;
+    if !pending.is_null() {
+        out.event("pending", &format!("Interrupted publication: {}", serde_json::to_string(&pending)?))?;
+    }
     let non_interactive = cli.non_interactive || cli.json || !io::stdin().is_terminal();
     let secret_inputs = initial_secret_inputs(cli)?;
     let result = match &cli.command {
@@ -266,27 +401,63 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
             prohibit_plan_mutation(cli)?;
             nickel::init(&root)?
         }
-        Commands::Setup { inputs } => {
+        Commands::Run { name } => {
+            prohibit_plan_mutation(cli)?;
+            dockstride::commands::run(&root, name, cli.timeout, out)?
+        }
+        Commands::Env { command } => match command {
+            EnvironmentCommand::List { worktrees } => dockstride::environment::list(&root, *worktrees)?,
+            EnvironmentCommand::Forget { path, yes } => {
+                let confirmed = cli.plan || *yes || confirm(cli, non_interactive, "Forget only this resource-free environment registration?")?;
+                dockstride::environment::forget(&root, path, cli.plan, confirmed, out)?
+            }
+        },
+        Commands::Ports { command } => {
+            let (yes, gc) = match command {
+                PortCommand::Release { yes } => (*yes, false),
+                PortCommand::Gc { yes } => (*yes, true),
+            };
+            let confirmed = cli.plan || yes || confirm(cli, non_interactive,
+                if gc { "Collect only reservations with verified stale ownership and no Docker resources?" }
+                else { "Release owned generated endpoints after proving Docker resources are absent?" })?;
+            if gc { dockstride::ports::gc(&root, cli.plan, confirmed, out)? }
+            else { dockstride::ports::release(&root, cli.plan, confirmed, out)? }
+        }
+        Commands::Setup { inputs, no_shared_sources } => {
+            let mut inputs = inputs.clone();
+            if *no_shared_sources { inputs.push("_dockstride.sources=[]".to_owned()); }
             if cli.plan {
-                configuration_plan(&root, "setup", &secret_inputs)?
+                let candidate = config::setup_plan_candidate(&root, &inputs)?;
+                configuration_plan(&root, "setup", &secret_inputs, Some(&candidate))?
             } else {
-                config::setup(&root, inputs, non_interactive)?;
-                secrets::provision(&root, non_interactive, &secret_inputs, out)?;
+                config::setup_with_context(&root, &inputs, non_interactive, cli.timeout, out, "setup")?;
+                let provisioned = secrets::provision(&root, non_interactive, &secret_inputs, out)?;
                 {
                     let _lifecycle = state::lock(&root, "lifecycle")?;
-                    let project = nickel::evaluate(&root, None)?;
-                    if project.backend()? == "compose" && runtime::allocate_ports(&project)? {
+                    if runtime::allocate_ports(&root)? {
                         out.event("Ports", "declared checkout-local allocations persisted")?;
                     }
                 }
+                if provisioned["consumerValidation"] == "deferred" { secrets::validate_consumers(&root, out)?; }
                 json!({"configured":true,"started":false,"configuration":config::list(&root)?})
             }
         }
         Commands::Config { command } => match command {
             ConfigCommand::List => config::list(&root)?,
+            ConfigCommand::Sources { command } => match command {
+                SourceCommand::List => config::sources_list(&root)?,
+                SourceCommand::Add { path, create } => {
+                    prohibit_plan_mutation(cli)?;
+                    config::sources_add(&root, path, *create)?
+                }
+                SourceCommand::Remove { path } => {
+                    prohibit_plan_mutation(cli)?;
+                    config::sources_remove(&root, path)?
+                }
+            },
             ConfigCommand::Get { path } => config::get(&root, path)?,
             ConfigCommand::Schema => json!({"fields":nickel::schema(&root,None)?}),
-            ConfigCommand::Set { path, value, file } => {
+            ConfigCommand::Set { path, value, file, shared, source } => {
                 prohibit_plan_mutation(cli)?;
                 let value = if let Some(file) = file {
                     parse_value(&std::fs::read_to_string(file)?)?
@@ -297,20 +468,23 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                             .context("config set requires VALUE or --file")?,
                     )?
                 };
-                config::set(&root, path, value)?
+                if *shared { config::set_shared(&root, path, value, source.as_deref())? }
+                else { config::set(&root, path, value)? }
             }
-            ConfigCommand::Unset { path } => {
+            ConfigCommand::Unset { path, shared, source } => {
                 prohibit_plan_mutation(cli)?;
-                config::unset(&root, path)?
+                if *shared { config::unset_shared(&root, path, source.as_deref())? }
+                else { config::unset(&root, path)? }
             }
-            ConfigCommand::Edit => {
+            ConfigCommand::Edit { shared, source } => {
                 prohibit_plan_mutation(cli)?;
                 if non_interactive {
                     bail!(
                         "config edit requires an interactive editor; use config set --file for automation"
                     );
                 }
-                config::edit(&root)?
+                if *shared { config::edit_shared(&root, source.as_deref())? }
+                else { config::edit(&root)? }
             }
         },
         Commands::Render { target } => {
@@ -327,7 +501,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                 json!(serde_yaml::to_string(&model)?)
             }
         }
-        Commands::Doctor => doctor(&root, out)?,
+        Commands::Doctor => doctor(&root, cli.timeout, cli.plan, out)?,
         Commands::Secrets { command } => match command {
             SecretCommand::List => secrets::list(&root)?,
             SecretCommand::Replace {
@@ -338,17 +512,19 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
             } => {
                 prohibit_plan_mutation(cli)?;
                 let input = if let Some(file) = file {
-                    Some(secrets::read_input(file).with_context(|| {
-                        format!("reading private secret source {}", file.display())
-                    })?)
+                    let path = if file.is_absolute() { file.clone() }
+                        else { std::env::current_dir()?.join(file) };
+                    Some(secrets::SecretInput::File(path))
                 } else if *stdin {
-                    let mut bytes = Vec::new();
-                    io::stdin().take(1_048_577).read_to_end(&mut bytes)?;
-                    Some(bytes)
-                } else {
-                    None
-                };
-                secrets::replace(&root, name, input.as_deref(), *apply, non_interactive, out)?
+                    Some(secrets::SecretInput::Stdin)
+                } else { None };
+                secrets::replace(&root, name, input.as_ref(), *apply, non_interactive, out)?
+            }
+            SecretCommand::Sync { names, yes, apply } => {
+                let confirmed = cli.plan || *yes || confirm(
+                    cli, non_interactive, "Synchronize the selected imported files into immutable secret revisions?",
+                )?;
+                secrets::sync(&root, names, cli.plan, confirmed, *apply, out)?
             }
             SecretCommand::Gc { names, yes } => {
                 let confirmed = cli.plan
@@ -361,25 +537,34 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                 secrets::gc(&root, names, cli.plan, confirmed, out)?
             }
         },
-        Commands::Up { services } | Commands::Dev { services } | Commands::Deploy { services } => {
+        Commands::Up { services, .. } | Commands::Dev { services, .. } | Commands::Deploy { services } => {
             let workflow = match cli.command {
                 Commands::Dev { .. } => "dev",
                 Commands::Deploy { .. } => "deploy",
                 _ => "up",
+            };
+            let profiles = match &cli.command {
+                Commands::Up { profiles, .. } | Commands::Dev { profiles, .. } => profiles.as_slice(),
+                _ => &[],
             };
             let project = if cli.plan {
                 match nickel::evaluate(&root, None) {
                     Ok(project) => project,
                     Err(error) => {
                         return Ok(Some(
-                            json!({"workflow":workflow,"sideEffects":false,"unresolved":configuration_plan(&root,workflow,&secret_inputs)?,"diagnostic":format!("{error:#}")}),
+                            json!({"workflow":workflow,"sideEffects":false,"unresolved":configuration_plan(&root,workflow,&secret_inputs,None)?,"diagnostic":format!("{error:#}")}),
                         ));
                     }
                 }
             } else {
-                config::setup(&root, &[], non_interactive)?;
-                secrets::provision(&root, non_interactive, &secret_inputs, out)?;
+                config::setup_with_context(&root, &[], non_interactive, cli.timeout, out, workflow)?;
+                let provisioned = secrets::provision(&root, non_interactive, &secret_inputs, out)?;
+                if workflow != "deploy" {
+                    let _lifecycle = state::lock(&root, "lifecycle")?;
+                    runtime::allocate_ports(&root)?;
+                }
                 let project = nickel::evaluate(&root, None)?;
+                if provisioned["consumerValidation"] == "deferred" { secrets::validate_consumers(&root, out)?; }
                 header(&project, out)?;
                 let result = if workflow == "deploy" {
                     deploy::deploy(&project, services, false, cli.timeout, out)?
@@ -388,6 +573,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                         &project,
                         workflow,
                         services,
+                        profiles,
                         false,
                         false,
                         cli.timeout,
@@ -399,15 +585,40 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
             if workflow == "deploy" {
                 deploy::deploy(&project, services, true, cli.timeout, out)?
             } else {
-                runtime::lifecycle(&project, workflow, services, true, false, cli.timeout, out)?
+                runtime::lifecycle(&project, workflow, services, profiles, true, false, cli.timeout, out)?
             }
         }
-        Commands::Status => {
-            let project = nickel::evaluate(&root, None)?;
+        Commands::Status { services, profiles, inspect_only } => {
+            let project = nickel::evaluate(&root, None).map_err(|error| {
+                error.context(dockstride::status::StatusReport(json!({
+                    "backend":null,"project":null,"context":null,"inspectOnly":inspect_only,
+                    "ready":false,"deadlineExceeded":false,"configurationObserved":false,
+                    "requiredServices":[],"excludedServices":[],"services":[],"endpoints":{}
+                })))
+            })?;
             if project.backend()? == "swarm" {
-                deploy::status(&project, out)?
+                if !profiles.is_empty() {
+                    let required: Vec<_> = if services.is_empty() {
+                        project.services()?.keys().map(String::as_str).collect()
+                    } else {
+                        services.iter().map(String::as_str).collect()
+                    };
+                    let rows: Vec<_> = required.iter().map(|name| json!({
+                        "name":name,"required":true,"observed":false,"containerReady":false,
+                        "applicationReady":null,"ready":false,"status":"unobserved"
+                    })).collect();
+                    return Err(anyhow::anyhow!("Compose profiles do not apply to Swarm status")
+                        .context(dockstride::status::StatusConfiguration)
+                        .context(dockstride::status::StatusReport(json!({
+                            "backend":"swarm","project":project.name()?,"context":null,
+                            "inspectOnly":inspect_only,"ready":false,"deadlineExceeded":false,
+                            "requiredServices":required,"excludedServices":[],"services":rows,
+                            "endpoints":project.endpoints()
+                        }))));
+                }
+                deploy::status(&project, services, *inspect_only, cli.timeout, out)?
             } else {
-                runtime::inspect(&project, out)?
+                runtime::status(&project, services, profiles, *inspect_only, cli.timeout, out)?
             }
         }
         Commands::Down | Commands::Destroy { .. } => {
@@ -431,6 +642,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                 runtime::lifecycle(
                     &project,
                     if destroy { "destroy" } else { "down" },
+                    &[],
                     &[],
                     cli.plan,
                     confirmed,
@@ -561,15 +773,17 @@ fn configuration_plan(
     root: &Path,
     workflow: &str,
     inputs: &BTreeMap<String, secrets::SecretInput>,
+    candidate: Option<&Value>,
 ) -> Result<Value> {
-    let env = config::read_env(root)?;
-    let fields = nickel::schema(root, None)?;
+    let snapshot = dockstride::sources::snapshot(root, candidate)?;
+    let env = snapshot.values;
+    let fields = nickel::schema(root, candidate)?;
     let missing: Vec<_> = fields
         .iter()
         .filter(|f| f.required && f.default.is_none() && lookup(&env, &f.path).is_none())
         .map(|f| json!({"path":f.path,"kind":f.kind,"description":f.doc}))
         .collect();
-    let setup = match nickel::setup_metadata(root, None) {
+    let setup = match nickel::setup_metadata(root, candidate) {
         Ok(metadata) => metadata,
         Err(error) => json!({"unresolved":true,"diagnostic":format!("{error:#}")}),
     };
@@ -585,19 +799,21 @@ fn configuration_plan(
             )
         })
         .collect();
+    let defaults = dockstride::defaults::plan(root, &snapshot.local)?;
     Ok(
-        json!({"workflow":workflow,"sideEffects":false,"missingInputs":missing,"setup":setup,"providedSecretInputs":provided}),
+        json!({"workflow":workflow,"sideEffects":false,"missingInputs":missing,"setup":setup,"defaults":defaults,"providedSecretInputs":provided}),
     )
 }
 fn lookup<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     path.split('.').try_fold(value, |v, key| v.get(key))
 }
-fn doctor(root: &Path, out: &Output) -> Result<Value> {
+fn doctor(root: &Path, timeout: u64, plan_only: bool, out: &Output) -> Result<Value> {
     let docker = runtime::Docker::new(root, out.clone());
     let prerequisites = match docker.check() {
         Ok(value) => json!({"ok":true,"details":value}),
         Err(error) => json!({"ok":false,"diagnostic":format!("{error:#}")}),
     };
+    let mut diagnostics = json!({"schemaVersion":1,"findings":[],"failures":[]});
     let configuration = match nickel::evaluate(root, None) {
         Ok(project) => {
             let view = if project.backend()? == "swarm" {
@@ -608,6 +824,15 @@ fn doctor(root: &Path, out: &Output) -> Result<Value> {
             let runtime = match runtime::doctor(&project, out) {
                 Ok(value) => value,
                 Err(error) => json!({"ok":false,"diagnostic":format!("{error:#}")}),
+            };
+            diagnostics = if plan_only {
+                dockstride::diagnostics::validate(&project)?;
+                json!({"schemaVersion":1,"sideEffects":false,"findings":[],"failures":[],
+                    "plannedHooks":project.metadata.get("diagnostics").cloned().unwrap_or_else(|| json!({}))})
+            } else {
+                dockstride::diagnostics::run(
+                    &project, &[], "doctor", timeout, &docker, out, None,
+                )
             };
             match view {
                 Ok(_) => {
@@ -622,7 +847,7 @@ fn doctor(root: &Path, out: &Output) -> Result<Value> {
         Ok(value) => value,
         Err(error) => json!({"ok":false,"diagnostic":format!("{error:#}")}),
     };
-    Ok(json!({"docker":prerequisites,"configuration":configuration,"secrets":secrets}))
+    Ok(json!({"docker":prerequisites,"configuration":configuration,"secrets":secrets,"diagnostics":diagnostics}))
 }
 
 fn initial_secret_inputs(cli: &Cli) -> Result<BTreeMap<String, secrets::SecretInput>> {

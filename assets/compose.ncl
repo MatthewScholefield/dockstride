@@ -14,6 +14,8 @@ dc.ComposeFile {
   # Dockstride metadata is available to the CLI but not exported to Docker.
   dockstride | not_exported = {
     Config = configContract,
+    # Optional trusted JSON discovery: commands.devDefaults = { argv = ["python3", "scripts/dev-defaults.py"] },
+    # setup.defaults = { command = "devDefaults", fields = ["project"], sources = true },
     endpoints.hello = "http://localhost:%{env.apiPort}",
   },
   # Replace this small prebuilt service with your application's services.
