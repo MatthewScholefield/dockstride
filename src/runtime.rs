@@ -2446,9 +2446,9 @@ fn teardown(
                 removed.push(resource.into());
             }
         }
-        // Down deliberately retains data and identity; destroying volumes still
-        // does not transfer authority over persistent secret revisions.
-        if destroy && project.env["secrets"].as_object().is_none_or(Map::is_empty) {
+        // Down retains data and identity. A full Compose destroy retires the
+        // deployment; retained credential files still belong to the same owner.
+        if destroy {
             state::mark_resources(&project.root, false)?;
         }
     }

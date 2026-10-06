@@ -117,6 +117,8 @@ Complete managed setup registers even stopped environments under `$HOME/.local/s
 
 The configured project is the actual Compose project/Swarm stack namespace. Folder-derived proposals are also offered by interactive setup. Equal folder names can propose equal namespaces; a same-daemon collision fails and requires an explicit readable `project` override rather than an automatic suffix. Existing configured names are not rewritten, and there is no automatic resource migration.
 
+A successful full Compose `destroy` retires the deployment identity even when credential files are retained. After removing the old containers, networks, and volumes, a new project can be configured in the same checkout, including after moving `env.yaml` aside. Secret provisioning verifies previous owned Docker resources are absent before accepting the retired namespace change; owner, checkout, backend, and Docker-context safeguards remain. `down`, scoped teardown, and failed destroy do not grant this transition.
+
 Listing reads saved records without Docker or Nickel evaluation and reports missing, stale, unreadable, and pending entries. `--worktrees` augments the invoking Git repository's worktrees, including unregistered configuration presence; non-Git registration/listing remain supported. Arbitrary historical directories are not retroactively discovered. Older configured checkouts register on their next successful managed command.
 
 Forgetting removes only registration, never checkout files or private credential revisions. Stopped containers, networks, volumes, owned Swarm objects, pending publications, and reservations block it. An unreachable recorded connection cannot prove resource absence. Plans list exact blockers and perform no writes.

@@ -201,7 +201,7 @@ pub(crate) fn prepare_with_docker(project: &Project, source_files: &[PathBuf], d
     Ok(Registration { changes, claims, owner_id: owner })
 }
 
-fn check_previous_resources(root: &Path, identity: &Value) -> Result<()> {
+pub(crate) fn check_previous_resources(root: &Path, identity: &Value) -> Result<()> {
     let owner = identity["id"].as_str().context("previous owner ID missing")?;
     let connection = identity["context"].as_str().context("previous Docker connection missing")?;
     let mut kinds = vec![vec!["ps", "-aq"], vec!["volume", "ls", "-q"], vec!["network", "ls", "-q"]];

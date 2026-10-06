@@ -836,7 +836,8 @@ fn session(root: &Path, output: &Output) -> Result<Session> {
     let identity = state::read(root, "identity")?;
     if identity.get("id").is_some() {
         ensure!(
-            identity["project"].as_str() == Some(&project)
+            (identity["project"].as_str() == Some(&project)
+                || (backend == "compose" && identity["resources"] == false))
                 && identity["backend"].as_str() == Some(&backend)
                 && identity["context"].as_str() == Some(&context),
             "secret ownership scope differs from project/backend/Docker context"
@@ -846,6 +847,9 @@ fn session(root: &Path, output: &Output) -> Result<Session> {
                 Path::new(recorded_root) == fs::canonicalize(root)?,
                 "ownership identity belongs to a different checkout"
             );
+        }
+        if identity["project"].as_str() != Some(&project) {
+            crate::registry::check_previous_resources(root, &identity)?;
         }
     }
     if let Some(recorded) = identity.get("secretCluster").and_then(Value::as_str) {

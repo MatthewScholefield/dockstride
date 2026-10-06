@@ -400,6 +400,26 @@ fn reference_replacement_sync_gc_and_destroy_never_mutate_external_files() {
 }
 
 #[test]
+fn full_compose_destroy_allows_a_new_project_without_deleting_retained_credentials() {
+    let f = Fixture::new("compose", "lib.GenerateSecret {bytes = 32, encoding = \"hex\"}");
+    f.success(&["setup"]);
+    let reference = f.current();
+    let path = Path::new(reference["file"].as_str().unwrap());
+    let bytes = fs::read(path).unwrap();
+    let original_metadata = metadata(path);
+    dockstride::state::mark_resources(&f.root, true).unwrap();
+
+    f.success(&["down"]);
+    assert!(!f.command(&["config", "set", "project", "new-project"], None).status.success());
+    f.success(&["destroy", "--yes"]);
+    fs::rename(f.root.join("env.yaml"), f.root.join("env.yaml.old")).unwrap();
+    f.success(&["setup", "--set", "project=new-project"]);
+    assert_eq!(f.env()["project"], "new-project");
+    assert_eq!(fs::read(path).unwrap(), bytes);
+    assert_eq!(metadata(path), original_metadata);
+}
+
+#[test]
 fn swarm_publishes_only_to_docker_and_explicit_sync_uses_the_current_shared_source() {
     let f = Fixture::new("swarm", "lib.ReferenceSecret");
     let first = f.private_file("first-provider", b"first-swarm-provider-value");
