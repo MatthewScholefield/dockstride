@@ -73,13 +73,15 @@ Replace the `hello` service with your own services when you're ready.
 dks setup
 ```
 
-This asks for missing settings and saves them to `env.yaml`. For this example, just enter `hello` as the project name:
+This asks for missing settings and saves them to `env.yaml`. The proposed project name is the sanitized checkout folder name, with no hash suffix. For example, in a folder named `hello`, press Enter to accept:
 
 ```yaml
 project: hello
 ```
 
 The backend defaults to Compose and the port to 8080. You can change them in `env.yaml`, or use `dks config set apiPort 8081`. Invalid values are rejected.
+
+Project proposals lowercase the canonical folder name, replace non-ASCII-alphanumeric characters with `-`, trim edge hyphens, and cap the result at 40 characters (`project` if empty). `.Voxellum_worktree-1` becomes `voxellum-worktree-1`. Set `project` explicitly when you want another readable namespace. Two checkouts with the same name on the same Docker daemon are rejected, never automatically renamed with a hash. Existing configured project names are not rewritten or migrated.
 
 Commit `compose.ncl` and the library, but not `env.yaml`. Each environment gets its own settings. (`dks init` should have gitignored the file for you)
 

@@ -1,7 +1,6 @@
 use crate::{model::Field, nickel, state, sources, publication, output::Output};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -855,8 +854,7 @@ pub fn project_proposal(root: &Path) -> Result<String> {
         slug = "project".to_owned();
     }
     slug.truncate(40);
-    let digest = hex::encode(Sha256::digest(root.as_os_str().as_encoded_bytes()));
-    Ok(format!("{slug}-{}", &digest[..8]))
+    Ok(slug)
 }
 
 pub fn setup(root: &Path, inputs: &[String], non_interactive: bool) -> Result<Value> {

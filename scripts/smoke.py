@@ -228,7 +228,7 @@ class Harness:
         require(shared.is_file() and shared.stat().st_mode & 0o777 == 0o600,
                 "defaults hook did not create private shared settings")
         name_b = self.compose_bootstrap(second, source=shared)
-        require(name_a != name_b, "path-hashed proposals collided across worktrees")
+        require(name_a != name_b, "distinct folder names produced the same project proposal")
         port_a, port_b = self.configured_port(first), self.configured_port(second)
         require(port_a != port_b, "worktrees allocated the same generated endpoint")
         registered = {row["root"]: row for row in self.cli(first, "env", "list", "--worktrees")["environments"]}

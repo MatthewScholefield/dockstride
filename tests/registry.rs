@@ -84,6 +84,28 @@ fn concurrent_complete_setups_reserve_one_daemon_project_before_local_publicatio
 }
 
 #[test]
+fn same_folder_proposals_require_an_explicit_name_on_the_same_daemon() {
+    let fixture = Fixture::new();
+    let first = fixture.checkout("one/voxellum");
+    let second = fixture.checkout("two/voxellum");
+    for root in [&first, &second] {
+        let project = dockstride::config::project_proposal(root).unwrap();
+        let result = fixture.run(root, &["setup", "--set", &format!("project={project}")]);
+        if root == &first {
+            succeeded(&result);
+        } else {
+            assert!(!result.status.success());
+            assert!(String::from_utf8_lossy(&result.stdout).contains("already registered"));
+            assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), "{}\n");
+        }
+    }
+    succeeded(&fixture.run(&second, &["setup", "--set", "project=voxellum-worker"]));
+    let saved = fixture.saved();
+    assert_eq!(saved["environments"][first.to_str().unwrap()]["project"], "voxellum");
+    assert_eq!(saved["environments"][second.to_str().unwrap()]["project"], "voxellum-worker");
+}
+
+#[test]
 fn a_different_verified_daemon_can_reuse_a_project_name() {
     let fixture = Fixture::new();
     let a = fixture.checkout("a");

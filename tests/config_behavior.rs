@@ -198,17 +198,20 @@ fn plaintext_secret_configuration_is_rejected_without_publication() {
 }
 
 #[test]
-fn project_proposals_are_stable_and_worktree_isolated() {
-    let first = fixture();
-    let second = fixture();
-    let first_name = config::project_proposal(first.path()).unwrap();
-    assert_eq!(config::project_proposal(first.path()).unwrap(), first_name);
-    assert_ne!(config::project_proposal(second.path()).unwrap(), first_name);
-    assert!(
-        first_name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    );
+fn project_proposals_use_folder_names_without_path_suffixes() {
+    let directory = tempfile::tempdir().unwrap();
+    for (folder, expected) in [
+        ("voxellum", "voxellum"),
+        (".Voxellum_worktree-1", "voxellum-worktree-1"),
+        ("---", "project"),
+    ] {
+        let root = directory.path().join(folder);
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(config::project_proposal(&root).unwrap(), expected);
+    }
+    let other = directory.path().join("another-parent/voxellum");
+    fs::create_dir_all(&other).unwrap();
+    assert_eq!(config::project_proposal(&other).unwrap(), "voxellum");
 }
 
 #[test]
