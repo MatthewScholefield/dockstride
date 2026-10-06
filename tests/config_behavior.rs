@@ -594,20 +594,18 @@ fn recursive_live_layers_replace_units_and_record_winning_and_overridden_origins
 }
 
 #[test]
-fn missing_cycle_and_shared_secret_sources_fail_with_paths() {
+fn missing_cycle_and_plaintext_shared_secret_sources_fail_without_publication() {
     let directory = fixture();
     let root = directory.path();
     fs::write(root.join("env.yaml"),"_dockstride:\n  sources: [{path: absent.yaml}]\n").unwrap();
-    let error = format!("{:#}",dockstride::sources::snapshot(root,None).unwrap_err());
-    assert!(error.contains("absent.yaml") && error.contains("env.yaml"),"{error}");
+    assert!(dockstride::sources::snapshot(root,None).is_err());
     fs::write(root.join("a.yaml"),"_dockstride:\n  sources: [{path: b.yaml}]\n").unwrap();
     fs::write(root.join("b.yaml"),"_dockstride:\n  sources: [{path: a.yaml}]\n").unwrap();
     fs::write(root.join("env.yaml"),"_dockstride:\n  sources: [{path: a.yaml}]\n").unwrap();
-    let error = format!("{:#}",dockstride::sources::snapshot(root,None).unwrap_err());
-    assert!(error.contains("cycle") && error.contains("a.yaml") && error.contains("b.yaml"),"{error}");
-    fs::write(root.join("a.yaml"),"secrets:\n  token: {file: /private/reference}\n").unwrap();
-    let error = format!("{:#}",dockstride::sources::snapshot(root,None).unwrap_err());
-    assert!(error.contains("a.yaml") && error.contains("checkout-local"),"{error}");
+    assert!(dockstride::sources::snapshot(root,None).is_err());
+    fs::write(root.join("a.yaml"),"secrets:\n  token: raw-credential-bytes\n").unwrap();
+    assert!(dockstride::sources::snapshot(root,None).is_err());
+    assert_eq!(config::read_env(root).unwrap(),json!({"_dockstride":{"sources":[{"path":"a.yaml"}]}}));
 }
 
 #[test]

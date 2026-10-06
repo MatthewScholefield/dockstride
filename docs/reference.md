@@ -38,7 +38,7 @@ dc.ComposeFile {
 
 Nickel records are recursive: `Config = Config` would shadow an outer binding and recurse. Distinct outer names such as `cfg` avoid that ambiguity. Annotations precede field assignment/default values; `| doc ... | default = 8080` is valid, whereas appending `| doc` after `= 8080` is not.
 
-Library interfaces: `Choice`, `Backend`, `Port`, `SecretSource`, `GenerateSecret`, `PromptSecret`, `FileSecret`, `StdinSecret`, and `forEnvironment`, whose record provides `ComposeFile`, `Service`, `Env`, `image`, `grantSecrets`, and `secretPath`. `Env` converts scalars into Docker environment strings. `_FILE` handling is application code, not Docker magic.
+Library interfaces: `Choice`, `Backend`, `Port`, `SecretSource`, `GenerateSecret`, `ReferenceSecret`, `PromptSecret`, `FileSecret`, `StdinSecret`, and `forEnvironment`, whose record provides `ComposeFile`, `Service`, `Env`, `image`, `grantSecrets`, and `secretPath`. `Env` converts scalars into Docker environment strings. `_FILE` handling is application code, not Docker magic.
 
 The pinned library snapshot is version `0.2.0`, evaluated by embedded Nickel `0.19.0`. Keep the application's checked-in copy aligned with the CLI's embedded library; evaluation never fetches a newer snapshot.
 
@@ -56,7 +56,7 @@ dks config edit
 dks config schema --json
 ```
 
-Block-YAML scalar edits preserve comments/order; replacing complex collections may regenerate only the affected record. Edits are locked, candidate-validated, and atomically published. `EDITOR` is split into argv, not implicitly executed by a shell. Secret fields do not accept plaintext through ordinary configuration commands. Project/backend identity edits serialize with lifecycle operations and refuse changes while recorded or live owned resources remain; a separate checkout is the normal production/development boundary.
+Block-YAML scalar edits preserve comments/order; replacing complex collections may regenerate only the affected record. Edits are locked, candidate-validated, and atomically published. `EDITOR` is split into argv, not implicitly executed by a shell. Secret fields accept validated direct file/external reference records through configuration commands, never plaintext; generated-secret replacement remains a separate lifecycle rather than a config-edit bypass. Project/backend identity edits serialize with lifecycle operations and refuse changes while recorded or live owned resources remain; a separate checkout is the normal production/development boundary.
 
 The illustrative secret consumer above declares numeric `user = "0:0"` so its private `0600` development secret is verifiably readable rather than assuming the image's default USER. The richer sample demonstrates UID-1000 consumers with explicit restrictive group access. The minimal initialized starter declares no secrets; these examples are not production-hardening claims.
 
@@ -68,7 +68,7 @@ Command discovery is lazy: missing service settings and credentials do not force
 
 ### Live shared settings and setup defaults
 
-Local `env.yaml` may declare ordered ordinary-setting sources:
+Local `env.yaml` may declare ordered settings/reference sources:
 
 ```yaml
 _dockstride:
@@ -76,7 +76,7 @@ _dockstride:
     - path: ../main-checkout/env.shared.yaml
 ```
 
-Sources resolve relative to their declaring file and may select other sources. Recursive mappings merge; scalars, lists, and explicit null replace entire values. Precedence is Config defaults, ordered sources, local overrides, then explicit invocation inputs. Cycles, missing declared files, incompatible live settings, and shared `secrets.*` deployed references fail explicitly. `_dockstride` is reserved and removed before applying the application contract or rendering Docker data.
+Sources resolve relative to their declaring file and may select other sources. Recursive mappings merge; scalars, lists, and explicit null replace entire values. Precedence is Config defaults, ordered sources, local overrides, then explicit invocation inputs. Shared `secrets.<name>` accepts validated absolute private file references or externally managed Swarm named refs, never raw credential bytes; generated policies cannot inherit credentials from shared sources. Cycles, missing declared files, unsafe references, and incompatible live settings fail explicitly. `_dockstride` is reserved and removed before applying the application contract or rendering Docker data.
 
 ```sh
 dks config sources list
@@ -84,17 +84,20 @@ dks config sources add ../main-checkout/env.shared.yaml --create
 dks config sources remove ../main-checkout/env.shared.yaml
 dks config set oauth.enabled true --shared
 dks config set oauth.issuer example --shared --source ../main-checkout/env.shared.yaml
+dks config set secrets.apiToken '{file: /absolute/private/provider-token}' --shared
+dks config set secrets.apiToken '{file: /absolute/private/checkout-token}'
+dks config unset secrets.apiToken
 dks config unset oauth.enabled
 dks config edit --shared
 ```
 
-Ordinary edits change local overrides. Unsetting an override reveals inheritance/defaults. Shared edits target one direct source; multiple direct sources require `--source`, never an inferred transitive winner. The invoking checkout validates a shared edit; other checkouts validate the live update on their next command. List/get include winning file/path and overridden origins. Existing scalar YAML comments are preserved.
+Local edits change overrides, including direct secret references. Unsetting an override reveals the current inheritance/defaults, not a saved shared copy. Shared edits target one direct source; multiple direct sources require `--source`, never an inferred transitive winner. The invoking checkout validates a shared edit; other checkouts validate the live update on their next command. List/get include winning file/path and overridden origins. Existing scalar YAML comments are preserved. Shared Compose references are used directly by setup, list, doctor, consumer access checks, and GC protection without being materialized into local `env.yaml`.
 
 `setup.defaults = { command = "devDefaults", fields = ["project"], sources = true }` permits one named command to fill missing allowlisted ordinary settings and discover sources when no selection is declared. Input includes effective non-secret settings, provenance, selected paths, missing fields, and Dockstride's path-hashed `projectProposal`. Output is `{ "schemaVersion": 1, "values": { "project": "proposal" }, "sources": [{ "path": "/absolute/env.shared.yaml", "createIfMissing": true }] }`. Dockstride validates the entire proposal before create-new source publication; inherited/default/explicit/concurrently supplied values win. Accepted local values are persisted without flattening inherited settings.
 
-`setup`, `up`, `dev`, and `deploy` may execute defaults; configuration reads, render, status, doctor, and `--plan` do not. Plans report whether discovery would run. Hook failure is explicit, not a fallback to guessed values. `dks setup --no-shared-sources` persists an explicit empty selection and disables discovery. Shared credential inputs are private file-path settings, not credential contents or shared backend-owned deployed references.
+`setup`, `up`, `dev`, and `deploy` may execute defaults; configuration reads, render, status, doctor, and `--plan` do not. Plans report whether discovery would run. Hook failure is explicit, not a fallback to guessed values. `dks setup --no-shared-sources` persists an explicit empty selection and disables discovery. Shared YAML and original externally owned credential files remain authoritative. A shared path edit changes the effective source on the next command, not a running consumer's mount; no automatic live credential refresh is performed.
 
-Shared scalar strings are ordinary values, not automatically rebased file paths. A project sharing credential-input paths should require absolute paths in its field contract; generic declared `FileSecret` still permits project-relative input paths.
+Direct `secrets.<name>.file` references require absolute paths. Shared ordinary scalar strings are not automatically rebased file paths. Separately, a declared `FileSecret` managed-import policy still permits project-relative input paths; that policy intentionally creates an owned immutable copy rather than treating its input as the deployed Compose source.
 
 Mutation lock order is checkout lifecycle, per-user environment/allocation coordination, local allocation when required, canonical configuration/source files in sorted path order, then individual state files. No operation acquires another checkout's lifecycle lock under the global lock. Defaults and editors run outside publication locks; fingerprint revalidation prevents stale editor output from replacing a concurrent update. Allocation and secret publication use internal already-locked helpers rather than reacquiring advisory locks.
 
@@ -234,22 +237,29 @@ One fresh diagnostic phase has a shared 10-second deadline, shortened by a small
 
 ## Secrets
 
-`Config.secrets.<logical-name>` uses `lib.SecretSource`. Docker-native sources are exactly `{file = "/absolute/private/revision"}` for Compose or `{external = true, name = "immutable-swarm-revision"}` for Swarm. Service grants are explicit and the container filename stays `/run/secrets/<logical-name>`.
+`Config.secrets.<logical-name>` uses `lib.SecretSource`. Docker-native sources are exactly `{file = "/absolute/private/key"}` for Compose or `{external = true, name = "swarm-secret-name"}` for Swarm. Service grants are explicit and the container filename stays `/run/secrets/<logical-name>`. These records contain references, not credential bytes; validated direct refs can be set/unset/edited locally or in shared YAML.
 
 Initial policies under `setup.secrets`:
 
 ```nickel
 authKey = lib.GenerateSecret { bytes = 32, encoding = "hex" },
 password = lib.PromptSecret,
-apiToken = lib.FileSecret "/private/provider-token",
+apiToken = lib.ReferenceSecret,
+managedToken = lib.FileSecret "/private/provider-token",
 importedKey = lib.StdinSecret,
 ```
 
-Generation supports hex/base64 and 16–65536 source bytes. Inputs are bounded to 1 MiB and nonempty. File input requires a private, current-user-owned regular file and rejects symlink traversal. Explicit initial `--secret-file NAME=PATH` or `--secret-stdin NAME` overrides a policy only for a missing reference; existing references are reused without reading supplied inputs. Relative CLI file paths are relative to invocation directory; relative declared file policies are relative to the project. Only one missing secret may consume stdin per invocation. Noninteractive prompts return structured missing inputs.
+Generation supports hex/base64 and 16–65536 source bytes. Inputs are bounded to 1 MiB and nonempty. File input requires a private, current-user-owned regular file and rejects symlink traversal. Initial `--secret-file NAME=PATH` supplies a missing reference; existing references are reused without reading a replacement input. Relative CLI paths resolve from the invocation directory.
+
+`lib.ReferenceSecret` is `{kind = "reference"}`. For a missing reference, initial `--secret-file` or a private interactive **file-path** prompt records the validated absolute original path. It never collects plaintext and rejects `--secret-stdin`. Compose directly mounts the original file, without writing provider bytes to managed storage or saving inherited shared refs locally. An existing externally owned file remains external: setup, replace, sync, GC, and destroy never delete, chmod, or chown it. The operator must arrange safe consumer readability; Dockstride validates access rather than silently changing it.
+
+`FileSecret`, `PromptSecret`, `StdinSecret`, and explicit import APIs intentionally provision managed immutable copies. For these policies, initial `--secret-file`/`--secret-stdin` can override the missing input policy; relative declared file-policy paths resolve from the project. Only one missing secret may consume stdin per invocation. Noninteractive prompts report missing inputs. This managed-copy lifecycle is distinct from reference policies, not a fallback or compatibility shim.
+
+Generated policies stay deployment-local and retain their existing revisions; shared refs cannot supply generated credentials. Native config commands validate direct refs and do not permit raw values or replacement of generated secrets outside their lifecycle.
 
 ### Private file permissions
 
-Default parent: `$XDG_DATA_HOME/dockstride/secrets` (normally `~/.local/share/dockstride/secrets`), current-user-owned/private, with ownership marker. Per-user `u<uid>` directory is mode `0300`; random revision filenames resist accidental discovery. Atomic exclusive creation uses anchored no-follow descriptors; file and directory-entry durability precede reference publication. An existing unmarked/incompatible store is refused, never commandeered.
+For generated credentials and intentionally managed imports, the default parent is `$XDG_DATA_HOME/dockstride/secrets` (normally `~/.local/share/dockstride/secrets`), current-user-owned/private, with ownership marker. Per-user `u<uid>` directory is mode `0300`; random revision filenames resist accidental discovery. Atomic exclusive creation uses anchored no-follow descriptors; file and directory-entry durability precede reference publication. An existing unmarked/incompatible store is refused, never commandeered. Reference-backed Compose credentials are not copied here.
 
 The optional shared parent is an explicit administration operation:
 
@@ -261,7 +271,7 @@ scripts/setup-secret-storage.sh --user APPLICATION_USER --directory /opt/secrets
 
 The parent is root-owned `0755`; `.dockstride-owner` is root-owned `0644` with the exact version marker; each `u<uid>` is user-owned `0300`. `dockstride.setup.secretDirectory` selects this path. Normal CLI operations never run wholesale as root. Configured history is used for normal listing/GC, not directory enumeration. Unknown/orphan files are not automatically adopted or deleted; administrative enumeration of non-listable storage requires separate elevated host inspection.
 
-A root/non-root container must actually be able to read its granted file. Native Compose preserves host ownership/mode, ignoring long-form uid/gid requests for bind-backed secrets. `setup.secretAccess.<name> = {uid = HOST_UID, gid = HOST_GID}` explicitly authorizes restrictive group access (`0640`); default root-readable files stay `0600`. No world-readable credential workaround is used.
+A root/non-root container must actually be able to read its granted file. Native Compose preserves host ownership/mode, ignoring long-form uid/gid requests for bind-backed secrets. For owned managed storage, `setup.secretAccess.<name> = {uid = HOST_UID, gid = HOST_GID}` explicitly authorizes restrictive group access (`0640`); default root-readable files stay `0600`. External source files are checked as supplied, never chmodded/chowned to fit a consumer. No world-readable credential workaround is used.
 
 Rootless local Docker maps container UID/GID zero to the invoking host user/group. A non-root container `user = "1000:0"` can read an explicitly authorized invoking-host-group `0640` file. The rich sample exposes `hostSecretUid`, `hostSecretGid`, and `containerGid` for this policy. Remote hosts, Docker Desktop mounts, and unknown userns-remap mappings are refused by the host-file backend rather than claimed portable. Swarm secrets use Docker's native distribution instead.
 
@@ -280,13 +290,16 @@ setup.secrets.authKey = lib.GenerateSecret {
 
 The absolute recovery path contains literal `{revision}` and has a private `0700` parent; revision backups are exclusive `0600` and fsynced. `durable = false` explicitly declares an ephemeral/recreatable credential. Swarm inspect cannot return plaintext, and a new cluster cannot reconstruct generated credentials from a reference.
 
-Replacement creates a new revision, atomically updates the reference, and retains the old one. Missing recorded files/objects fail rather than regenerate. Interrupted owned pending revisions reconcile through journals/labels. Externally managed references remain unowned; replacement never grants deletion authority over them.
+Managed replacement creates a new revision, atomically updates the reference, and retains the old one. Missing recorded files/objects fail rather than regenerate. Interrupted owned pending revisions reconcile through journals/labels. Externally managed references remain unowned; replacement never grants deletion authority over their files/objects. Reference-backed Compose path changes keep a direct original-file reference, rather than importing bytes into an owned revision.
 
 `--apply` requires `setup.rotations.<name> = {workflow = "rotate-auth", services = ["api"]}` plus explicit actions for that workflow. Credential rotation can fail after storage replacement; the CLI reports committed storage and retained previous revision without pretending database/encryption changes are transactional.
 
+Reference-backed Swarm providers have a different copy boundary: Docker receives the bytes as an immutable secret, but Dockstride does not create a redundant private host recovery copy. The original file remains authoritative. A local Docker revision reference may be recorded for deployment while the shared file source remains live; explicit sync/rotation uses the current effective source. Ordinary startup reuses the published Docker revision and never silently refreshes changed source content. An externally managed `{external = true, name = "existing-secret"}` reference is reused without adopting Docker deletion authority. None of this relaxes recovery requirements for generated durable Swarm credentials.
+
+
 ### Explicit imported-secret synchronization
 
-File imports record their canonical input path and origin privately with the immutable revision. Ordinary setup/startup reuses the deployed reference even when that input changes. Synchronization is explicit and names every selected secret:
+Reference-backed Compose uses the current original file/path directly; sync does not materialize a managed host copy. Reference-backed Swarm reads the current effective file source on explicit sync and publishes changed bytes only into Docker's immutable storage. File imports separately record their canonical input path and origin privately with the immutable owned revision; ordinary setup/startup reuses that deployed revision even when the input changes. There is no automatic live credential refresh. Synchronization is explicit and names every selected secret:
 
 ```sh
 dks secrets sync apiToken --plan
@@ -294,15 +307,15 @@ dks secrets sync apiToken --yes
 dks secrets sync apiToken --yes --apply
 ```
 
-The current declared `FileSecret` takes precedence; otherwise sync uses the current revision's explicit CLI-file origin. A stdin replacement does not inherit an older file origin. Source settings are never rewritten. Files must remain private, current-user-owned regular files; symlinks, empty/oversized inputs, and unavailable origins fail before publication. All selected sources and required rotation declarations are checked before the first replacement.
+For reference policies, the current effective direct file ref is authoritative, including live shared path changes rather than an older local Docker revision's origin. For managed imports, the current declared `FileSecret` takes precedence; otherwise sync uses the current revision's explicit CLI-file origin. A stdin replacement does not inherit an older file origin. Source settings are never rewritten. Files must remain private, current-user-owned regular files; symlinks, empty/oversized inputs, and unavailable origins fail before publication. All selected sources and required rotation declarations are checked before the first replacement.
 
 Unchanged comparable inputs reuse their revisions. Private history stores an HMAC-SHA-256 digest, keyed by a durable owner-only `0600` key at `$HOME/.local/share/dockstride/.dockstride/secret-source-key`; neither digests, key material, nor credential bytes enter results. Legacy Compose revisions can establish a baseline by securely comparing their owned managed file. A legacy Swarm revision cannot prove content equality: sync creates a new immutable revision and reports `priorContentComparable: false`. Plans inspect source metadata without reading credential contents or creating a key, and report `comparison-deferred`, never a speculative unchanged/changed result.
 
-Without `--apply`, changed storage reports `consumerRestartNeeded: true`. An ordinary Compose `up` can retain an existing bind-backed secret mount; use the project's declared rotation procedure or an explicit `down`/`up` to remount a new revision. Storage replacement alone does not rotate a database password or re-encrypt stored data. Unchanged `--apply` skips rotation. Failures retain the original error and `details.secretSync` with exact committed, uncommitted, and successfully applied names; already published references and previous revisions are retained.
+Without `--apply`, changed storage reports `consumerRestartNeeded: true`. An ordinary Compose `up` can retain an existing bind-backed secret mount; use the project's declared rotation procedure or explicit `down`/`up` after changing source paths or replacing files. In-place writes can be visible through a mount, but applications may cache credentials; no automatic reload is promised. Swarm revision changes likewise require explicit consumer remount/rotation. Storage/reference replacement alone does not rotate a database password or re-encrypt stored data. Unchanged `--apply` skips rotation. Failures retain the original error and `details.secretSync` with exact committed, uncommitted, and successfully applied names; already published references and previous revisions are retained.
 
 ### Protected revision GC
 
-Registered checkouts' effective declared file inputs, current revision file origins, current/pending references, and retained operation/deployment snapshots protect matching paths and inode aliases. Live consumer mounts and Swarm service grants remain blockers. GC observes foreign checkout metadata without acquiring foreign lifecycle locks or enumerating mode-`0300` credential stores, and revalidates its evidence before each deletion. Missing, moved, unreadable, unsafe, or externally changed evidence fails closed. Explicit registry forget removes that checkout's protection only after its owned resources have been cleared.
+Registered checkouts' effective local/shared direct file refs, declared managed-import inputs, current revision file origins, current/pending references, and retained operation/deployment snapshots protect matching owned paths and inode aliases. Live consumer mounts and Swarm service grants remain blockers. Externally owned original files are never GC targets; using a Dockstride-owned revision as a shared source does not revoke its ownership or retention checks. GC observes foreign checkout metadata without acquiring foreign lifecycle locks or enumerating mode-`0300` credential stores, and revalidates its evidence before each deletion. Missing, moved, unreadable, unsafe, or externally changed evidence fails closed. Explicit registry forget removes that checkout's protection only after its owned resources have been cleared.
 
 GC plans list exact `revision` identifiers and reasons for ineligibility. Actual deletion requires explicit identifiers and confirmation:
 

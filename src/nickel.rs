@@ -256,6 +256,11 @@ pub fn setup_metadata(root: &Path, candidate: Option<&Value>) -> Result<Value> {
     )
 }
 
+pub(crate) fn setup_metadata_values(root: &Path, values: &Value) -> Result<Value> {
+    export_values(root, values,
+        "let p = import \"compose.ncl\" in {setup = if std.record.has_field \"setup\" p.dockstride then p.dockstride.setup else {}}")
+}
+
 /// Discover allocation names without forcing policy values or unrelated setup.
 pub(crate) fn allocation_fields_values(root: &Path, values: &Value) -> Result<Vec<String>> {
     let fields = export_values(root, values,

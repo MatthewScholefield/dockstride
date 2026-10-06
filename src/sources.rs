@@ -17,6 +17,8 @@ pub struct EnvironmentSnapshot {
     pub sources: Vec<PathBuf>,
     pub provenance: BTreeMap<String, Provenance>,
     pub fingerprints: BTreeMap<PathBuf, Option<String>>,
+    pub(crate) shared_values: Value,
+    pub(crate) shared_documents: BTreeMap<PathBuf, Value>,
 }
 
 impl EnvironmentSnapshot {
@@ -61,15 +63,15 @@ fn read_document(path: &Path, shared: bool) -> Result<(Value, Option<String>)> {
     };
     let text = std::str::from_utf8(&bytes)
         .with_context(|| format!("configuration {} is not UTF-8", path.display()))?;
-    let value = if shared { parse(text, path, true)? } else { crate::config::parse_document(text)? };
+    let value = if shared { parse(text, path)? } else { crate::config::parse_document(text)? };
     Ok((value, Some(hex::encode(Sha256::digest(&bytes)))))
 }
 
-pub fn parse(text: &str, path: &Path, shared: bool) -> Result<Value> {
+pub fn parse(text: &str, path: &Path) -> Result<Value> {
     let mut value: Value = serde_yaml::from_str(text).with_context(|| format!("invalid configuration {}", path.display()))?;
     if value.is_null() { value = json!({}); }
     ensure!(value.is_object(), "{} must contain a configuration mapping", path.display());
-    ensure!(!shared || value.get("secrets").is_none(), "shared source {} cannot contain secrets; deployed references must remain checkout-local", path.display());
+    crate::config::check_secrets(&value)?;
     descriptors(&value)?;
     Ok(value)
 }
@@ -91,6 +93,12 @@ pub fn descriptors(local: &Value) -> Result<Option<Vec<PathBuf>>> {
 pub fn merge(target: &mut Value, overlay: &Value) {
     if let (Some(target), Some(overlay)) = (target.as_object_mut(), overlay.as_object()) {
         for (key, value) in overlay {
+            if key == "secrets" {
+                if let (Some(old), Some(refs)) = (target.get_mut(key).and_then(Value::as_object_mut), value.as_object()) {
+                    old.extend(refs.iter().map(|(name, reference)| (name.clone(), reference.clone())));
+                    continue;
+                }
+            }
             match target.get_mut(key) { Some(old) => merge(old, value), None => { target.insert(key.clone(), value.clone()); } }
         }
     } else { *target = overlay.clone(); }
@@ -141,10 +149,14 @@ fn resolve(snapshot: &mut EnvironmentSnapshot, file: &Path, value: Value, stack:
             read_document(&canonical, true)
                 .with_context(|| format!("reading shared source {} declared by {}", canonical.display(), file.display()))?
         };
-        ensure!(child.get("secrets").is_none(), "shared source {} cannot contain secrets", canonical.display());
+        crate::config::check_secrets(&child)?;
+        snapshot.shared_documents.insert(canonical.clone(), child.clone());
         snapshot.fingerprints.insert(canonical.clone(), fingerprint);
         if !snapshot.sources.contains(&canonical) { snapshot.sources.push(canonical.clone()); }
         resolve(snapshot, &canonical, child, stack, overrides)?;
+    }
+    if file == snapshot.local_file.as_path() {
+        snapshot.shared_values = snapshot.values.clone();
     }
     apply(snapshot, &value, file);
     stack.pop();
@@ -163,8 +175,21 @@ pub(crate) fn snapshot_with_overrides(root: &Path, candidate: Option<&Value>, ov
         None => read_document(&file, false)?,
     };
     ensure!(local.is_object(), "env.yaml must contain a configuration mapping");
-    let mut snapshot = EnvironmentSnapshot { local: local.clone(), local_file: file.clone(), values: json!({}), sources: Vec::new(), provenance: BTreeMap::new(), fingerprints: BTreeMap::from([(file.clone(), fingerprint)]) };
+    let mut snapshot = EnvironmentSnapshot { local: local.clone(), local_file: file.clone(), values: json!({}), sources: Vec::new(), provenance: BTreeMap::new(), fingerprints: BTreeMap::from([(file.clone(), fingerprint)]), shared_values: json!({}), shared_documents: BTreeMap::new() };
     resolve(&mut snapshot, &file, local, &mut Vec::new(), overrides)?;
+    if snapshot.shared_documents.values().any(|value| value.get("secrets").is_some()) {
+        let metadata = crate::nickel::setup_metadata_values(&root, &snapshot.values)?;
+        if let Some(policies) = metadata.pointer("/setup/secrets").and_then(Value::as_object) {
+            for (name, policy) in policies {
+                if policy["kind"] == "generate" || (policy.get("kind").is_none() && policy.get("bytes").is_some()) {
+                    for (source, value) in &snapshot.shared_documents {
+                        ensure!(value.pointer(&format!("/secrets/{name}")).is_none(),
+                            "generated secret {name} must remain checkout-local, not inherited from shared source {}", source.display());
+                    }
+                }
+            }
+        }
+    }
     Ok(snapshot)
 }
 

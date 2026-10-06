@@ -83,7 +83,7 @@ impl Protection {
             let snapshot = sources::snapshot(&checkout.root.canonical, None)?;
             ensure!(snapshot.fingerprints == checkout.snapshot.fingerprints,
                 "secret retention source graph changed; rerun GC");
-            let metadata = nickel::setup_metadata(&checkout.root.canonical, Some(&snapshot.local))?;
+            let metadata = nickel::setup_metadata_values(&checkout.root.canonical, &snapshot.values)?;
             snapshot.verify()?;
             ensure!(metadata == checkout.metadata, "secret retention policies changed; rerun GC");
         }
@@ -165,15 +165,22 @@ impl Protection {
         let snapshot = sources::snapshot(root, None).context("cannot resolve current layered configuration")?;
         ensure!(snapshot.fingerprints.get(&snapshot.local_file).is_some_and(Option::is_some),
             "checkout configuration is missing; current secret consumers are unknown");
-        let metadata = nickel::setup_metadata(root, Some(&snapshot.local)).context("cannot evaluate current secret policy metadata")?;
+        let metadata = nickel::setup_metadata_values(root, &snapshot.values).context("cannot evaluate current secret policy metadata")?;
         snapshot.verify()?;
-        let refs = match snapshot.local.get("secrets") {
+        let refs = match snapshot.values.get("secrets") {
             Some(value) => Some(value.as_object().context("unsafe current secret references")?),
             None => None,
         };
         if let Some(refs) = refs {
             for reference in refs.values() {
                 self.reference(reference, format!("current environment reference in {}", root.display()))?;
+            }
+        }
+        for (source, value) in &snapshot.shared_documents {
+            if let Some(refs) = value.get("secrets").and_then(Value::as_object) {
+                for reference in refs.values() {
+                    self.reference(reference, format!("shared environment reference in {}", source.display()))?;
+                }
             }
         }
         let history = self.file(&root.join(".dockstride/secrets.json")).context("cannot read private secret revision history")?;
@@ -196,7 +203,7 @@ impl Protection {
                     revision["logical"].as_str() == Some(logical) && revision["reference"] == *reference && revision["deleted"] != true)
                 {
                     if let Some(source) = revision.get("fileSource").filter(|source| !source.is_null()) {
-                        ensure!(source["kind"] == "file" && matches!(source["origin"].as_str(), Some("declared-file" | "cli-file")), "unsafe current secret source provenance");
+                        ensure!(source["kind"] == "file" && matches!(source["origin"].as_str(), Some("declared-file" | "cli-file" | "reference-file" | "shared-reference")), "unsafe current secret source provenance");
                         let path = source["canonicalPath"].as_str().context("unsafe current secret source path")?;
                         self.source(Path::new(path), format!("current imported source for {logical} in {}", root.display()))?;
                     }

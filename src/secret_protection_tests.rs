@@ -1,8 +1,5 @@
-use dockstride::{nickel, registry, sources, state};
-// Exercise the crate-private retention engine without widening its public API.
-#[path = "../src/secret_protection.rs"]
-mod secret_protection;
-use secret_protection::observe;
+use crate::{nickel, registry, sources, state};
+use crate::secret_protection::observe;
 use serde_json::{Value, json};
 use std::{fs, os::unix::fs::{PermissionsExt, symlink}, path::{Path, PathBuf}, process::Command};
 use tempfile::TempDir;
@@ -10,7 +7,7 @@ use tempfile::TempDir;
 fn isolated(name: &str, run: impl FnOnce()) {
     if std::env::var("DKS_PROTECTION_CHILD").as_deref() == Ok(name) { run(); return; }
     let home = tempfile::tempdir().unwrap();
-    let output = Command::new(std::env::current_exe().unwrap()).args(["--exact", name, "--nocapture"])
+    let output = Command::new(std::env::current_exe().unwrap()).args(["--exact", &format!("secret_protection_tests::{name}"), "--nocapture"])
         .env("DKS_PROTECTION_CHILD", name).env("HOME", home.path()).env("XDG_DATA_HOME", home.path().join("data"))
         .output().unwrap();
     assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
@@ -88,6 +85,32 @@ fn declared_shared_source_survives_primary_rotation_and_explicit_forget_releases
         f.register(&[&f.primary]);
         assert!(protection.verify().is_err());
         assert!(observe(&f.primary).unwrap().reason(&f.reference()).is_none());
+    });
+}
+
+#[test]
+fn shared_references_remain_protected_behind_local_overrides_until_source_changes() {
+    isolated("shared_references_remain_protected_behind_local_overrides_until_source_changes", || {
+        let f = Fixture::new();
+        let shared = f.temp.path().join("shared.yaml");
+        fs::write(&shared, serde_yaml::to_string(&json!({"secrets":{"token":f.reference()}})).unwrap()).unwrap();
+        let inherited = json!({"project":"fixture","backend":"compose","_dockstride":{"sources":[{"path":shared}]}});
+        f.environment(&f.consumer, inherited.clone());
+        let protection = observe(&f.primary).unwrap();
+        assert!(protection.reason(&f.reference()).is_some());
+        protection.verify().unwrap();
+
+        let mut overridden = inherited.clone();
+        overridden["secrets"] = json!({"token":{"file":f.current}});
+        f.environment(&f.consumer, overridden);
+        assert!(protection.verify().is_err());
+        assert!(observe(&f.primary).unwrap().reason(&f.reference()).is_some());
+
+        f.environment(&f.consumer, inherited);
+        assert!(observe(&f.primary).unwrap().reason(&f.reference()).is_some());
+        fs::write(&shared, serde_yaml::to_string(&json!({"secrets":{"token":{"file":f.current}}})).unwrap()).unwrap();
+        assert!(observe(&f.primary).unwrap().reason(&f.reference()).is_none());
+        assert!(f.old.exists());
     });
 }
 

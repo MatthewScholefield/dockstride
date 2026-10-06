@@ -105,6 +105,7 @@ pub fn provision(
     inputs: &BTreeMap<String, SecretInput>,
     output: &Output,
 ) -> Result<Value> {
+    preflight_inputs(root, inputs, None)?;
     let _lifecycle = state::lock(root, "lifecycle")?;
     let _global = state::global_lock()?;
     let _config = state::lock(root, "config")?;
@@ -125,9 +126,21 @@ pub fn provision(
         valid_name(name)?;
         ensure!(
             policies.contains_key(name)
-                || session.snapshot.local.pointer(&format!("/secrets/{name}")).is_some(),
+                || session.snapshot.values.pointer(&format!("/secrets/{name}")).is_some(),
             "unknown initial secret input name {name}"
         );
+    }
+    for (name, input) in inputs {
+        ensure!(!(policies.get(name).is_some_and(|policy| policy_kind(policy) == "reference")
+            && matches!(input, SecretInput::Stdin)),
+            "reference secret {name} requires a private file path; stdin cannot supply a reference");
+        if policies.get(name).is_some_and(|policy| policy_kind(policy) == "reference")
+            && session.snapshot.values.pointer(&format!("/secrets/{name}")).is_none() {
+            if let SecretInput::File(path) = input {
+                let path = if path.is_absolute() { path.clone() } else { std::env::current_dir()?.join(path) };
+                reference_file(&json!({"file":path}))?;
+            }
+        }
     }
     ensure!(
         inputs
@@ -154,21 +167,26 @@ pub fn provision(
     let mut history = history(root)?;
     reconcile(root, &mut session, &mut history)?;
     let mut results = Vec::new();
-    if let Some(refs) = session.snapshot.local.get("secrets").and_then(Value::as_object) {
-        for (name, reference) in refs {
-            valid_name(name)?;
-            validate_reference(reference, &session)?;
+    let existing: Vec<_> = references(&session.snapshot.values).map(|(name, reference)| (name.clone(), reference.clone())).collect();
+    for (name, reference) in existing {
+        if session.backend == "swarm" && reference.get("file").is_some() {
+            let policy = policies.get(&name).cloned().unwrap_or_else(|| json!({"kind":"reference"}));
+            publish_reference(root, &mut session, &mut history, &name, &reference, &policy)?;
+            results.push(json!({"name":name,"status":"provisioned","reference":session.snapshot.values.pointer(&format!("/secrets/{name}"))}));
+        } else {
+            valid_name(&name)?;
+            validate_reference(&reference, &session)?;
             let owned = history
                 .revisions
                 .iter()
-                .find(|r| r.reference == *reference && !r.deleted);
-            verify_reference(reference, &session, owned)?;
+                .find(|r| r.reference == reference && !r.deleted);
+            verify_reference(&reference, &session, owned)?;
             results.push(json!({"name":name,"status":"reused","reference":reference}));
         }
     }
     let missing: Vec<_> = policies
         .keys()
-        .filter(|name| session.snapshot.local.pointer(&format!("/secrets/{name}")).is_none())
+        .filter(|name| session.snapshot.values.pointer(&format!("/secrets/{name}")).is_none())
         .cloned()
         .collect();
     let stdin_count = missing
@@ -186,13 +204,15 @@ pub fn provision(
     if non_interactive {
         let unresolved: Vec<_> = missing
             .iter()
-            .filter(|name| !inputs.contains_key(*name) && policy_kind(&policies[*name]) == "prompt")
+            .filter(|name| !inputs.contains_key(*name) && matches!(policy_kind(&policies[*name]), "prompt" | "reference"))
             .cloned()
             .collect();
         if !unresolved.is_empty() {
             return Err(config::MissingInputs { fields: unresolved.iter().map(|name| {
                 session.fields.iter().find(|f| f.path.strip_prefix("secrets.") == Some(name.as_str())).cloned().unwrap_or_else(|| crate::model::Field {
-                    path:format!("secrets.{name}"),kind:"secret".into(),doc:Some("Supply --secret-file NAME=PATH or --secret-stdin NAME, or use a hidden terminal prompt.".into()),default:None,required:true,choices:vec![],
+                    path:format!("secrets.{name}"),kind:"secret".into(),doc:Some(if policy_kind(&policies[name]) == "reference" {
+                        "Supply --secret-file NAME=PATH to an existing private file, or use the hidden FILE PATH prompt.".into()
+                    } else { "Supply --secret-file NAME=PATH or --secret-stdin NAME, or use a hidden terminal prompt.".into() }),default:None,required:true,choices:vec![],
                 })
             }).collect() }.into());
         }
@@ -200,6 +220,12 @@ pub fn provision(
     let mut stdin_used = false;
     for name in missing {
         let policy = &policies[&name];
+        if policy_kind(policy) == "reference" {
+            let reference = obtain_reference(inputs.get(&name), non_interactive)?;
+            let reference = publish_reference(root, &mut session, &mut history, &name, &reference, policy)?;
+            results.push(json!({"name":name,"status":"provisioned","reference":reference}));
+            continue;
+        }
         let input = match inputs.get(&name) {
             Some(input) => obtain_input(input, &mut stdin_used)?,
             None => obtain(root, policy, non_interactive, &mut stdin_used)?,
@@ -242,7 +268,7 @@ pub fn list(root: &Path) -> Result<Value> {
     let history = history(root)?;
     let consumers = consumers(root)?;
     let mut secrets = Vec::new();
-    for (name, reference) in references(&session.snapshot.local) {
+    for (name, reference) in references(&session.snapshot.values) {
         let revision = history
             .revisions
             .iter()
@@ -265,7 +291,7 @@ pub fn doctor(root: &Path) -> Result<Value> {
     let session = session(root, &output)?;
     let mut issues = Vec::new();
     let history = history(root)?;
-    for (name, reference) in references(&session.snapshot.local) {
+    for (name, reference) in references(&session.snapshot.values) {
         let revision = history
             .revisions
             .iter()
@@ -294,6 +320,9 @@ pub fn replace(
     output: &Output,
 ) -> Result<Value> {
     valid_name(name)?;
+    if let Some(input) = input {
+        preflight_inputs(root, &BTreeMap::from([(name.to_owned(), input.clone())]), None)?;
+    }
     let _lifecycle = state::lock(root, "lifecycle")?;
     let global = state::global_lock()?;
     let config = state::lock(root, "config")?;
@@ -314,7 +343,7 @@ pub fn replace(
     let mut history = history(root)?;
     reconcile(root, &mut session, &mut history)?;
     let old = session
-        .snapshot.local
+        .snapshot.values
         .pointer(&format!("/secrets/{name}"))
         .context("secret has no existing reference; run setup first")?
         .clone();
@@ -330,11 +359,16 @@ pub fn replace(
     let policy = policies(&session.metadata)?
         .remove(name)
         .unwrap_or_else(|| json!({"kind":"prompt"}));
-    let input = match input {
-        Some(input) => obtain_input(input, &mut false)?,
-        None => obtain(root, &policy, non_interactive, &mut false)?,
+    let reference = if policy_kind(&policy) == "reference" {
+        let reference = obtain_reference(input, non_interactive)?;
+        publish_reference(root, &mut session, &mut history, name, &reference, &policy)?
+    } else {
+        let input = match input {
+            Some(input) => obtain_input(input, &mut false)?,
+            None => obtain(root, &policy, non_interactive, &mut false)?,
+        };
+        create_revision(root, &mut session, &mut history, name, &input.bytes, &policy, input.source)?
     };
-    let reference = create_revision(root, &mut session, &mut history, name, &input.bytes, &policy, input.source)?;
     validate_consumers_with_session(root, &session)?;
     let affected = consumers(root)?.remove(name).unwrap_or_default();
     // Storage is committed before trusted project commands run. Keep only lifecycle
@@ -431,14 +465,29 @@ pub fn sync(
     let mut rows = Vec::with_capacity(names.len());
     // Resolve every selection before reading any credential or creating the HMAC key.
     for name in names {
-        let previous = session.snapshot.local.pointer(&format!("/secrets/{name}"))
+        let previous = session.snapshot.values.pointer(&format!("/secrets/{name}"))
             .with_context(|| format!("secret {name} has no existing reference; run setup first"))?.clone();
         let owned_index = history.revisions.iter().rposition(|revision|
             revision.logical == *name && revision.reference == previous && !revision.deleted);
         let owned = owned_index.map(|index| &history.revisions[index]);
         verify_reference(&previous, &session, owned)?;
         let policy = policies.get(name).cloned().unwrap_or_else(|| json!({"kind":"prompt"}));
-        let (path, origin) = if policy_kind(&policy) == "file" {
+        let (path, origin) = if policy_kind(&policy) == "reference" {
+            if let Some(path) = previous.get("file").and_then(Value::as_str) {
+                (PathBuf::from(path), "reference-file")
+            } else {
+                let source = owned.and_then(|revision| revision.file_source.as_ref())
+                    .context("external named secret has no file source to sync")?;
+                if source.origin == "shared-reference" {
+                    let path = session.snapshot.shared_values.pointer(&format!("/secrets/{name}/file"))
+                        .and_then(Value::as_str).context("shared provider file reference is absent; do not reuse an obsolete source")?;
+                    (PathBuf::from(path), "shared-reference")
+                } else {
+                    ensure!(source.origin == "reference-file", "secret has no authoritative reference file source");
+                    (source.canonical_path.clone(), "reference-file")
+                }
+            }
+        } else if policy_kind(&policy) == "file" {
             (declared_path(root, &policy)?, "declared-file")
         } else {
             let source = owned.and_then(|revision| revision.file_source.as_ref())
@@ -456,16 +505,22 @@ pub fn sync(
             unchanged: false, baseline: false, prior_comparable: false, owned_index, rotation: None });
     }
     if plan_only { return Ok(sync_report(&rows, true, &[], &[], names)); }
-    let key = source_key()?;
+    let key = if selections.iter().any(|selection| policy_kind(&selection.policy) != "reference" || session.backend == "swarm") { Some(source_key()?) } else { None };
     // Preflight all sources and exact bytes before the first new revision is published.
     for selection in &mut selections {
+        if policy_kind(&selection.policy) == "reference" && session.backend == "compose" {
+            reference_file(&json!({"file":selection.source.canonical_path}))?;
+            continue;
+        }
         let path = if selection.source.origin == "declared-file" {
             declared_path(root, &selection.policy)?
         } else { selection.source.canonical_path.clone() };
-        let (file, canonical_path) = open_input(&path, None)?;
+        let (file, canonical_path) = if policy_kind(&selection.policy) == "reference" {
+            reference_file(&json!({"file":path}))?
+        } else { open_input(&path, None)? };
         ensure!(canonical_path == selection.source.canonical_path, "secret sync source identity changed");
         let bytes = read_bounded(file)?;
-        let mac = content_mac(&key, &bytes);
+        let mac = content_mac(key.as_ref().unwrap(), &bytes);
         let revision = selection.owned_index.map(|index| &history.revisions[index]);
         if let Some(digest) = revision.and_then(|revision| revision.file_source.as_ref())
             .and_then(|source| source.keyed_digest.as_deref()) {
@@ -520,8 +575,12 @@ pub fn sync(
             error.context(SyncFailed(sync_report(&rows, false, &committed, &applied, names))))?;
     }
     for (index, selection) in selections.iter().enumerate().filter(|(_, selection)| !selection.unchanged) {
-        let created = create_revision(root, &mut session, &mut history, &selection.name,
-            selection.input.as_deref().unwrap(), &selection.policy, Some(selection.source.clone()));
+        let created = if policy_kind(&selection.policy) == "reference" && session.backend == "compose" {
+            Ok(selection.previous.clone())
+        } else {
+            create_revision(root, &mut session, &mut history, &selection.name,
+                selection.input.as_deref().unwrap(), &selection.policy, Some(selection.source.clone()))
+        };
         match created {
             Ok(reference) => {
                 committed.push(selection.name.clone());
@@ -626,7 +685,7 @@ pub fn gc(
         reconcile(root, &mut session, &mut history)?;
     }
     let mut protection = crate::secret_protection::observe(root)?;
-    let current: Vec<_> = references(&session.snapshot.local)
+    let current: Vec<_> = references(&session.snapshot.values)
         .map(|(_, value)| value.clone())
         .collect();
     let mut plan = Vec::new();
@@ -722,10 +781,9 @@ pub fn gc(
 
 fn session(root: &Path, output: &Output) -> Result<Session> {
     let snapshot = crate::sources::snapshot(root, None)?;
-    let env = &snapshot.local;
     let layered = &snapshot.values;
-    let metadata = nickel::setup_metadata(root, Some(env))?;
-    let fields = nickel::schema(root, Some(env))?;
+    let metadata = nickel::setup_metadata_values(root, layered)?;
+    let fields = nickel::schema_values(root, layered)?;
     let effective = |path: &str| {
         layered.get(path).or_else(|| {
             fields
@@ -846,7 +904,7 @@ fn policy_kind(policy: &Value) -> &str {
             "prompt"
         })
 }
-fn valid_name(name: &str) -> Result<()> {
+pub(crate) fn valid_name(name: &str) -> Result<()> {
     ensure!(
         !name.is_empty()
             && name.len() <= 128
@@ -862,6 +920,139 @@ fn references(env: &Value) -> impl Iterator<Item = (&String, &Value)> {
         .and_then(Value::as_object)
         .into_iter()
         .flat_map(|record| record.iter())
+}
+
+pub(crate) fn validate_reference_shape(reference: &Value) -> Result<()> {
+    let record = reference.as_object().context("secret reference must be a record, never plaintext")?;
+    if let Some(path) = record.get("file").and_then(Value::as_str) {
+        ensure!(record.len() == 1 && Path::new(path).is_absolute(),
+            "file secret reference requires exactly {{file: absolute-path}}");
+        ensure!(!Path::new(path).components().any(|part| matches!(part, Component::ParentDir | Component::CurDir)),
+            "secret paths must not contain traversal components");
+    } else {
+        ensure!(record.len() == 2 && record.get("external").and_then(Value::as_bool) == Some(true),
+            "secret reference requires {{file: absolute-path}} or {{external: true, name: object}}");
+        valid_name(record.get("name").and_then(Value::as_str).context("external secret name missing")?)?;
+    }
+    Ok(())
+}
+
+fn reference_file(reference: &Value) -> Result<(File, PathBuf)> {
+    validate_reference_shape(reference)?;
+    let path = Path::new(reference["file"].as_str().context("file reference required")?);
+    let file = open_secure_file(path, libc::O_RDONLY | libc::O_NOATIME, 0)?;
+    let metadata = file.metadata()?;
+    ensure!(metadata.is_file() && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.mode() & 0o007 == 0 && metadata.mode() & 0o022 == 0
+        && metadata.len() > 0 && metadata.len() <= 1_048_576,
+        "referenced secret file must be nonempty, private, regular, and owned by the current user");
+    Ok((file, path.to_owned()))
+}
+
+pub fn preflight_inputs(root: &Path, inputs: &BTreeMap<String, SecretInput>, candidate: Option<&Value>) -> Result<()> {
+    if !inputs.values().any(|input| matches!(input, SecretInput::Stdin)) { return Ok(()); }
+    let snapshot = crate::sources::snapshot(root, candidate)?;
+    let mut policies = policies(&nickel::setup_metadata_values(root, &snapshot.values)?)?;
+    for field in nickel::schema_values(root, &snapshot.values)?.into_iter().filter(|field| field.kind == "secret") {
+        if let Some(name) = field.path.strip_prefix("secrets.") {
+            policies.entry(name.to_owned()).or_insert_with(|| json!({"kind":"prompt"}));
+        }
+    }
+    for (name, input) in inputs {
+        ensure!(!matches!(input, SecretInput::Stdin) || policies.contains_key(name)
+            || snapshot.values.pointer(&format!("/secrets/{name}")).is_some(),
+            "unknown initial secret input name {name}");
+        ensure!(!(matches!(input, SecretInput::Stdin) && policies.get(name).is_some_and(|policy| policy_kind(policy) == "reference")),
+            "reference secret {name} requires a private file path; stdin cannot supply a reference");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_config_transition(root: &Path, before: &Value, candidate: &Value, effective: &Value, managed: bool) -> Result<()> {
+    config::check_secrets(candidate)?;
+    let mut policies = policies(&nickel::setup_metadata_values(root, effective)?)?;
+    let mut prior_values = effective.clone();
+    let mut prior_overlay = before.clone();
+    prior_overlay.as_object_mut().context("configuration must be a mapping")?.remove("_dockstride");
+    crate::sources::merge(&mut prior_values, &prior_overlay);
+    for (name, policy) in self::policies(&nickel::setup_metadata_values(root, &prior_values)?)? {
+        if policy_kind(&policy) == "generate" { policies.insert(name, policy); }
+    }
+    for (name, policy) in &policies {
+        if !managed && policy_kind(policy) == "generate" {
+            ensure!(before.pointer(&format!("/secrets/{name}")) == candidate.pointer(&format!("/secrets/{name}")),
+                "generated secret {name} is managed by setup/replace, not native configuration edits");
+        }
+    }
+    let default_fields = if effective.get("backend").is_none()
+        && references(candidate).any(|(name, reference)| reference.get("file").is_none()
+            && before.pointer(&format!("/secrets/{name}")) != Some(reference)) {
+        nickel::schema_values(root, effective)?
+    } else { Vec::new() };
+    let backend = effective.get("backend").or_else(|| default_fields.iter()
+        .find(|field| field.path == "backend").and_then(|field| field.default.as_ref()))
+        .and_then(Value::as_str).unwrap_or("compose");
+    for (name, reference) in references(candidate) {
+        if before.pointer(&format!("/secrets/{name}")) == Some(reference) { continue; }
+        if reference.get("file").is_some() {
+            if !managed { reference_file(reference)?; }
+        } else {
+            ensure!(backend == "swarm",
+                "external named secrets require the Swarm backend");
+            if !managed {
+                let docker = Docker::new(root, Output { json: false, quiet: true });
+                let info: Value = serde_json::from_str(&docker.capture(&["secret".into(), "inspect".into(),
+                    reference["name"].as_str().unwrap().into()], None)?)?;
+                ensure!(info.get(0).and_then(|item| item.pointer("/Spec/Name")) == Some(&reference["name"]),
+                    "external secret reference is absent or mismatched in the current Docker context");
+            }
+        }
+    }
+    if !managed && references(candidate).any(|(name, reference)| before.pointer(&format!("/secrets/{name}")) != Some(reference)) {
+        let fields = nickel::schema_values(root, effective)?;
+        let values = config::effective(effective, &fields)?;
+        let complete = fields.iter().filter(|field| field.required).all(|field|
+            field.path.split('.').try_fold(&values, |value, part| value.get(part)).is_some());
+        if complete && values.get("backend").and_then(Value::as_str).unwrap_or("compose") == "compose" {
+            let mut session = session(root, &Output { json: false, quiet: true })?;
+            session.snapshot.values = effective.clone();
+            session.metadata = nickel::setup_metadata_values(root, effective)?;
+            validate_consumers_with_session(root, &session)?;
+        }
+    }
+    Ok(())
+}
+
+fn obtain_reference(input: Option<&SecretInput>, non_interactive: bool) -> Result<Value> {
+    let path = match input {
+        Some(SecretInput::File(path)) => path.clone(),
+        Some(SecretInput::Stdin) => bail!("reference secrets require a private file path, not stdin"),
+        None => {
+            ensure!(!non_interactive && std::io::stdin().is_terminal(), "reference secret requires --secret-file NAME=PATH");
+            PathBuf::from(rpassword::prompt_password("Private secret FILE PATH (hidden): ")?)
+        }
+    };
+    let path = if path.is_absolute() { path } else { std::env::current_dir()?.join(path) };
+    let reference = json!({"file":path});
+    reference_file(&reference)?;
+    Ok(reference)
+}
+
+fn publish_reference(root: &Path, session: &mut Session, history: &mut History, name: &str, reference: &Value, policy: &Value) -> Result<Value> {
+    let (file, path) = reference_file(reference)?;
+    if session.backend == "compose" {
+        local_scope(session)?;
+        session.snapshot.verify()?;
+        config::set_secret_reference_locked(root, name, reference)?;
+        session.snapshot = crate::sources::snapshot(root, None)?;
+        Ok(reference.clone())
+    } else {
+        let bytes = read_bounded(file)?;
+        let origin = if session.snapshot.provenance.get(&format!("secrets.{name}")).is_some_and(|origin| origin.file != session.snapshot.local_file) { "shared-reference" } else { "reference-file" };
+        let source = FileSource { kind: "file".into(), canonical_path: path, origin: origin.into(),
+            keyed_digest: Some(content_digest(&source_key()?, &bytes)) };
+        create_revision(root, session, history, name, &bytes, policy, Some(source))
+    }
 }
 fn retained(history: &History, logical: &str, current: &Value, owner: &str) -> Vec<Value> {
     let mut result: Vec<Value> = history
@@ -1142,7 +1333,7 @@ fn create_revision(
         owner: session.owner.clone(),
         context: session.context.clone(),
         cluster: session.cluster.clone(),
-        previous: session.snapshot.local.pointer(&format!("/secrets/{name}")).cloned(),
+        previous: session.snapshot.values.pointer(&format!("/secrets/{name}")).cloned(),
         pending: true,
         deleted: false,
         file_source,
@@ -1197,7 +1388,7 @@ fn reconcile(root: &Path, session: &mut Session, history: &mut History) -> Resul
             "interrupted secret operation belongs to a different owner/context/cluster"
         );
         verify_reference(&record.reference, session, Some(record)).context("interrupted secret revision is absent or unverifiable; recover from the declared private recovery source, do not regenerate an established credential")?;
-        let current = session.snapshot.local.pointer(&format!("/secrets/{}", record.logical));
+        let current = session.snapshot.values.pointer(&format!("/secrets/{}", record.logical));
         ensure!(
             current == Some(&record.reference) || current == record.previous.as_ref(),
             "secret reference changed during interrupted operation; manual recovery required"
@@ -1213,6 +1404,7 @@ fn reconcile(root: &Path, session: &mut Session, history: &mut History) -> Resul
     Ok(())
 }
 fn validate_reference(reference: &Value, session: &Session) -> Result<()> {
+    validate_reference_shape(reference)?;
     let record = reference
         .as_object()
         .context("secret reference must be a Docker-native record, never plaintext")?;
@@ -1274,11 +1466,15 @@ fn verify_reference(
             );
         }
     } else {
+        if revision.is_none() {
+            reference_file(reference)?;
+        }
         let path = Path::new(reference["file"].as_str().unwrap());
         let file = open_secure_file(path, libc::O_RDONLY, 0).context("recorded secret file is absent or unreadable; restore it from recovery source, never regenerate")?;
         let metadata = file.metadata()?;
         ensure!(
-            metadata.is_file() && metadata.mode() & 0o007 == 0 && metadata.mode() & 0o022 == 0,
+            metadata.is_file() && metadata.len() > 0 && metadata.len() <= 1_048_576
+                && metadata.mode() & 0o007 == 0 && metadata.mode() & 0o022 == 0,
             "secret file ownership/permissions are unsafe"
         );
         if let Some(revision) = revision {
@@ -1663,9 +1859,15 @@ fn validate_consumers_with_session(root: &Path, session: &Session) -> Result<()>
     if session.backend != "compose" {
         return Ok(());
     }
-    let project = nickel::evaluate(root, None)?;
+    let project = nickel::evaluate_values(root, &session.snapshot.values)?;
+    let services = project.services()?;
+    if !services.values().any(|service| service.get("secrets").and_then(Value::as_array)
+        .is_some_and(|grants| !grants.is_empty())) {
+        return Ok(());
+    }
+    local_scope(session)?;
     let rootless = docker_rootless(session)?;
-    for (service_name, service) in project.services()? {
+    for (service_name, service) in services {
         let user = service.get("user").and_then(Value::as_str);
         for secret in service
             .get("secrets")
@@ -1678,14 +1880,11 @@ fn validate_consumers_with_session(root: &Path, session: &Session) -> Result<()>
                 .or_else(|| secret.get("source").and_then(Value::as_str))
                 .context("invalid service secret grant")?;
             let reference = session
-                .snapshot.local
+                .snapshot.values
                 .pointer(&format!("/secrets/{logical}"))
                 .context("service secret grant has no reference")?;
-            let metadata = fs::metadata(
-                reference["file"]
-                    .as_str()
-                    .context("invalid file secret reference")?,
-            )?;
+            let metadata = open_secure_file(Path::new(reference["file"].as_str()
+                .context("invalid file secret reference")?), libc::O_RDONLY, 0)?.metadata()?;
             if let Some(user) = user {
                 let mut parts = user.split(':');
                 let uid: u32 = parts.next().unwrap().parse().with_context(|| format!("service {service_name}: named container users cannot be validated against host-file ownership; use numeric user and explicit setup.secretAccess"))?;

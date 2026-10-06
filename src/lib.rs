@@ -17,3 +17,6 @@ pub mod ports;
 pub mod status;
 pub mod diagnostics;
 pub(crate) mod secret_protection;
+
+#[cfg(test)]
+mod secret_protection_tests;

@@ -139,7 +139,9 @@ pub(crate) fn check_secrets(value: &Value) -> Result<()> {
             .as_object()
             .context("secrets must be a mapping of Docker secret references")?
         {
+            crate::secrets::valid_name(name)?;
             secret_reference(reference).with_context(|| format!("secrets.{name}"))?;
+            crate::secrets::validate_reference_shape(reference)?;
         }
     }
     Ok(())
@@ -251,16 +253,23 @@ fn protect_identity(root: &Path, before: &Value, after: &Value, fields: &[Field]
     Ok(())
 }
 
-fn validate_candidate(root: &Path, before: &Value, candidate: &Value) -> Result<Vec<Field>> {
+fn validate_candidate(root: &Path, before: &Value, candidate: &Value, managed: bool) -> Result<Vec<Field>> {
     check_secrets(candidate)?;
     let old = sources::snapshot(root, Some(before))?;
     let new = sources::snapshot(root, Some(candidate))?;
+    crate::secrets::validate_config_transition(root, before, candidate, &new.values, managed)?;
     validate_values(root, &old.values, &new.values)
 }
 
 fn validate_values(root: &Path, before: &Value, candidate: &Value) -> Result<Vec<Field>> {
     let fields = nickel::schema_values(root, candidate)?;
     let previous_fields = nickel::schema_values(root, before)?;
+    let previous_values = effective(before, &previous_fields)?;
+    let candidate_values = effective(candidate, &fields)?;
+    ensure!(!fields.iter().any(|field| field.required
+        && at(&previous_values, &field.path).is_some()
+        && at(&candidate_values, &field.path).is_none()),
+        "candidate removes an existing required input without a default; configuration was not changed");
     ensure!(
         !missing(before, &previous_fields, true)?.is_empty()
             || missing(candidate, &fields, true)?.is_empty(),
@@ -637,10 +646,6 @@ fn publish_candidate(root: &Path, operation: &str, mut changes: Vec<publication:
 
 fn mutate(root: &Path, path: &str, replacement: Option<Value>, secret: bool) -> Result<Value> {
     parts(path)?;
-    ensure!(
-        secret || !is_secret(path),
-        "secret configuration is reference-only; use dks secrets replace or dks setup"
-    );
     let _lifecycle = state::lock(root, "lifecycle")?;
     let _global = state::global_lock()?;
     let _allocation = state::lock(root, "port-allocation")?;
@@ -658,34 +663,29 @@ fn mutate(root: &Path, path: &str, replacement: Option<Value>, secret: bool) -> 
 /// remain active so callers must not pass an unprotected effective snapshot.
 fn mutate_locked(root: &Path, path: &str, replacement: Option<Value>, secret: bool) -> Result<Value> {
     parts(path)?;
-    ensure!(
-        secret || !is_secret(path),
-        "secret configuration is reference-only; use dks secrets replace or dks setup"
-    );
     let text = document(root)?;
     let before = parse_document(&text)?;
     let snapshot = sources::snapshot(root, Some(&before))?;
     snapshot.verify_text(&snapshot.local_file, &text)?;
     let schema = nickel::schema(root, Some(&before))?;
-    ensure!(
-        schema
-            .iter()
-            .any(|f| f.path == path || f.path.starts_with(&format!("{path}.")))
-            || (secret && path.starts_with("secrets.")),
-        "unknown configuration field {path}"
-    );
     let mut candidate = before.clone();
     put(&mut candidate, path, replacement.clone())?;
+    let candidate_schema = nickel::schema(root, Some(&candidate))?;
+    ensure!(schema.iter().chain(&candidate_schema).any(|field| field.path == path
+        || field.path.starts_with(&format!("{path}."))
+        || (is_secret(path) && path.starts_with(&format!("{}.", field.path))))
+        || (secret && path.starts_with("secrets."))
+        || (is_secret(path) && candidate.get("secrets").is_some()), "unknown configuration field {path}");
     if replacement.is_none() {
-        let values = effective(&sources::snapshot(root, Some(&candidate))?.values, &schema)?;
+        let values = effective(&sources::snapshot(root, Some(&candidate))?.values, &candidate_schema)?;
         ensure!(
-            !schema.iter().any(|f| f.required
+            !candidate_schema.iter().any(|f| f.required
                 && (f.path == path || f.path.starts_with(&format!("{path}.")))
                 && at(&values, &f.path).is_none()),
             "unsetting {path} would remove a required input without a default"
         );
     }
-    let fields = validate_candidate(root, &before, &candidate)?;
+    let fields = validate_candidate(root, &before, &candidate, secret)?;
     let edited = edit_document(&text, &before, &candidate, path, replacement.as_ref())?;
     snapshot.verify()?;
     let change = publication::Change::replace(&root.join("env.yaml"), edited.as_bytes(), 0o600)?;
@@ -724,7 +724,7 @@ pub(crate) fn prepare_sets_locked(root: &Path, updates: &[(String, Value)]) -> R
         put(&mut candidate, path, Some(value.clone()))?;
         edited = edit_document(&edited, &previous, &candidate, path, Some(value))?;
     }
-    let fields = validate_candidate(root, &before, &candidate)?;
+    let fields = validate_candidate(root, &before, &candidate, false)?;
     for (path, _) in updates {
         ensure!(fields.iter().any(|field| field.path == *path || field.path.starts_with(&format!("{path}."))), "unknown configuration field {path}");
     }
@@ -817,7 +817,7 @@ pub fn edit(root: &Path) -> Result<Value> {
         let _sources = sources::lock_paths(snapshot.fingerprints.keys().chain(after.fingerprints.keys()).cloned())?;
         snapshot.verify()?;
         after.verify()?;
-        let fields = validate_candidate(root, &before, &candidate)?;
+        let fields = validate_candidate(root, &before, &candidate, false)?;
         snapshot.verify()?;
         after.verify()?;
         let change = publication::Change::replace(&root.join("env.yaml"), edited.as_bytes(), 0o600)?;
@@ -1076,7 +1076,7 @@ pub fn setup_plan_candidate(root: &Path, inputs: &[String]) -> Result<Value> {
     for (path,_) in &explicit {
         ensure!(path == "_dockstride.sources" || fields.iter().any(|field| field.path == *path || field.path.starts_with(&format!("{path}."))), "unknown configuration field {path}");
     }
-    validate_candidate(root,&before,&candidate)?;
+    validate_candidate(root,&before,&candidate,false)?;
     Ok(candidate)
 }
 
@@ -1205,7 +1205,7 @@ pub fn unset_shared(root: &Path, path: &str, source: Option<&Path>) -> Result<Va
 
 fn mutate_shared(root: &Path, path: &str, replacement: Option<Value>, source: Option<&Path>) -> Result<Value> {
     parts(path)?;
-    ensure!(!is_secret(path) && path != "_dockstride" && !path.starts_with("_dockstride."),"shared edits only accept ordinary configuration fields");
+    ensure!(path != "_dockstride" && !path.starts_with("_dockstride."),"reserved shared configuration path");
     let _lifecycle = state::lock(root,"lifecycle")?;
     let _global = state::global_lock()?;
     let _config = state::lock(root,"config")?;
@@ -1214,12 +1214,22 @@ fn mutate_shared(root: &Path, path: &str, replacement: Option<Value>, source: Op
     let target = shared_target(root,&before.local,source)?;
     let text = fs::read_to_string(&target)?;
     before.verify_text(&target, &text)?;
-    let raw = sources::parse(&text,&target,true)?;
-    let fields = nickel::schema_values(root,&before.values)?;
-    ensure!(fields.iter().any(|field| field.path == path || field.path.starts_with(&format!("{path}."))),"unknown configuration field {path}");
+    let raw = sources::parse(&text,&target)?;
     let mut candidate = raw.clone();
     put(&mut candidate,path,replacement.clone())?;
     let after = sources::snapshot_with_overrides(root,Some(&before.local),&BTreeMap::from([(target.clone(),candidate.clone())]))?;
+    let mut validation = after.values.clone();
+    let mut overlay = candidate.clone();
+    overlay.as_object_mut().unwrap().remove("_dockstride");
+    sources::merge(&mut validation, &overlay);
+    let fields = nickel::schema_values(root, &validation)?;
+    let previous_fields = nickel::schema_values(root, &before.values)?;
+    ensure!(fields.iter().chain(&previous_fields).any(|field| field.path == path
+        || field.path.starts_with(&format!("{path}."))
+        || (is_secret(path) && path.starts_with(&format!("{}.",field.path))))
+        || (is_secret(path) && validation.get("secrets").is_some()),
+        "unknown configuration field {path}");
+    crate::secrets::validate_config_transition(root, &raw, &candidate, &validation, false)?;
     let _locks = sources::lock_paths(before.fingerprints.keys().chain(after.fingerprints.keys()).cloned())?;
     before.verify()?;
     after.verify()?;
@@ -1240,10 +1250,12 @@ fn mutate_shared(root: &Path, path: &str, replacement: Option<Value>, source: Op
     before.verify()?;
     after.verify()?;
     publish_candidate(root, "config-shared", vec![change], &after, None)?;
-    let mut result = get(root,path)?;
-    result["editedSource"] = json!(target);
-    result["applied"] = json!(false);
-    Ok(result)
+    let fields = nickel::schema_values(root, &after.values)?;
+    let values = effective(&after.values, &fields)?;
+    Ok(json!({"path":path,"value":at(&values,path),
+        "origin":if at(&after.values,path).is_some(){origin(&after,path)}else if at(&values,path).is_some(){"default".to_owned()}else{"missing".to_owned()},
+        "provenance":after.provenance.get(path),"pending":publication::pending(root)?,
+        "editedSource":target,"applied":false}))
 }
 
 pub fn edit_shared(root: &Path, source: Option<&Path>) -> Result<Value> {
@@ -1262,7 +1274,7 @@ pub fn edit_shared(root: &Path, source: Option<&Path>) -> Result<Value> {
         let status = Command::new(&argv[0]).args(&argv[1..]).arg(&temporary).status().context("launch EDITOR executable")?;
         ensure!(status.success(),"editor exited with {status}; shared source was not changed");
         let edited = fs::read_to_string(&temporary)?;
-        let candidate = sources::parse(&edited,&target,true)?;
+        let candidate = sources::parse(&edited,&target)?;
         let after = sources::snapshot_with_overrides(root,Some(&before.local),&BTreeMap::from([(target.clone(),candidate.clone())]))?;
         let _lifecycle = state::lock(root, "lifecycle")?;
         let _global = state::global_lock()?;
@@ -1272,6 +1284,11 @@ pub fn edit_shared(root: &Path, source: Option<&Path>) -> Result<Value> {
         before.verify()?;
         after.verify()?;
         let fields = validate_values(root,&before.values,&after.values).with_context(|| format!("invalid shared candidate {}",target.display()))?;
+        let mut validation = after.values.clone();
+        let mut overlay = candidate.clone();
+        overlay.as_object_mut().unwrap().remove("_dockstride");
+        sources::merge(&mut validation, &overlay);
+        crate::secrets::validate_config_transition(root, &sources::parse(&text,&target)?, &candidate, &validation, false)?;
         validate_shared_fields(root,&after.values,&candidate)?;
         before.verify()?;
         after.verify()?;

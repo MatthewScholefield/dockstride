@@ -396,6 +396,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
     }
     let non_interactive = cli.non_interactive || cli.json || !io::stdin().is_terminal();
     let secret_inputs = initial_secret_inputs(cli)?;
+    secrets::preflight_inputs(&root, &secret_inputs, None)?;
     let result = match &cli.command {
         Commands::Init => {
             prohibit_plan_mutation(cli)?;
@@ -426,6 +427,10 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
         Commands::Setup { inputs, no_shared_sources } => {
             let mut inputs = inputs.clone();
             if *no_shared_sources { inputs.push("_dockstride.sources=[]".to_owned()); }
+            if !secret_inputs.is_empty() {
+                let candidate = config::setup_plan_candidate(&root, &inputs)?;
+                secrets::preflight_inputs(&root, &secret_inputs, Some(&candidate))?;
+            }
             if cli.plan {
                 let candidate = config::setup_plan_candidate(&root, &inputs)?;
                 configuration_plan(&root, "setup", &secret_inputs, Some(&candidate))?

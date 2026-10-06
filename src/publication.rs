@@ -129,7 +129,7 @@ fn validate_payload(path: &Path, payload: &str, create: bool) -> Result<()> {
     }
     validate_target(path)?;
     let local = path.file_name().is_some_and(|name| name == "env.yaml");
-    let value = crate::sources::parse(payload, path, !local)?;
+    let value = crate::sources::parse(payload, path)?;
     if local { crate::config::check_secrets(&value)?; }
     if create && !local { ensure!(value == json!({}), "shared source creation permits only an empty mapping: {}", path.display()); }
     Ok(())
@@ -177,7 +177,7 @@ impl Journal {
                 let expected = if matches!(name, "port-reservations.json" | "environment-registry.json") { global } else { root };
                 ensure!(change.path.parent() == Some(expected.join(".dockstride").as_path()), "reference state is outside its publication owner: {}", change.path.display());
             } else if change.path != root.join("env.yaml") && change.kind != Kind::Remove {
-                let value = crate::sources::parse(change.payload.as_ref().context("shared transition is missing payload")?, &change.path, true)?;
+                let value = crate::sources::parse(change.payload.as_ref().context("shared transition is missing payload")?, &change.path)?;
                 if change.kind == Kind::Create { ensure!(value == json!({}), "shared source creation permits only an empty mapping"); }
             }
             let next = change_rank(change);
@@ -241,7 +241,7 @@ fn check_transitions(journal: &Journal) -> Result<()> {
     for change in &journal.changes {
         let current = check_transition(change)?;
         if change.kind == Kind::Remove && current.is_some() && state_name(&change.path).is_none() && change.path != journal.root.join("env.yaml") {
-            crate::sources::parse(&read_ordinary(&change.path)?, &change.path, true)?;
+            crate::sources::parse(&read_ordinary(&change.path)?, &change.path)?;
         }
     }
     Ok(())

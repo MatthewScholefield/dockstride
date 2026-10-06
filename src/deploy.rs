@@ -1899,12 +1899,14 @@ fn deployment_state(root: &std::path::Path) -> Result<Value> {
 fn recheck_environment(project: &Project) -> Result<()> {
     runtime::recover_publication(&project.root)?;
     let current = crate::sources::snapshot(&project.root, None)?.values;
+    let fields = if current.get("project").is_none() || current.get("backend").is_none() {
+        crate::nickel::schema_values(&project.root, &current)?
+    } else { Vec::new() };
+    let effective = |path: &str| current.get(path).or_else(|| fields.iter()
+        .find(|field| field.path == path).and_then(|field| field.default.as_ref()));
     ensure!(
-        current.get("project").and_then(Value::as_str) == Some(project.name()?)
-            && current
-                .get("backend")
-                .and_then(Value::as_str)
-                .unwrap_or("compose")
+        effective("project").and_then(Value::as_str) == Some(project.name()?)
+            && effective("backend").and_then(Value::as_str).unwrap_or("compose")
                 == project.backend()?,
         "environment project/backend changed before lifecycle execution; re-evaluate the project before applying resources"
     );

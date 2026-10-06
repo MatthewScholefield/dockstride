@@ -58,6 +58,7 @@ let swarm = fun canonical =>
     (policy | {bytes | Number, encoding | choiceContract ["hex", "base64"], ..}) & {kind = "generate"},
   PromptSecret = {kind = "prompt"},
   FileSecret = fun sourcePath => {kind = "file", path = sourcePath | String},
+  ReferenceSecret = {kind = "reference"},
   StdinSecret = {kind = "stdin"},
 
   forEnvironment = fun env => {
