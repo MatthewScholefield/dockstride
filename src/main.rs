@@ -48,15 +48,10 @@ enum Commands {
     Init,
     /// Execute a named project command without applying its returned settings.
     Run { name: String },
-    /// List configured environments or explicitly forget a resource-free registration.
+    /// List the invoking Git repository's worktrees and configuration files.
     Env {
         #[command(subcommand)]
         command: EnvironmentCommand,
-    },
-    /// Explicitly release generated endpoints or collect proven-stale reservations.
-    Ports {
-        #[command(subcommand)]
-        command: PortCommand,
     },
     /// Fill missing environment values and provision declared secrets, without starting containers.
     Setup {
@@ -111,8 +106,8 @@ enum Commands {
         #[arg(long)]
         yes: bool,
     },
-    /// Publish and deploy all or selected Swarm services.
-    Deploy { services: Vec<String> },
+    /// Build, publish and deploy the complete Swarm stack.
+    Deploy,
     Secrets {
         #[command(subcommand)]
         command: SecretCommand,
@@ -140,27 +135,7 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum EnvironmentCommand {
-    List {
-        #[arg(long)]
-        worktrees: bool,
-    },
-    Forget {
-        path: PathBuf,
-        #[arg(long)]
-        yes: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum PortCommand {
-    Release {
-        #[arg(long)]
-        yes: bool,
-    },
-    Gc {
-        #[arg(long)]
-        yes: bool,
-    },
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -222,7 +197,7 @@ enum SecretCommand {
         #[arg(long)]
         apply: bool,
     },
-    /// Explicitly compare imported private files and publish changed revisions.
+    /// Validate current file sources and publish fresh immutable Swarm bindings.
     Sync {
         #[arg(required = true)]
         names: Vec<String>,
@@ -230,11 +205,6 @@ enum SecretCommand {
         yes: bool,
         #[arg(long)]
         apply: bool,
-    },
-    Gc {
-        names: Vec<String>,
-        #[arg(long)]
-        yes: bool,
     },
 }
 
@@ -290,12 +260,6 @@ fn main() {
             if let Some(prerequisite) = error.downcast_ref::<runtime::PrerequisiteFailed>() {
                 details["prerequisite"] = prerequisite.0.clone();
             }
-            if let Some(blocked) = error.downcast_ref::<dockstride::environment::ForgetBlocked>() {
-                details["environment"] = blocked.0.clone();
-            }
-            if let Some(blocked) = error.downcast_ref::<dockstride::ports::PortsBlocked>() {
-                details["ports"] = blocked.0.clone();
-            }
             if let Some(failed) = error.downcast_ref::<dockstride::status::StatusFailed>() {
                 details["status"] = failed.0.clone();
             }
@@ -307,11 +271,6 @@ fn main() {
             }
             if let Some(report) = error.downcast_ref::<secrets::SyncFailed>() {
                 details["secretSync"] = report.0.clone();
-            }
-            if let Ok(pending) = dockstride::publication::pending(&cli.directory)
-                && !pending.is_null()
-            {
-                details["pendingPublication"] = pending;
             }
             let _ = output.diagnostic(category, code, &message, details);
             std::process::exit(code);
@@ -390,13 +349,8 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
         )
     })?;
     runtime::pin_invocation();
-    let pending = dockstride::publication::pending(&root)?;
-    if !pending.is_null() {
-        out.event("pending", &format!("Interrupted publication: {}", serde_json::to_string(&pending)?))?;
-    }
     let non_interactive = cli.non_interactive || cli.json || !io::stdin().is_terminal();
     let secret_inputs = initial_secret_inputs(cli)?;
-    secrets::preflight_inputs(&root, &secret_inputs, None)?;
     let result = match &cli.command {
         Commands::Init => {
             prohibit_plan_mutation(cli)?;
@@ -406,24 +360,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
             prohibit_plan_mutation(cli)?;
             dockstride::commands::run(&root, name, cli.timeout, out)?
         }
-        Commands::Env { command } => match command {
-            EnvironmentCommand::List { worktrees } => dockstride::environment::list(&root, *worktrees)?,
-            EnvironmentCommand::Forget { path, yes } => {
-                let confirmed = cli.plan || *yes || confirm(cli, non_interactive, "Forget only this resource-free environment registration?")?;
-                dockstride::environment::forget(&root, path, cli.plan, confirmed, out)?
-            }
-        },
-        Commands::Ports { command } => {
-            let (yes, gc) = match command {
-                PortCommand::Release { yes } => (*yes, false),
-                PortCommand::Gc { yes } => (*yes, true),
-            };
-            let confirmed = cli.plan || yes || confirm(cli, non_interactive,
-                if gc { "Collect only reservations with verified stale ownership and no Docker resources?" }
-                else { "Release owned generated endpoints after proving Docker resources are absent?" })?;
-            if gc { dockstride::ports::gc(&root, cli.plan, confirmed, out)? }
-            else { dockstride::ports::release(&root, cli.plan, confirmed, out)? }
-        }
+        Commands::Env { command: EnvironmentCommand::List } => dockstride::environment::list(&root)?,
         Commands::Setup { inputs, no_shared_sources } => {
             let mut inputs = inputs.clone();
             if *no_shared_sources { inputs.push("_dockstride.sources=[]".to_owned()); }
@@ -440,7 +377,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                 {
                     let _lifecycle = state::lock(&root, "lifecycle")?;
                     if runtime::allocate_ports(&root)? {
-                        out.event("Ports", "declared checkout-local allocations persisted")?;
+                        out.event("Ports", "missing port fields saved to env.yaml")?;
                     }
                 }
                 if provisioned["consumerValidation"] == "deferred" { secrets::validate_consumers(&root, out)?; }
@@ -527,25 +464,19 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
             }
             SecretCommand::Sync { names, yes, apply } => {
                 let confirmed = cli.plan || *yes || confirm(
-                    cli, non_interactive, "Synchronize the selected imported files into immutable secret revisions?",
+                    cli, non_interactive, "Synchronize the selected current secret sources?",
                 )?;
                 secrets::sync(&root, names, cli.plan, confirmed, *apply, out)?
             }
-            SecretCommand::Gc { names, yes } => {
-                let confirmed = cli.plan
-                    || *yes
-                    || confirm(
-                        cli,
-                        non_interactive,
-                        "Delete only the explicitly selected, unreferenced owned secret revisions?",
-                    )?;
-                secrets::gc(&root, names, cli.plan, confirmed, out)?
-            }
         },
-        Commands::Up { services, .. } | Commands::Dev { services, .. } | Commands::Deploy { services } => {
+        Commands::Up { .. } | Commands::Dev { .. } | Commands::Deploy => {
+            let services = match &cli.command {
+                Commands::Up { services, .. } | Commands::Dev { services, .. } => services.as_slice(),
+                _ => &[],
+            };
             let workflow = match cli.command {
                 Commands::Dev { .. } => "dev",
-                Commands::Deploy { .. } => "deploy",
+                Commands::Deploy => "deploy",
                 _ => "up",
             };
             let profiles = match &cli.command {
@@ -572,7 +503,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                 if provisioned["consumerValidation"] == "deferred" { secrets::validate_consumers(&root, out)?; }
                 header(&project, out)?;
                 let result = if workflow == "deploy" {
-                    deploy::deploy(&project, services, false, cli.timeout, out)?
+                    deploy::deploy(&project, false, cli.timeout, out)?
                 } else {
                     runtime::lifecycle(
                         &project,
@@ -588,7 +519,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                 return Ok(Some(result));
             };
             if workflow == "deploy" {
-                deploy::deploy(&project, services, true, cli.timeout, out)?
+                deploy::deploy(&project, true, cli.timeout, out)?
             } else {
                 runtime::lifecycle(&project, workflow, services, profiles, true, false, cli.timeout, out)?
             }
@@ -862,7 +793,7 @@ fn initial_secret_inputs(cli: &Cli) -> Result<BTreeMap<String, secrets::SecretIn
             Commands::Setup { .. }
                 | Commands::Up { .. }
                 | Commands::Dev { .. }
-                | Commands::Deploy { .. }
+                | Commands::Deploy
         )
     {
         bail!(

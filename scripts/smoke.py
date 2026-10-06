@@ -21,7 +21,6 @@ import os
 from pathlib import Path
 import shutil
 import signal
-import stat
 import socket
 import subprocess
 import sys
@@ -95,6 +94,7 @@ class Harness:
         self.dind_data_paths = []
         self.contexts = []
         self.network = None
+        self.network_id = None
         self.watch = None
         self.report = []
         self.git_fixture()
@@ -112,6 +112,29 @@ class Harness:
         path = self.root / suffix
         run(["git", "-C", self.repo, "worktree", "add", "--quiet", "--detach", path])
         return path
+
+    def reject_cli(self, project, *args):
+        result = run([self.binary, "-C", project, *args], self.env, ok=False)
+        require(result.returncode != 0, "removed CLI accepted: " + repr(args))
+
+    def assert_disposable_state(self, project):
+        forbidden = [path for path in (project / ".dockstride").rglob("*")
+                     if path.suffix in (".json", ".jsonl", ".yaml", ".yml")]
+        require(not forbidden, "durable runtime state created: " + repr(forbidden))
+        for directory in (self.root / "private" / "dockstride",
+                          self.root / "home" / ".local" / "share" / "dockstride",
+                          self.root / "state" / "dockstride"):
+            forbidden = [path for path in directory.rglob("*")
+                         if path.suffix in (".json", ".jsonl") or path.name == ".dockstride-owner"]
+            require(not forbidden, "hidden durable state created: " + repr(forbidden))
+
+    def discard_scratch(self, project):
+        self.assert_disposable_state(project)
+        scratch = project / ".dockstride"
+        if scratch.exists():
+            require(not scratch.is_symlink() and project.resolve().is_relative_to(self.root.resolve()),
+                    "scratch cleanup escaped fixture")
+            shutil.rmtree(scratch)
 
     def cli(self, project, *args, fail=False, timeout=300, env=None, lifecycle_timeout=None):
         budget = self.args.timeout if lifecycle_timeout is None else lifecycle_timeout
@@ -156,11 +179,8 @@ class Harness:
         if port is not None:
             inputs["apiPort"] = port
         if backend == "swarm":
-            recovery = self.root / "recovery"
-            recovery.mkdir(mode=0o700, exist_ok=True)
             inputs.update(imagePrefix="registry:5000/" + name, containerGid=1000,
-                          swarmDirectNetworking=True,
-                          recoveryFile=str(recovery / (suffix + "-{revision}")))
+                          swarmDirectNetworking=True)
         else:
             security = self.json_docker("info", "--format", "{{json .SecurityOptions}}")
             # Rootless GID zero maps to invoking host GID; native daemon needs host GID directly.
@@ -188,9 +208,20 @@ class Harness:
     def secret_ref(self, project):
         return self.cli(project, "render", "--target", "compose")["secrets"]["authKey"]
 
+    def swarm_ref(self, project):
+        return self.cli(project, "render", "--target", "swarm")["secrets"]["authKey"]
+
+    def current_secret_listing(self, project, backend, reference, binding):
+        rows = self.cli(project, "secrets", "list")["secrets"]
+        require(len(rows) == 1 and set(rows[0]) ==
+                {"name", "backend", "reference", "binding", "consumers", "present"} and
+                rows[0]["name"] == "authKey" and rows[0]["backend"] == backend and
+                rows[0]["reference"] == reference and rows[0]["binding"] == binding and
+                set(rows[0]["consumers"]) == {"api", "worker"} and rows[0]["present"] is True,
+                "current secret listing lost source/binding/consumer observations or exposed history")
+
     def config_smoke(self):
-        # Leave this schema-only checkout incomplete: config-only runs need no
-        # Docker daemon and must not leak a stopped registration.
+        # This incomplete checkout exercises configuration without a Docker daemon.
         project = self.checkout("config")
         fields = self.cli(project, "config", "schema")["fields"]
         require(any(field["path"] == "oauth.enabled" and field["default"] is False for field in fields),
@@ -211,30 +242,45 @@ class Harness:
                 "scalar edit lost YAML comments")
         self.cli(project, "config", "set", "apiPort", "70000", fail=True)
         require(path.read_bytes() == before, "invalid candidate overwrote environment")
-        require(not self.cli(project, "env", "list")["environments"],
-                "incomplete configuration acquired a registry claim")
-        self.report.append("schema/incremental edits/comments/invalid candidate/no-effect plan; no configured claim")
+        inventory = self.cli(project, "env", "list")
+        require(set(inventory) == {"schemaVersion", "status", "scope", "worktrees"} and
+                inventory["schemaVersion"] == 1 and inventory["status"] == "available" and
+                inventory["scope"] == "invoking-repository" and
+                str(project.resolve()) in {row["root"] for row in inventory["worktrees"]},
+                "Git worktree inventory omitted incomplete checkout")
+        for args in (("ports", "release", "--yes"), ("ports", "gc", "--yes"),
+                     ("env", "forget", str(project), "--yes"), ("env", "list", "--worktrees"),
+                     ("secrets", "gc", "authKey", "--yes"), ("deploy", "api")):
+            self.reject_cli(project, *args)
+        self.assert_disposable_state(project)
+        self.report.append("schema/incremental edits/comments/invalid candidate/no-effect plan; Git-only inventory and removed CLI rejection")
     
 
     def compose_smoke(self):
-        first = self.checkout(self.prefix + "-compose-a")
+        self.host_daemon_id = self.docker("info", "--format", "{{.ID}}", env=self.host_env).stdout.strip()
+        require(self.host_daemon_id, "selected Compose Docker daemon has no verifiable identity")
+        first = self.checkout(self.prefix + "-compose a=λ")
         second = self.checkout(self.prefix + "-compose-b")
         for project in (first, second):
             self.compose_fixture_model(project)
         source = self.root / "private-import.input"
-        self.compose_private_file(source, uuid.uuid4().hex.encode())
+        self.compose_private_file(source, uuid.uuid4().hex.encode(), mode=0o640)
         name_a = self.compose_bootstrap(first, imported=source)
         shared = first / "env.shared.yaml"
         require(shared.is_file() and shared.stat().st_mode & 0o777 == 0o600,
                 "defaults hook did not create private shared settings")
-        name_b = self.compose_bootstrap(second, source=shared)
+        # Stopped checkouts hold no reservation: a real bind keeps this endpoint
+        # occupied while the second setup probes for its ordinary YAML value.
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", self.configured_port(first)))
+            name_b = self.compose_bootstrap(second, source=shared)
         require(name_a != name_b, "distinct folder names produced the same project proposal")
         port_a, port_b = self.configured_port(first), self.configured_port(second)
-        require(port_a != port_b, "worktrees allocated the same generated endpoint")
-        registered = {row["root"]: row for row in self.cli(first, "env", "list", "--worktrees")["environments"]}
-        for project, name in ((first, name_a), (second, name_b)):
-            require(registered[str(project)]["state"] == "committed" and registered[str(project)]["project"] == name,
-                    "complete stopped setup missing from registry")
+        require(port_a != port_b, "allocation selected a currently bound endpoint")
+        inventory = self.cli(first, "env", "list")
+        require({str(first.resolve()), str(second.resolve())} <=
+                {row["root"] for row in inventory["worktrees"]},
+                "Git inventory omitted configured worktrees")
         self.cli(first, "config", "set", "oauth.issuer", json.dumps("shared-one"), "--shared")
         require(self.cli(second, "config", "get", "oauth.issuer")["value"] == "shared-one",
                 "shared change was not live in second checkout")
@@ -247,6 +293,23 @@ class Harness:
                 "unsetting override did not reveal inherited value")
         refs = (self.secret_ref(first), self.secret_ref(second))
         require(refs[0] != refs[1], "worktrees share credentials")
+        self.current_secret_listing(first, "compose", refs[0], None)
+        self.current_secret_listing(second, "compose", refs[1], None)
+        generated_path = Path(refs[1]["file"])
+        generated_bytes = generated_path.read_bytes()
+        require(not generated_path.resolve().is_relative_to(second.resolve()),
+                "generated credentials were stored inside the checkout")
+        self.cli(second, "setup")
+        require(self.secret_ref(second) == refs[1] and generated_path.read_bytes() == generated_bytes and
+                self.configured_port(second) == port_b, "repeat setup changed materialized generated inputs")
+        missing = generated_path.with_name(generated_path.name + ".smoke-held")
+        generated_path.rename(missing)
+        try:
+            error = self.cli(second, "setup", fail=True)
+            require(not generated_path.exists() and "restore" in error["message"].lower(),
+                    "missing referenced generated bytes were regenerated or did not fail closed")
+        finally:
+            missing.rename(generated_path)
         before_plan = (first / "env.yaml").read_bytes()
         self.cli(first, "up", "--plan")
         require((first / "env.yaml").read_bytes() == before_plan and self.secret_ref(first) == refs[0],
@@ -257,9 +320,12 @@ class Harness:
             listener.listen()
             occupied = listener.getsockname()[1]
             self.setup(blocked, "blocked", port=occupied)
+            blocked_yaml = (blocked / "env.yaml").read_bytes()
             error = self.cli(blocked, "up", fail=True, timeout=900)
             require("port" in error["message"].lower() or "address already in use" in error["message"].lower(),
                     "occupied-port startup did not explain conflict")
+            require((blocked / "env.yaml").read_bytes() == blocked_yaml,
+                    "occupied materialized endpoint was silently rerolled")
             require(listener.fileno() >= 0 and listener.getsockname()[1] == occupied,
                     "startup commandeered unrelated listener")
         count, migration = self.compose_once_up(first, name_a, port_a, 0)
@@ -267,9 +333,29 @@ class Harness:
         initial, other = self.identity(port_a, name_a), self.identity(port_b, name_b)
         require(initial["migrated"] and other["migrated"], "one-shot migration did not complete")
         require(initial["secretFingerprint"] != other["secretFingerprint"], "worktree secrets are not isolated")
+        self.discard_scratch(first)
         report = self.cli(first, "status")
         api = next(row for row in report["services"] if row["name"] == "api")
         require(report["ready"] and api["applicationReady"] is True, "strict status did not verify application")
+        owner = str(first.resolve())
+        for service in ("api", "worker", "migrate"):
+            labels = self.json_docker("inspect", self.compose_container(name_a, service))[0]["Config"]["Labels"]
+            require(labels.get("io.dockstride.owner") == owner and
+                    labels.get("io.dockstride.project") == name_a, "Compose labels lost canonical path ownership")
+        alias = self.root / "canonical-alias"
+        alias.symlink_to(first, target_is_directory=True)
+        require(self.cli(alias, "status")["ready"], "symlink checkout did not retain canonical ownership")
+        collision = self.checkout(self.prefix + "-collision")
+        self.compose_fixture_model(collision)
+        self.compose_private_file(collision / "env.yaml", (first / "env.yaml").read_bytes())
+        original_ids = {service: self.json_docker("inspect", self.compose_container(name_a, service))[0]["Id"]
+                        for service in ("api", "worker", "migrate")}
+        for args in (("status",), ("up",), ("destroy", "--yes")):
+            error = self.cli(collision, *args, fail=True)
+            require(owner in error["message"], "collision error omitted observed foreign checkout")
+        for service, container_id in original_ids.items():
+            require(self.json_docker("inspect", self.compose_container(name_a, service))[0]["Id"] == container_id,
+                    "foreign same-project checkout changed original resources")
         inspected = self.cli(first, "status", "--inspect-only")
         require(inspected["inspectOnly"] and next(row for row in inspected["services"] if row["name"] == "api")["applicationReady"] is None,
                 "inspect-only claimed application readiness")
@@ -310,8 +396,6 @@ class Harness:
         require(self.compose_data(name_a, "smoke-sentinel") == "preserve-me", "cancellation destroyed data")
         volumes = self.docker("volume", "ls", "--quiet", "--filter", "label=com.docker.compose.project=" + name_a).stdout.split()
         require(volumes, "sample did not create application data")
-        self.cli(first, "ports", "release", "--yes", fail=True)
-        self.cli(first, "env", "forget", str(first), "--yes", fail=True)
         self.cli(first, "down")
         for volume in volumes:
             self.docker("volume", "inspect", volume)
@@ -322,77 +406,55 @@ class Harness:
                 "ordinary restart regenerated credential")
         require(self.compose_data(name_a, "smoke-sentinel") == "preserve-me", "down/up lost application data")
         self.watch_smoke(first, port_a, name_a)
-        self.compose_private_file(source, uuid.uuid4().hex.encode())
-        self.cli(first, "up", timeout=900)
-        require(self.secret_ref(first) == refs[0] and self.identity(port_a, name_a)["secretFingerprint"] == initial["secretFingerprint"],
-                "ordinary startup implicitly synced an imported source")
+        require(refs[0] == {"file": str(source.resolve())}, "original provider file was copied")
+        original_bytes = source.read_bytes()
+        self.cli(first, "setup")
+        require(self.secret_ref(first) == refs[0] and source.read_bytes() == original_bytes and
+                self.configured_port(first) == port_a,
+                "repeated setup changed original reference, bytes, or ordinary port")
         deferred = self.cli(first, "secrets", "sync", "authKey", "--plan")
-        require(deferred["comparisonsDeferred"] and deferred["secrets"][0]["status"] == "comparison-deferred",
-                "sync plan falsely claimed a content comparison")
-        rendered_old = self.cli(first, "render", "--target", "compose")
+        require(deferred["sideEffects"] is False and deferred["secrets"][0]["status"] == "planned",
+                "sync plan claimed validation/publication")
+        self.compose_private_file(source, uuid.uuid4().hex.encode(), mode=0o640)
         synced = self.cli(first, "secrets", "sync", "authKey", "--yes")
         new_ref = self.secret_ref(first)
-        require(synced["committed"] == ["authKey"] and synced["secrets"][0]["status"] == "replaced" and new_ref != refs[0],
-                "explicit sync did not publish a fresh immutable revision")
-        require(synced["secrets"][0]["source"]["canonicalPath"] == str(source.resolve()), "sync changed source origin")
-        require(self.identity(port_a, name_a)["secretFingerprint"] == initial["secretFingerprint"],
-                "storage-only sync implicitly restarted consumers")
-        # Refresh the executable render snapshot without touching live mounts,
-        # so this refusal proves live consumption rather than stale rendering.
-        self.cli(first, "logs", "--tail", "1", "api")
-        self.compose_gc_refusal(first, refs[0], "consumer")
-        unchanged = self.cli(first, "secrets", "sync", "authKey", "--yes")
-        require(unchanged["committed"] == [] and unchanged["secrets"][0]["status"] == "unchanged" and self.secret_ref(first) == new_ref,
-                "unchanged source created another revision")
+        require(synced["committed"] == [] and synced["uncommitted"] == [] and
+                synced["secrets"][0]["status"] == "validated" and new_ref == refs[0] and
+                synced["secrets"][0]["binding"] is None,
+                "Compose sync copied or fictitiously committed provider bytes")
+        require(synced["secrets"][0]["source"]["canonicalPath"] == str(source.resolve()),
+                "sync changed source origin")
         self.cli(first, "down")
-        snapshot = first / ".dockstride" / "smoke-retained.json"
-        self.compose_private_file(snapshot, json.dumps(rendered_old))
-        self.compose_gc_refusal(first, refs[0], "snapshot")
-        snapshot.unlink()
-        self.config(second, "authInput", refs[0]["file"])
-        self.compose_gc_refusal(first, refs[0], "source")
-        require(self.cli(second, "config", "get", "authInput")["value"] == refs[0]["file"],
-                "GC protection rewrote declared source field")
+        self.discard_scratch(first)
         self.cli(first, "up", timeout=900)
         require(self.identity(port_a, name_a)["secretFingerprint"] != initial["secretFingerprint"],
-                "explicit down/up did not remount synchronized storage")
+                "restart did not consume changed original provider file")
         self.compose_postgres_smoke()
         other_ids = {service: self.json_docker("inspect", self.compose_container(name_b, service))[0]["Id"]
                      for service in ("api", "worker", "migrate")}
-        other_saved = next(row for row in self.cli(second, "env", "list")["environments"] if row["root"] == str(second))
+        other_yaml = (second / "env.yaml").read_bytes()
         self.cli(first, "destroy", "--plan")
         self.cli(first, "destroy", "--yes")
         for volume in volumes:
             require(self.docker("volume", "inspect", volume, ok=False).returncode != 0, "destroy preserved data volume")
         require(self.secret_ref(first) == new_ref, "destroy removed immutable credential")
         retained_yaml = (first / "env.yaml").read_bytes()
-        release_plan = self.cli(first, "ports", "release", "--plan")
-        require(release_plan["plan"] and not release_plan["blockers"] and
-                len(release_plan["reservations"]) == 1 and
-                release_plan["fields"] == [{"field": "apiPort", "port": port_a,
-                                           "key": release_plan["reservations"][0]["key"]}],
-                "release plan did not identify the exact generated endpoint")
-        require((first / "env.yaml").read_bytes() == retained_yaml, "release plan changed local settings")
-        released = self.cli(first, "ports", "release", "--yes")
-        require(released["released"] == 1, "release did not clear exact owned reservation")
-        require("apiPort:" not in (first / "env.yaml").read_text(), "release retained generated local endpoint")
-        self.cli(first, "env", "forget", str(first), "--plan")
-        self.cli(first, "env", "forget", str(first), "--yes")
-        require(not any(row["root"] == str(first) for row in self.cli(second, "env", "list")["environments"]),
-                "explicit forget retained fixture registration")
+        self.discard_scratch(first)
+        require((first / "env.yaml").read_bytes() == retained_yaml and
+                self.configured_port(first) == port_a,
+                "destroy or scratch removal changed ordinary YAML values")
         self.cli(first, "setup")
         self.cli(first, "up", timeout=900)
         self.identity(self.configured_port(first), name_a)
         require(self.secret_ref(first) == new_ref, "recreated fixture regenerated retained credential")
         for service, expected in other_ids.items():
             require(self.json_docker("inspect", self.compose_container(name_b, service))[0]["Id"] == expected,
-                    "destroy/release/forget/recreate altered another checkout")
-        saved = next(row for row in self.cli(second, "env", "list")["environments"] if row["root"] == str(second))
-        require(all(saved[key] == other_saved[key] for key in ("ownerId", "project", "allocations", "allocatedEndpoints")),
-                "fixture endpoint reset disturbed another checkout's claims")
+                    "destroy/recreate altered another checkout")
+        require((second / "env.yaml").read_bytes() == other_yaml,
+                "fixture teardown changed another checkout's settings")
         require(self.identity(port_b, name_b)["secretFingerprint"] == other["secretFingerprint"],
                 "recreate affected another checkout's credential")
-        self.report.append("Compose: two defaults/shared-source worktrees, stopped claims/ports/overrides; strict identity/unhealthy/absent status; fresh migration event+identity+marker proof, failure/cancellation/seed safety; non-root secrets/watch/logs/exec/data; explicit sync/no-op/live/snapshot/source GC protection; isolated destroy/release/forget/recreate")
+        self.report.append("Compose: defaults/shared-source worktrees, ordinary bound-port allocation and overrides; strict readiness; fresh prerequisite execution, failure/cancellation/seed safety; non-root secrets/watch/logs/exec/data; direct-reference validation; scratch-independent isolated teardown")
     
 
     def compose_container(self, name, service):
@@ -426,11 +488,13 @@ class Harness:
                 self.watch = None
 
     def dind_fixture(self):
-        self.host_daemon_id = self.docker("info", "--format", "{{.ID}}", env=self.host_env).stdout.strip()
-        require(self.host_daemon_id, "outer Docker daemon has no verifiable identity")
+        observed = self.docker("info", "--format", "{{.ID}}", env=self.host_env).stdout.strip()
+        require(observed and (self.host_daemon_id is None or observed == self.host_daemon_id),
+                "outer Docker target changed before isolated DIND setup")
+        self.host_daemon_id = observed
         self.network = self.prefix + "-network"
-        self.docker("network", "create", "--label", "dockstride.smoke=" + self.prefix,
-                    self.network, env=self.host_env)
+        self.network_id = self.docker("network", "create", "--label", "dockstride.smoke=" + self.prefix,
+                                      self.network, env=self.host_env).stdout.strip()
         registry = self.prefix + "-registry"
         self.containers.append(registry)
         result = self.docker("run", "-d", "--name", registry, "--network", self.network,
@@ -506,19 +570,34 @@ class Harness:
 
     def swarm_smoke(self):
         self.dind_fixture()
+        for path, name, environment in self.projects:
+            if environment == self.host_env:
+                absent = self.cli(path, "status", "--inspect-only")
+                require(absent["ready"] is False and absent["ownershipVerified"] and
+                        absent["owner"] == str(path.resolve()) and absent["project"] == name and
+                        absent["context"].startswith(self.env["DOCKER_CONTEXT"] + ";") and
+                        all(not row["containers"] for row in absent["services"]),
+                        "target switch reused host resources instead of current live observations")
+                returned = self.cli(path, "status", "--inspect-only", env=environment)
+                require(returned["ownershipVerified"] and returned["owner"] == str(path.resolve()) and
+                        returned["project"] == name and returned["context"] != absent["context"] and
+                        any(row["containers"] for row in returned["services"]) and
+                        all(row["containerReady"] for row in returned["services"] if row["required"]),
+                        "returning to selected host target lost live owned resources")
+                break
         project = self.checkout("swarm")
         name = self.setup(project, "swarm", "swarm", self.app_port)
-        secret_before = self.secret_ref(project)
-        generated = self.swarm_secret(project, name, secret_before)
-        revision_id = generated["Spec"]["Labels"]["io.dockstride.revision"]
-        recovery = self.root / "recovery" / ("swarm-" + revision_id)
-        metadata = recovery.stat()
-        require(recovery.is_file() and not recovery.is_symlink() and metadata.st_uid == os.getuid() and
-                metadata.st_mode & 0o777 == 0o600 and metadata.st_size > 0,
-                "durable generated Swarm secret has no private revision-specific recovery file")
+        secret_before = self.swarm_ref(project)
+        self.swarm_secret(project, name, secret_before)
+        source_file = Path(self.secret_ref(project)["file"])
+        metadata = source_file.stat()
+        require(source_file.is_file() and not source_file.is_symlink() and
+                not source_file.resolve().is_relative_to(project.resolve()) and
+                metadata.st_uid == os.getuid() and metadata.st_mode & 0o777 in (0o600, 0o640) and metadata.st_size > 0,
+                "generated Swarm source is not a private external file")
         before_plan = (project / "env.yaml").read_bytes()
         self.cli(project, "deploy", "--plan")
-        require((project / "env.yaml").read_bytes() == before_plan and self.secret_ref(project) == secret_before,
+        require((project / "env.yaml").read_bytes() == before_plan and self.swarm_ref(project) == secret_before,
                 "Swarm plan mutated environment or secret")
         self.cli(project, "deploy", timeout=900)
         identity = self.identity(self.app_port, name)
@@ -527,7 +606,7 @@ class Harness:
             require("@sha256:" in self.swarm_service(name, service)["Spec"]["TaskTemplate"]["ContainerSpec"]["Image"],
                     "single-node Swarm did not deploy immutable image digests")
         self.cli(project, "deploy", timeout=900)
-        require(self.secret_ref(project) == secret_before and
+        require(self.swarm_ref(project) == secret_before and
                 self.identity(self.app_port, name)["secretFingerprint"] == identity["secretFingerprint"],
                 "repeated deployment regenerated Swarm secret")
         token = self.docker("swarm", "join-token", "-q", "worker").stdout.strip()
@@ -552,17 +631,31 @@ class Harness:
         require(worker_identity["project"] == name and worker_identity["uid"] == 1000 and
                 worker_identity["secretFingerprint"] == identity["secretFingerprint"],
                 "worker did not pull/read the same image/secret from shared registry and Swarm")
-        require(self.secret_ref(project) == secret_before, "two-node deployment regenerated secret")
-        revision = "selected-" + uuid.uuid4().hex[:8]
+        require(self.swarm_ref(project) == secret_before, "two-node deployment regenerated secret")
+        previous_image = self.swarm_service(name, "api")["Spec"]["TaskTemplate"]["ContainerSpec"]["Image"]
+        previous_revision = identity["revision"]
+        revision = "full-update-" + uuid.uuid4().hex[:8]
         self.swarm_private_write(project / "api" / "content" / "revision.txt", revision + "\n")
-        self.cli(project, "deploy", "api", timeout=900)
-        selected_identity = self.identity(self.app_port, name, revision)
-        require(self.secret_ref(project) == secret_before and
-                selected_identity["secretFingerprint"] == identity["secretFingerprint"],
-                "selected deployment regenerated application credential")
+        deployed = self.cli(project, "deploy", timeout=900)
+        require(set(deployed) == {"deployed", "context", "services", "convergence"} and
+                set(deployed["services"]) == {"api", "worker"},
+                "full deployment omitted authored services or exposed historical state")
+        updated_identity = self.identity(self.app_port, name, revision)
+        require(self.swarm_ref(project) == secret_before and
+                updated_identity["secretFingerprint"] == identity["secretFingerprint"],
+                "full deployment regenerated application credential")
         after = self.swarm_service(name, "worker")
-        require(after["Version"] == worker_spec["Version"] and after["Spec"] == worker_spec["Spec"],
-                "selected API deploy modified unrelated worker service")
+        require(after["Spec"]["TaskTemplate"]["ContainerSpec"]["Image"] !=
+                worker_spec["Spec"]["TaskTemplate"]["ContainerSpec"]["Image"],
+                "full deploy did not update worker to newly built image")
+        self.docker("service", "update", "--rollback", name + "_api")
+        self.swarm_wait_tasks(name, "api")
+        self.identity(self.app_port, name, previous_revision)
+        require(self.swarm_service(name, "api")["Spec"]["TaskTemplate"]["ContainerSpec"]["Image"] == previous_image,
+                "Docker-native rollback did not preserve prior immutable digest")
+        self.cli(project, "deploy", timeout=900)
+        self.identity(self.app_port, name, revision)
+        self.discard_scratch(project)
         self.swarm_strict_status(project, name)
         self.cli(project, "logs", "--tail", "20", "api")
         unsupported = self.cli(project, "exec", "api", "true", fail=True)
@@ -571,21 +664,21 @@ class Harness:
                       bool, "owned manager API task")
         self.docker("exec", api_id, "python", "-c", "from pathlib import Path; Path('/data/smoke-preserved').write_text('retained')")
         self.config(project, "failHealth", True)
-        error = self.cli(project, "deploy", "api", fail=True, timeout=900)
+        error = self.cli(project, "deploy", fail=True, timeout=900)
         require(any(word in error["message"].lower() for word in ("rollout", "task", "health", "converge", "pause")),
                 "failed rollout lacks actionable task/health/convergence error")
         row = self.swarm_failed_status(project, "api")
         require(row.get("containerReady") is False and row.get("ready") is False,
                 "failed rollout did not fail strict status")
         self.config(project, "failHealth", False)
-        self.cli(project, "deploy", "api", timeout=900)
+        self.cli(project, "deploy", timeout=900)
         self.identity(self.app_port, name, revision)
         require(self.cli(project, "status").get("ready") is True, "failed rollout restoration did not recover")
         api_id = poll(lambda: self.docker("ps", "-q", "--filter", "label=com.docker.swarm.service.name=" + name + "_api").stdout.strip(),
                       bool, "restored manager API task")
         self.docker("exec", api_id, "python", "-c", "from pathlib import Path; assert Path('/data/smoke-preserved').read_text() == 'retained'")
         self.cli(project, "down")
-        require(self.secret_ref(project) == secret_before and self.configured_port(project) == self.app_port,
+        require(self.swarm_ref(project) == secret_before and self.configured_port(project) == self.app_port,
                 "Swarm down changed stable credential/endpoint")
         self.cli(project, "status", fail=True)
         refused = self.cli(project, "destroy", "--yes", fail=True)
@@ -593,11 +686,11 @@ class Harness:
                 "multi-node destroy did not preserve conservative node-local volume boundary")
         self.retire_swarm_worker()
         self.cli(project, "destroy", "--yes")
-        require(self.secret_ref(project) == secret_before and recovery.stat().st_size == metadata.st_size,
-                "destroy discarded durable generated secret/recovery")
+        require(self.swarm_ref(project) == secret_before and source_file.stat().st_size == metadata.st_size,
+                "destroy discarded current generated secret source/binding")
         self.swarm_secret(project, name, secret_before)
-        self.cli(project, "ports", "release", "--yes")
-        self.report.append("disposable single-node/two-node Swarm: durable generated recovery, published immutable digests distributed to worker, repeated/scoped deploy, strict native/application status, missing service/replica faults and restoration, inspect-only, logs/node-local exec boundary, failed rollout and retained data, conservative multi-node destroy and owned single-node teardown")
+        self.discard_scratch(project)
+        self.report.append("disposable single/two-node Swarm: external generated source, full build/push/digest distribution and updates, native rollback, strict status and replica faults, failed rollout/data retention, conservative multi-node destroy and owned teardown")
         self.swarm_import_sync_smoke()
     
 
@@ -712,38 +805,31 @@ class Harness:
         if self.watch and self.watch.poll() is None:
             os.killpg(self.watch.pid, signal.SIGTERM)
             self.watch.wait(timeout=20)
-        environments = {str(Path(path).resolve()): env for path, _, env in self.projects}
-        inventory = self.cli(self.repo, "env", "list", env=self.host_env)
+        if self.host_daemon_id:
+            require(self.docker("info", "--format", "{{.ID}}", env=self.host_env).stdout.strip() ==
+                    self.host_daemon_id, "outer Docker target changed; refusing cleanup")
         fixtures = []
-        if inventory["pendingOperations"]:
-            errors.append("fixture pending publication claims require recovery")
-        for entry in reversed(inventory["environments"]):
-            project = Path(entry["root"])
+        for path, saved_name, environment in reversed(self.projects):
+            project = Path(path).resolve()
             try:
-                require(project.resolve().is_relative_to(self.root.resolve()),
-                        "refusing cleanup of a registration outside this fixture")
-                identity = json.loads((project / ".dockstride" / "identity.json").read_text())
-                owner, name = identity["id"], entry["project"]
-                require(identity["root"] == str(project.resolve()) and
-                        identity["project"] == name and entry["ownerId"] == owner,
-                        "fixture cleanup ownership identity changed")
-                require(str(project.resolve()) in environments,
-                        "refusing cleanup of an untracked fixture registration")
-                environment = environments[str(project.resolve())]
-                if entry["backend"] == "swarm":
+                require(project.is_relative_to(self.root.resolve()), "cleanup escaped run-owned fixture")
+                name = saved_name or self.cli(project, "config", "get", "project", env=environment)["value"]
+                backend = self.cli(project, "config", "get", "backend", env=environment)["value"]
+                require(self.cli(project, "config", "get", "project", env=environment)["value"] == name,
+                        "tracked fixture project name changed")
+                if backend == "swarm":
                     require(environment == self.node_envs.get("manager"),
-                            "refusing Swarm cleanup outside the pinned disposable manager")
-                fixtures.append((entry, project, owner, name, environment))
+                            "refusing Swarm cleanup outside pinned disposable manager")
+                fixtures.append((backend, project, str(project), name, environment))
             except (OSError, ValueError, KeyError, subprocess.TimeoutExpired, SmokeFailure) as error:
                 errors.append(f"{project}: {error}")
         if not errors:
             try:
                 # Prove both outer owners and the complete cluster before any down.
-                # Stop every registered fixture first, not just the first project,
-                # so retiring its worker cannot disrupt another owned deployment.
+                # Stop all tracked deployments before retiring their shared worker.
                 self.verified_swarm_nodes()
-                for entry, project, _, _, environment in fixtures:
-                    if entry["backend"] == "swarm":
+                for backend, project, _, _, environment in fixtures:
+                    if backend == "swarm":
                         self.cli(project, "down", env=environment, timeout=180)
                 self.retire_swarm_worker()
             except (OSError, ValueError, KeyError, subprocess.TimeoutExpired, SmokeFailure) as error:
@@ -751,11 +837,15 @@ class Harness:
         if errors:
             raise SmokeFailure("fixture cleanup failed; recovery retained at " + str(self.root) +
                                ":\n" + "\n".join(errors))
-        for entry, project, owner, name, environment in fixtures:
+        for backend, project, owner, name, environment in fixtures:
             try:
+                if backend == "swarm":
+                    self.verified_dind_node("manager")
+                else:
+                    require(self.docker("info", "--format", "{{.ID}}", env=environment).stdout.strip() ==
+                            self.host_daemon_id, "Compose cleanup target changed")
                 self.cli(project, "destroy", "--yes", env=environment, timeout=180)
-                self.cli(project, "ports", "release", "--yes", env=environment, timeout=120)
-                if entry["backend"] == "swarm":
+                if backend == "swarm":
                     # Current immutable backend objects deliberately survive destroy.
                     # Only exact owned objects in this disposable daemon are removed.
                     require(environment.get("DOCKER_CONTEXT") in self.contexts,
@@ -776,23 +866,18 @@ class Harness:
                                 labels.get("io.dockstride.project") == name,
                                 "immutable secret teardown ownership changed")
                         self.docker("secret", "rm", secret_id, env=environment)
-                forgotten = self.cli(project, "env", "forget", str(project), "--yes",
-                                     env=environment, timeout=120)
-                require(forgotten.get("forgotten") is True,
-                        "fixture environment registration was not retired")
+                for kind, listing in (("containers", ("ps", "-aq")),
+                                      ("networks", ("network", "ls", "-q")),
+                                      ("volumes", ("volume", "ls", "-q"))):
+                    for label in ("io.dockstride.owner=" + owner, "io.dockstride.project=" + name):
+                        remaining = self.docker(*listing, "--filter", "label=" + label,
+                                                env=environment).stdout.split()
+                        require(not remaining, "owned " + kind + " remain: " + repr(remaining))
+                self.assert_disposable_state(project)
             except (OSError, ValueError, KeyError, subprocess.TimeoutExpired, SmokeFailure) as error:
                 errors.append(f"{project}: {error}")
-        remaining = self.cli(self.repo, "env", "list", env=self.host_env)
-        if remaining["environments"] or remaining["pendingOperations"]:
-            errors.append("fixture registry or pending publication claims remain")
-        reservations_path = self.root / "home" / ".local/share/dockstride/.dockstride/port-reservations.json"
-        if reservations_path.exists():
-            reservations = json.loads(reservations_path.read_text())
-            if reservations.get("reservations"):
-                errors.append("fixture endpoint reservations remain")
         if errors:
-            # Preserve the pinned DIND connection and private configuration needed
-            # for recovery; never hide leaked claims by deleting isolated HOME.
+            # Preserve exact connections and credentials if teardown is uncertain.
             raise SmokeFailure("fixture cleanup failed; recovery retained at " + str(self.root) +
                                ":\n" + "\n".join(errors))
         for name in reversed(self.containers):
@@ -802,6 +887,8 @@ class Harness:
                     result = self.docker("rm", "-f", "-v", item["Id"], env=self.host_env, ok=False)
                     if result.returncode:
                         errors.append(result.stderr)
+                    else:
+                        require(self.verified_outer_container(name) is None, "outer container survived removal")
             except (OSError, ValueError, KeyError, subprocess.TimeoutExpired, SmokeFailure) as error:
                 errors.append(f"{name}: {error}")
         if not errors:
@@ -826,7 +913,7 @@ class Harness:
                                ":\n" + "\n".join(errors))
         if self.network:
             item = self.json_docker("network", "inspect", self.network, env=self.host_env)[0]
-            require(item.get("Name") == self.network and
+            require(item.get("Name") == self.network and item.get("Id") == self.network_id and
                     item.get("Labels", {}).get("dockstride.smoke") == self.prefix,
                     "outer fixture network ownership changed; retaining recovery")
             result = self.docker("network", "rm", item["Id"], env=self.host_env, ok=False)
@@ -834,30 +921,23 @@ class Harness:
                 raise SmokeFailure("outer network cleanup failed; recovery retained at " + str(self.root) +
                                    ":\n" + result.stderr)
         for name in reversed(self.contexts):
+            context = self.json_docker("context", "inspect", name, env=self.host_env)[0]
+            records = [node for node in self.dind_nodes.values() if node["context"] == name]
+            require(len(records) == 1 and context.get("Name") == name and
+                    context.get("Endpoints", {}).get("docker", {}).get("Host") == records[0]["endpoint"],
+                    "context target changed; refusing context cleanup")
             result = self.docker("context", "rm", "-f", name, env=self.host_env, ok=False)
             if result.returncode:
                 errors.append(result.stderr)
         if errors:
             raise SmokeFailure("outer fixture cleanup failed:\n" + "\n".join(errors))
-        # Private secret directories deliberately prohibit listing; restore owner
-        # traversal only inside this disposable fixture for complete local cleanup.
-        private = self.root / "private"
-        if private.exists():
-            for directory, children, _ in os.walk(private):
-                for child in children:
-                    path = Path(directory) / child
-                    if not path.is_symlink():
-                        try:
-                            path.chmod(0o700)
-                        except PermissionError:
-                            pass
 
-    def compose_private_file(self, path, content):
+    def compose_private_file(self, path, content, mode=0o600):
         path.parent.mkdir(parents=True, exist_ok=True)
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
-        descriptor = os.open(path, flags, 0o600)
+        descriptor = os.open(path, flags, mode)
         with os.fdopen(descriptor, "wb") as output:
-            os.fchmod(output.fileno(), 0o600)
+            os.fchmod(output.fileno(), mode)
             output.write(content.encode() if isinstance(content, str) else content)
         require(path.stat().st_uid == os.getuid(), "fixture input is not owned by invoking UID")
 
@@ -912,11 +992,9 @@ class Harness:
         model = path.read_text()
         model = model.replace("  failMigration | Bool | default = false,", "  failMigration | Bool | default = false,\n"
                               "  migrationDelay | Number | default = 0,\n"
-                              "  wrongIdentity | Bool | default = false,\n"
-                              "  authInput | String | default = \"\",")
+                              "  wrongIdentity | Bool | default = false,")
         model = model.replace('json = { application = "dockstride-sample", project = env.project, uid = env.containerUid },',
                               'json = { application = "dockstride-sample", project = if env.wrongIdentity then "wrong-fixture-identity" else env.project, uid = env.containerUid },')
-        model = model.replace("secrets.authKey = lib.GenerateSecret", "secrets.authKey = if env.authInput != \"\" then lib.FileSecret env.authInput else lib.GenerateSecret")
         model = model.replace("environment = dc.Env { FAIL_MIGRATION = env.failMigration },",
                               "environment = dc.Env { FAIL_MIGRATION = env.failMigration, MIGRATION_DELAY = env.migrationDelay },")
         model = model.replace("    ] else [],", "      { name = \"smoke-seed\", kind = \"command\", argv = [\"python3\", \"smoke-seed.py\"],\n"
@@ -1029,27 +1107,17 @@ class Harness:
         self.config(project, "migrationDelay", 0)
 
 
-    def compose_gc_refusal(self, project, reference, expected_reason):
-        plan = self.cli(project, "secrets", "gc", reference["file"], "--plan")["plan"]
-        require(len(plan) == 1 and plan[0]["eligible"] is False,
-                "protected immutable revision became eligible for GC")
-        require(expected_reason in plan[0]["reason"].lower(),
-                "GC did not explain the relevant protection: " + plan[0]["reason"])
-        self.cli(project, "secrets", "gc", plan[0]["revision"], "--yes", fail=True)
-        require(Path(reference["file"]).is_file(), "GC refusal nevertheless deleted storage")
-
 
     def compose_postgres_smoke(self):
         project = self.checkout(self.prefix + "-postgres")
         name = self.prefix + "-postgres"
         self.projects.append((project, name, self.env.copy()))
         password = self.root / "postgres.input"
-        self.compose_private_file(password, uuid.uuid4().hex + "\n")
+        self.compose_private_file(password, uuid.uuid4().hex + "\n", mode=0o640)
         model = r'''let lib = import "libs/dockstride.ncl" in
 let cfg = {
   project | String, backend | lib.Backend | default = "compose",
   hostSecretUid | Number, hostSecretGid | Number,
-  passwordInput | String,
   postgresDb | String | default = "fixture",
   secrets = { password | lib.SecretSource },
 } in
@@ -1059,7 +1127,7 @@ dc.ComposeFile {
   dockstride | not_exported = {
     Config = cfg,
     setup = {
-      secrets.password = lib.FileSecret env.passwordInput,
+      secrets.password = lib.ReferenceSecret,
       secretAccess.password = { uid = env.hostSecretUid, gid = env.hostSecretGid },
     },
     commands.postgresDiagnosis = { argv = ["python3", "diagnose.py"], timeoutSeconds = 8 },
@@ -1187,9 +1255,8 @@ json.dump({"schemaVersion": 1, "findings": [finding]}, sys.stdout)
 sys.stdout.write("\n")
 '''
         self.compose_private_file(project / "diagnose.py", probe)
-        inputs = {"project": name, "hostSecretUid": os.getuid(), "hostSecretGid": os.getgid(),
-                  "passwordInput": str(password)}
-        argv = ["setup"]
+        inputs = {"project": name, "hostSecretUid": os.getuid(), "hostSecretGid": os.getgid()}
+        argv = ["setup", "--secret-file", "password=" + str(password)]
         for field, value in inputs.items():
             argv.extend(["--set", field + "=" + json.dumps(value)])
         self.cli(project, *argv)
@@ -1218,14 +1285,13 @@ sys.stdout.write("\n")
         self.config(project, "postgresDb", "fixture")
         self.cli(project, "down")
         wrong = self.root / "postgres-wrong.input"
-        self.compose_private_file(wrong, uuid.uuid4().hex + "\n")
+        self.compose_private_file(wrong, uuid.uuid4().hex + "\n", mode=0o640)
         self.cli(project, "secrets", "replace", "password", "--file", str(wrong))
         error = self.compose_bounded_cli(project, 15, "up", fail=True)
         finding = self.compose_postgres_finding(project, error["details"]["diagnostics"], "authentication-failed")
         require(finding.get("suggestedAction") and error["category"] == "operation" and error["exitCode"] == 1,
                 "credential mismatch did not retain primary failure and inert recovery guidance")
-        require(self.cli(project, "config", "get", "passwordInput")["value"] == str(password),
-                "diagnosis changed credential provider source")
+        require(password.is_file(), "diagnosis removed original provider file")
         # Restoring the correct mounted credential, not ALTER ROLE or volume
         # reset, must recover the original data. A destructive hook cannot pass.
         self.cli(project, "down")
@@ -1272,8 +1338,10 @@ sys.stdout.write("\n")
     def swarm_service(self, name, service):
         item = self.json_docker("service", "inspect", name + "_" + service)[0]
         labels = item["Spec"].get("Labels", {})
-        require(labels.get("io.dockstride.project") == name and labels.get("io.dockstride.owner"),
-                "refusing to manipulate a non-owned Swarm service")
+        expected = {str(Path(path).resolve()) for path, saved_name, _ in self.projects if saved_name == name}
+        require(len(expected) == 1 and labels.get("io.dockstride.project") == name and
+                labels.get("io.dockstride.owner") in expected,
+                "refusing to manipulate a foreign Swarm service")
         return item
 
 
@@ -1287,13 +1355,13 @@ sys.stdout.write("\n")
                 "Swarm credential is not an immutable external reference")
         item = self.json_docker("secret", "inspect", reference["name"])[0]
         labels = item["Spec"].get("Labels", {})
-        current_owner = json.loads((project / ".dockstride" / "identity.json").read_text())["id"]
+        current_owner = str(project.resolve())
         require(labels.get("io.dockstride.owner") == current_owner and
                 (owner is None or current_owner == owner) and
                 labels.get("io.dockstride.project") == name and
                 labels.get("io.dockstride.secret") == "authKey" and
-                labels.get("io.dockstride.revision") and item.get("ID"),
-                "Swarm revision lacks verified immutable identity/ownership labels")
+                item.get("ID"),
+                "Swarm secret lacks exact path/project/logical ownership labels")
         return item
 
 
@@ -1365,7 +1433,7 @@ sys.stdout.write("\n")
         row = self.swarm_failed_status(project, "worker")
         require(row.get("status") == "missing" and row.get("containerReady") is False,
                 "removed selected Swarm service did not fail as missing")
-        self.cli(project, "deploy", "worker", timeout=900)
+        self.cli(project, "deploy", timeout=900)
         self.swarm_wait_tasks(name, "worker")
         require(self.cli(project, "status", "worker").get("ready") is True,
                 "selected service restore did not recover")
@@ -1393,239 +1461,84 @@ sys.stdout.write("\n")
                 "secret sync did not precisely report committed/uncommitted/applied names")
         rows = report.get("secrets", [])
         require(len(rows) == 1 and rows[0].get("name") == "authKey" and rows[0].get("status") == status and
-                rows[0].get("source") == {"kind": "file", "canonicalPath": str(source.resolve()),
-                                          "origin": "declared-file"},
-                "secret sync lost current declared file provenance or comparison result")
-        serialized = json.dumps(report)
-        require("keyedDigest" not in serialized and "keyed_digest" not in serialized,
-                "secret sync exposed a private keyed digest")
+                rows[0].get("source", {}).get("canonicalPath") == str(source.resolve()) and
+                rows[0].get("source", {}).get("origin") is not None and
+                set(rows[0]["source"]) == {"canonicalPath", "origin"} and
+                set(rows[0]) == {"name", "status", "source", "reference", "binding", "consumers",
+                                "applied", "consumerRestartNeeded"},
+                "secret sync lost current source provenance or current-publication result shape")
         return rows[0]
 
 
-    def swarm_retire_fixture_snapshots(self, project, name, reference):
-        # Explicit fixture manipulation, NOT a Dockstride snapshot-removal API.
-        # Journals also retain plans and previous/completed deployment snapshots.
-        # Retire whole reference-bearing journals, never rewrite recorded history.
-        # Current env refs, revision history, identity, and private stores survive.
-        root = self.root.resolve()
-        require(project == project.resolve() and project.is_relative_to(root) and
-                any(Path(path) == project and saved_name == name for path, saved_name, _ in self.projects),
-                "snapshot retirement escaped the tracked disposable fixture")
-        state_dir = project / ".dockstride"
-        for directory in (project, state_dir):
-            metadata = directory.lstat()
-            require(stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.getuid() and
-                    not directory.is_symlink(), "unsafe fixture snapshot directory")
-        require(state_dir.stat().st_mode & 0o777 == 0o700, "unsafe fixture state directory mode")
-
-        observed = {}
-        def version(metadata):
-            return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid,
-                    metadata.st_size, metadata.st_mtime_ns)
-
-        def private_metadata(path):
-            require(path.parent == state_dir, "snapshot path escaped fixture bookkeeping")
-            metadata = path.lstat()
-            require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid() and
-                    metadata.st_mode & 0o777 == 0o600, "unsafe fixture snapshot bookkeeping")
-            observed[path] = version(metadata)
-            return metadata
-
-        def read_bookkeeping(path):
-            metadata = private_metadata(path)
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-            with os.fdopen(fd) as source:
-                require(version(os.fstat(source.fileno())) == version(metadata),
-                        "fixture snapshot changed while opening")
-                return source.read()
-
-        identity = json.loads(read_bookkeeping(state_dir / "identity.json"))
-        owner = identity["id"]
-        manager = self.dind_nodes["manager"]
-        context = manager["context"] + ";" + manager["endpoint"]
-        require(reference.get("external") is True and set(reference) == {"external", "name"} and
-                isinstance(reference.get("name"), str), "unsafe fixture old Swarm reference")
-        require(identity.get("root") == str(project) and identity.get("project") == name and
-                identity.get("backend") == "swarm" and identity.get("context") == context and
-                identity.get("secretCluster") == self.swarm_identity["cluster"] and
-                self.env.get("DOCKER_CONTEXT") == manager["context"] and manager["context"] in self.contexts,
-                "snapshot retirement ownership or pinned context mismatch")
-        require(not self.docker("service", "ls", "-q", "--filter", "label=io.dockstride.owner=" + owner,
-                                "--filter", "label=io.dockstride.project=" + name).stdout.strip(),
-                "fixture snapshots cannot retire before its live service grants disappear")
-
-        def contains(value):
-            return value == reference or (isinstance(value, dict) and any(contains(v) for v in value.values())) or (
-                isinstance(value, list) and any(contains(v) for v in value))
-
-        def operation_id(value, prefix):
-            suffix = value.removeprefix(prefix)
-            require(value.startswith(prefix) and len(suffix) == 32 and
-                    all(char in "0123456789abcdef" for char in suffix),
-                    "unexpected fixture operation identity")
-            return value
-
-        def deployment_record(value):
-            require(isinstance(value, dict) and value.get("owner") == owner and value.get("context") == context and
-                    value.get("project") == name, "fixture deployment snapshot ownership mismatch")
-            revision = operation_id(value["revision"], "deploy-")
-            require(value.get("snapshot") == str(state_dir / (revision + ".yaml")),
-                    "snapshot YAML path escaped fixture bookkeeping")
-
-        def journal(path, prefix):
-            operation = operation_id(path.name.removeprefix("journal-").removesuffix(".jsonl"), prefix)
-            rows = [json.loads(line) for line in read_bookkeeping(path).splitlines()]
-            require(rows and all(row.get("operation") == operation and isinstance(row.get("event"), dict) and
-                                isinstance(row.get("timestamp_ms"), int) for row in rows),
-                    "unsafe fixture operation journal")
-            return rows
-
-        # Historical deployment records say active=true at their creation time.
-        # A later completed native down plus live-grant absence proves inactivity.
-        down_completed = []
-        for path in state_dir.glob("journal-down-*.jsonl"):
-            rows = journal(path, "down-")
-            plan = rows[0]["event"].get("plan", {})
-            require(plan.get("backend") == "swarm" and plan.get("project") == name and
-                    plan.get("context") == context, "fixture down journal context mismatch")
-            if rows[-1]["event"].get("state") == "completed":
-                down_completed.append(rows[-1]["timestamp_ms"])
-        require(down_completed, "fixture has no completed native down before snapshot retirement")
-        inactive_since = max(down_completed)
-        retired = []
-        removals = set()
-        candidates = [state_dir / "deployment.json", state_dir / "deployment-applied.json"]
-        candidates.extend(state_dir.glob("snapshot-deploy-*.json"))
-        for path in candidates:
-            if not path.exists() and not path.is_symlink():
-                continue
-            value = json.loads(read_bookkeeping(path))
-            require(value.get("owner") == owner and value.get("context") == context,
-                    "snapshot retirement ownership or pinned context mismatch")
-            if path.name in ("deployment.json", "deployment-applied.json"):
-                deployment_record(value)
-                require(value.get("active") is False, "fixture deployment must be inactive before snapshot retirement")
-                revision = value["revision"]
-            else:
-                revision = operation_id(path.name.removeprefix("snapshot-").removesuffix(".json"), "deploy-")
-            if not contains(value):
-                continue
-            rows = journal(state_dir / ("journal-" + revision + ".jsonl"), "deploy-")
-            require(rows[-1]["event"].get("state") in ("completed", "failed", "cancelled") and
-                    max(row["timestamp_ms"] for row in rows) <= inactive_since,
-                    "fixture snapshot operation is not proven inactive")
-            yaml_path = state_dir / (revision + ".yaml")
-            if yaml_path.exists() or yaml_path.is_symlink():
-                private_metadata(yaml_path)
-                removals.add(yaml_path)
-            removals.add(path)
-            retired.append(path.name)
-
-        for path in state_dir.glob("journal-deploy-*.jsonl"):
-            rows = journal(path, "deploy-")
-            if not contains(rows):
-                continue
-            require(rows[-1]["event"].get("state") in ("completed", "failed", "cancelled") and
-                    max(row["timestamp_ms"] for row in rows) <= inactive_since,
-                    "fixture deployment operation is not proven inactive")
-            plan = rows[0]["event"].get("plan", {})
-            require(plan.get("backend") == "swarm" and plan.get("project") == name and
-                    plan.get("context") == context, "fixture deploy journal context mismatch")
-            resources = plan.get("sharedResources", {})
-            labels = [resource.get("labels", {}) for kind in ("networks", "volumes")
-                      for resource in (resources.get(kind) or {}).values()]
-            require(labels and all(label.get("io.dockstride.owner") == owner and
-                                   label.get("io.dockstride.project") == name for label in labels),
-                    "fixture deploy plan ownership mismatch")
-            for row in rows:
-                event = row["event"]
-                if "plan" in event:
-                    require(event["plan"] == plan, "unexpected fixture deployment plan")
-                for field in ("previous", "deployment"):
-                    record = event.get(field)
-                    if record:
-                        deployment_record(record)
-            removals.add(path)
-            retired.append(path.name)
-
-        require(retired, "fixture had no retained snapshots to retire")
-        # Validate everything before the first mutation; never enumerate credential
-        # stores or delete wildcard JSON files or unrelated operation journals.
-        require(all(version(path.lstat()) == saved for path, saved in observed.items()),
-                "fixture snapshot bookkeeping changed before retirement")
-        for path in sorted(removals):
-            path.unlink()
-        self.report.append("fixture-only retirement of verified owned inactive Swarm deployment and journal snapshot references (not a public command)")
 
 
     def swarm_import_sync_smoke(self):
         project = self.checkout("swarm-file")
-        source = self.root / "swarm-import-source"
+        source = self.root / "swarm-provider-source"
         source_values = [uuid.uuid4().hex + uuid.uuid4().hex for _ in range(3)]
         self.swarm_private_write(source, source_values[0])
+        shared = self.root / "swarm-shared.yaml"
+        self.compose_private_file(shared, "secrets:\n  authKey:\n    file: " + json.dumps(str(source.resolve())) + "\n")
+        shared_bytes = shared.read_bytes()
         model_path = project / "compose.ncl"
         model = model_path.read_text()
-        policy = 'lib.GenerateSecret { bytes = 32, encoding = "hex", durable = true, recoveryFile = env.recoveryFile }'
+        policy = 'lib.GenerateSecret { bytes = 32, encoding = "hex" }'
         require(model.count(policy) == 1, "sample generated-secret policy changed")
-        model = model.replace(policy, "lib.FileSecret " + json.dumps(str(source.resolve())))
+        model = model.replace(policy, "lib.ReferenceSecret")
         self.swarm_private_write(model_path, model)
+        self.cli(project, "config", "sources", "add", str(shared))
         name = self.setup(project, "swarm-file", "swarm", self.app_port)
-        first = self.secret_ref(project)
-        first_object = self.swarm_secret(project, name, first)
-        owner = first_object["Spec"]["Labels"]["io.dockstride.owner"]
-        plan = self.cli(project, "secrets", "sync", "authKey", "--plan")
-        require(plan.get("comparisonsDeferred") is True and plan.get("sideEffects") is False and
-                plan.get("committed") == [] and plan.get("applied") == [] and plan.get("uncommitted") == ["authKey"],
-                "sync plan claimed a comparison/publication")
-        require(plan.get("secrets") == [{"name": "authKey", "source": {
-                    "kind": "file", "canonicalPath": str(source.resolve()), "origin": "declared-file"},
-                    "status": "comparison-deferred", "reference": first}], "sync plan lost deferred source provenance")
+        original = self.swarm_ref(project)
+        original_object = self.swarm_secret(project, name, original)
+        self.current_secret_listing(project, "swarm", {"file": str(source.resolve())}, original["name"])
+        owner = str(project.resolve())
+        require(str(source) not in (project / "env.yaml").read_text() and shared.read_bytes() == shared_bytes,
+                "initial provisioning copied shared provider reference into local ordinary settings")
+        before_plan = (project / "env.yaml").read_bytes()
         initial_ids = self.swarm_secret_ids(name, owner)
-        require(initial_ids == {first_object["ID"]}, "initial file import created extra owned revisions")
-        unchanged = self.cli(project, "secrets", "sync", "authKey", "--yes")
-        self.swarm_sync_report(unchanged, source, "unchanged", [], [])
-        require(self.secret_ref(project) == first and self.swarm_secret(project, name, first)["ID"] == first_object["ID"],
-                "comparable initial imported Swarm secret was not an unchanged no-op")
-        require(self.swarm_secret_ids(name, owner) == initial_ids,
-                "unchanged file sync created an orphan immutable revision")
+        plan = self.cli(project, "secrets", "sync", "authKey", "--plan")
+        require(plan.get("sideEffects") is False and plan.get("committed") == [] and
+                plan.get("applied") == [] and plan["secrets"][0]["status"] == "planned" and
+                plan["secrets"][0]["source"]["canonicalPath"] == str(source.resolve()) and
+                (project / "env.yaml").read_bytes() == before_plan and
+                self.swarm_secret_ids(name, owner) == initial_ids,
+                "sync plan consumed/publicized material or changed current metadata")
+        republished = self.cli(project, "secrets", "sync", "authKey", "--yes")
+        row = self.swarm_sync_report(republished, source, "published", ["authKey"], [])
+        first = self.swarm_ref(project)
+        first_object = self.swarm_secret(project, name, first)
+        require(first != original and first_object["ID"] != original_object["ID"] and
+                row["reference"] == {"file": str(source.resolve())} and row["binding"] == first["name"],
+                "explicit unchanged-byte sync did not create a fresh binding")
         self.cli(project, "deploy", timeout=900)
         identity = self.identity(self.app_port, name)
         self.swarm_private_write(source, source_values[1])
+        current_ids = self.swarm_secret_ids(name, owner)
+        self.cli(project, "setup")
         self.cli(project, "deploy", timeout=900)
-        require(self.secret_ref(project) == first and
+        require(self.swarm_ref(project) == first and self.swarm_secret_ids(name, owner) == current_ids and
                 self.identity(self.app_port, name)["secretFingerprint"] == identity["secretFingerprint"],
-                "ordinary deployment implicitly synchronized changed file input")
+                "ordinary setup/deploy implicitly republished changed provider bytes")
         rejected = self.cli(project, "secrets", "sync", "authKey", "--yes", "--apply", fail=True)
-        require("rotation" in rejected.get("message", "").lower() and self.secret_ref(project) == first and
-                self.swarm_secret(project, name, first, owner)["ID"] == first_object["ID"],
-                "undeclared application rotation was not rejected before reference publication")
-        require(self.swarm_secret_ids(name, owner) == initial_ids,
-                "undeclared apply created a backend object before preflight rejection")
+        require("rotation" in rejected.get("message", "").lower() and
+                self.swarm_ref(project) == first and self.swarm_secret_ids(name, owner) == current_ids,
+                "undeclared rotation was not rejected before backend publication")
         changed = self.cli(project, "secrets", "sync", "authKey", "--yes")
-        row = self.swarm_sync_report(changed, source, "replaced", ["authKey"], [])
-        second = self.secret_ref(project)
-        second_object = self.swarm_secret(project, name, second, owner)
-        require(first != second and first_object["ID"] != second_object["ID"] and
-                first_object["Spec"]["Labels"]["io.dockstride.revision"] !=
-                second_object["Spec"]["Labels"]["io.dockstride.revision"] and
-                row.get("previous") == first and row.get("reference") == second and
-                row.get("priorContentComparable") is True and row.get("consumerRestartNeeded") is True,
-                "changed source did not publish a distinct verified immutable owned revision")
-        self.swarm_secret(project, name, first, owner)
-        self.swarm_sync_report(self.cli(project, "secrets", "sync", "authKey", "--yes"), source, "unchanged", [], [])
+        row = self.swarm_sync_report(changed, source, "published", ["authKey"], [])
+        second = self.swarm_ref(project)
+        second_object = self.swarm_secret(project, name, second)
+        require(second != first and second_object["ID"] != first_object["ID"] and
+                row["reference"] == {"file": str(source.resolve())} and row["binding"] == second["name"] and
+                row["consumerRestartNeeded"] is True and shared.read_bytes() == shared_bytes and
+                str(source) not in (project / "env.yaml").read_text(),
+                "sync failed to switch only the local binding of a shared original reference")
         for service in ("api", "worker"):
             grants = self.swarm_service(name, service)["Spec"]["TaskTemplate"]["ContainerSpec"]["Secrets"]
             require(any(grant.get("SecretID") == first_object["ID"] for grant in grants),
                     "storage-only sync unexpectedly changed live service grants")
         blocked = self.docker("secret", "rm", first_object["ID"], ok=False)
         require(blocked.returncode != 0 and "in use" in (blocked.stderr + blocked.stdout).lower(),
-                "live Swarm grant did not block old immutable object removal")
-        retained = self.cli(project, "secrets", "gc", first["name"], "--plan")["plan"]
-        require(len(retained) == 1 and retained[0].get("eligible") is False and
-                retained[0].get("reason") == "retained deployment snapshot", "old imported revision lost snapshot protection")
-        self.cli(project, "secrets", "gc", first["name"], "--yes", fail=True)
-
-        # Only this disposable model receives an explicit, matching command rotation.
+                "live Swarm grant did not protect the old immutable object")
         marker = project / "rotation-command-ran"
         rotation = ('{ name = "deliberate-rotation-failure", kind = "command", '
                     'argv = ["python3", "-c", ' + json.dumps(
@@ -1635,9 +1548,9 @@ sys.stdout.write("\n")
                     '], workflows = ["fixture-rotate-auth"], stage = "before", services = ["api", "worker"] }')
         rotating_model = model.replace("] else [],\n    oneshots =",
                                        "] else [" + rotation + "],\n    oneshots =", 1)
-        require(rotating_model.count("      secretAccess.authKey =") == 1,
-                "sample setup metadata changed before fixture rotation declaration")
-        rotating_model = rotating_model.replace("      secretAccess.authKey =", 
+        require(rotating_model.count("      secretAccess.authKey =") == 1 and rotating_model != model,
+                "sample metadata changed before fixture rotation declaration")
+        rotating_model = rotating_model.replace("      secretAccess.authKey =",
             '      rotations.authKey = { workflow = "fixture-rotate-auth", services = ["api", "worker"] },\n'
             "      secretAccess.authKey =")
         self.swarm_private_write(model_path, rotating_model)
@@ -1645,43 +1558,37 @@ sys.stdout.write("\n")
         failed = self.cli(project, "secrets", "sync", "authKey", "--yes", "--apply", fail=True)
         report = failed.get("details", {}).get("secretSync")
         require(isinstance(report, dict), "failed apply omitted precise details.secretSync")
-        row = self.swarm_sync_report(report, source, "replaced", ["authKey"], [])
-        third = self.secret_ref(project)
-        third_object = self.swarm_secret(project, name, third, owner)
+        row = self.swarm_sync_report(report, source, "published", ["authKey"], [])
+        third = self.swarm_ref(project)
+        third_object = self.swarm_secret(project, name, third)
         require(third not in (first, second) and third_object["ID"] not in (first_object["ID"], second_object["ID"]) and
-                row.get("previous") == second and row.get("reference") == third and row.get("applied") is False and
-                row.get("consumerRestartNeeded") is True and marker.is_file() and
+                row["binding"] == third["name"] and row["applied"] is False and
+                row["consumerRestartNeeded"] is True and marker.is_file() and
                 marker.stat().st_uid == os.getuid() and marker.stat().st_mode & 0o777 == 0o600,
-                "failed local rotation did not retain committed storage and prove command execution")
-        for reference in (first, second, third):
-            self.swarm_secret(project, name, reference, owner)
+                "failed explicit command rotation did not retain committed binding and execution evidence")
+        for reference in (original, first, second, third):
+            self.swarm_secret(project, name, reference)
         require(self.identity(self.app_port, name)["secretFingerprint"] == identity["secretFingerprint"],
-                "failed inert rotation changed the live consumer credential")
-        serialized = json.dumps((plan, unchanged, rejected, changed, failed))
-        require(all(value not in serialized for value in source_values) and "keyedDigest" not in serialized and
-                "keyed_digest" not in serialized, "Swarm sync/apply output leaked credential bytes/digests")
+                "failed inert rotation changed live consumer credentials")
+        serialized = json.dumps((plan, republished, rejected, changed, failed))
+        require(all(value not in serialized for value in source_values),
+                "Swarm sync/apply output leaked credential bytes")
         self.swarm_private_write(model_path, model)
+        self.cli(project, "deploy", timeout=900)
+        require(self.identity(self.app_port, name)["secretFingerprint"] != identity["secretFingerprint"],
+                "explicit full deploy did not apply committed current source publication")
+        for service in ("api", "worker"):
+            grants = self.swarm_service(name, service)["Spec"]["TaskTemplate"]["ContainerSpec"]["Secrets"]
+            require(any(grant.get("SecretID") == third_object["ID"] for grant in grants),
+                    "full deploy did not consume the current immutable binding")
         self.cli(project, "down")
-        require(self.secret_ref(project) == third, "Swarm down changed committed secret reference")
-        retained = self.cli(project, "secrets", "gc", first["name"], "--plan")["plan"]
-        require(len(retained) == 1 and retained[0].get("eligible") is False and
-                retained[0].get("reason") == "retained deployment snapshot",
-                "down silently discarded old revision snapshot protection")
-        self.swarm_retire_fixture_snapshots(project, name, first)
-        require(self.secret_ref(project) == third and marker.is_file(),
-                "fixture snapshot retirement changed the committed reference or rotation evidence")
-        eligible = self.cli(project, "secrets", "gc", first["name"], "--plan")["plan"]
-        require(len(eligible) == 1 and eligible[0].get("eligible") is True,
-                "old imported revision stayed blocked after live grants and fixture snapshots cleared")
-        self.cli(project, "secrets", "gc", first["name"], "--yes")
-        require(self.docker("secret", "inspect", first_object["ID"], ok=False).returncode != 0,
-                "eligible old revision was not explicitly garbage-collected")
-        self.swarm_secret(project, name, second, owner)
-        self.swarm_secret(project, name, third, owner)
-        require(self.secret_ref(project) == third,
-                "old revision garbage collection changed the committed current reference")
+        self.discard_scratch(project)
+        require(self.swarm_ref(project) == third and shared.read_bytes() == shared_bytes and marker.is_file(),
+                "down or scratch removal changed committed reference, source, or failed-action evidence")
         self.cli(project, "destroy", "--yes")
-        self.report.append("Swarm private FileSecret import/provenance/deferred plan, immutable unchanged/changed sync, ordinary deploy reuse, prepublication undeclared apply refusal, committed failed command apply with retained objects, live grants and retained snapshot GC protection")
+        for reference in (original, first, second, third):
+            self.swarm_secret(project, name, reference)
+        self.report.append("Swarm shared original-file provenance, no-effect plan, fresh every-sync immutable publication, ordinary setup reuse, preflight rotation refusal, committed failed explicit rotation, live old grants, explicit full apply, retained old objects and scratch-independent teardown")
 
 
 
@@ -1690,7 +1597,7 @@ sys.stdout.write("\n")
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dks", default="target/debug/dks", help="already-built CLI; this harness never builds Rust")
-    parser.add_argument("--compose", action="store_true", help="exercise Compose on the selected daemon with UUID-owned resources")
+    parser.add_argument("--compose", action="store_true", help="exercise Compose with run-owned checkout paths/project names")
     parser.add_argument("--swarm", action="store_true", help="create isolated DIND manager+worker+registry; NEVER initialize existing daemon")
     parser.add_argument("--timeout", type=int, default=90, help="Dockstride lifecycle deadline in seconds, including builds and rollout")
     parser.add_argument("--dind-image", default="docker:dind")

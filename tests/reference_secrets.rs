@@ -8,8 +8,8 @@ use std::{
 };
 use tempfile::TempDir;
 
-// Every CLI invocation has its own HOME, registry, Docker endpoint, and private
-// storage. The fake engine records stdin only in its simulated Docker store.
+// Each CLI invocation uses a disposable checkout, external credential storage,
+// and a fake Docker target that records secret bytes only in its engine store.
 struct Fixture {
     temp: TempDir,
     root: PathBuf,
@@ -84,7 +84,7 @@ elif a[:1] == ['ps'] or a[:2] in (['service','ls'], ['volume','ls'], ['network',
 else: raise SystemExit(9)
 "#).unwrap();
         fs::set_permissions(temp.path().join("bin/docker"), fs::Permissions::from_mode(0o700)).unwrap();
-        let private = serde_json::to_string(&root.join("private")).unwrap();
+        let private = serde_json::to_string(&temp.path().join("private")).unwrap();
         fs::write(root.join("compose.ncl"), format!(r#"let lib = import "libs/dockstride.ncl" in
 let contract = {{project | String, backend | lib.Backend | default = "compose", secrets.token | lib.SecretSource}} in
 let env | contract = import "env.yaml" in
@@ -170,23 +170,12 @@ finally:
     fn current(&self) -> Value { self.success(&["config", "get", "secrets.token"])["value"].clone() }
 
     fn assert_no_host_copy(&self) {
-        for path in [self.root.join("private"), self.temp.path().join("data/dockstride/secrets"), self.temp.path().join("home/.local/share/dockstride/secrets")] {
+        for path in [self.temp.path().join("private"), self.temp.path().join("data/dockstride/secrets"), self.temp.path().join("home/.local/share/dockstride/secrets")] {
             assert!(!path.exists(), "external credential unexpectedly materialized into {}", path.display());
         }
     }
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let user = format!("u{}", unsafe { libc::geteuid() });
-        for base in [self.root.join("private"), self.temp.path().join("data/dockstride/secrets"), self.temp.path().join("home/.local/share/dockstride/secrets")] {
-            let directory = base.join(&user);
-            if directory.exists() {
-                let _ = fs::set_permissions(directory, fs::Permissions::from_mode(0o700));
-            }
-        }
-    }
-}
 
 fn metadata(path: &Path) -> (u32, u32, u32, u64) {
     let value = fs::metadata(path).unwrap();
@@ -263,17 +252,24 @@ fn native_overrides_unset_and_live_shared_path_changes_do_not_copy_credentials()
 
 #[test]
 fn shared_file_security_failures_precede_any_swarm_publication() {
-    for invalid in ["missing", "empty", "unsafe", "symlink", "symlink-parent", "directory", "relative"] {
+    for invalid in ["missing", "empty", "oversized", "unsafe", "symlink", "symlink-parent", "directory", "relative", "checkout", "repository"] {
         let f = Fixture::new("swarm", "lib.ReferenceSecret");
         let file = f.private_file("provider", b"must-never-be-published");
         let reference = match invalid {
             "missing" => { fs::remove_file(&file).unwrap(); json!({"file":file}) }
             "empty" => { fs::write(&file, []).unwrap(); json!({"file":file}) }
+            "oversized" => { fs::write(&file, vec![b'x';1_048_577]).unwrap(); json!({"file":file}) }
             "unsafe" => { fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap(); json!({"file":file}) }
             "symlink" => { let link = f.temp.path().join("provider-link"); symlink(&file, &link).unwrap(); json!({"file":link}) }
             "symlink-parent" => { let link = f.temp.path().join("provider-parent"); symlink(f.temp.path(), &link).unwrap(); json!({"file":link.join("provider")}) }
             "directory" => json!({"file":f.temp.path()}),
             "relative" => json!({"file":"../provider"}),
+            "checkout" => { let local=f.root.join("provider"); fs::rename(&file,&local).unwrap(); json!({"file":local}) }
+            "repository" => {
+                let repo=f.temp.path().join("repository"); fs::create_dir(&repo).unwrap();
+                fs::write(repo.join(".git"),"gitdir: /elsewhere").unwrap();
+                let local=repo.join("provider"); fs::rename(&file,&local).unwrap(); json!({"file":local})
+            }
             _ => unreachable!(),
         };
         let source = f.shared(reference);
@@ -364,7 +360,7 @@ fn list_and_doctor_follow_effective_shared_references_without_claiming_ownership
     let row = list["secrets"].as_array().unwrap().iter().find(|row| row["name"] == "token").unwrap();
     assert_eq!(row["reference"], json!({"file":file}));
     assert_eq!(row["present"], true);
-    assert_eq!(row["owned"], false);
+    assert_eq!(row["binding"], Value::Null);
     assert_eq!(row["consumers"], json!(["api"]));
     assert_eq!(f.success(&["doctor"])["secrets"]["ok"], true);
     fs::remove_file(&file).unwrap();
@@ -378,7 +374,7 @@ fn list_and_doctor_follow_effective_shared_references_without_claiming_ownership
 }
 
 #[test]
-fn reference_replacement_sync_gc_and_destroy_never_mutate_external_files() {
+fn reference_replacement_sync_and_destroy_never_mutate_external_files() {
     let f = Fixture::new("compose", "lib.ReferenceSecret");
     let first = f.private_file("first-provider", b"first-provider-value");
     let second = f.private_file("second-provider", b"second-provider-value");
@@ -389,8 +385,6 @@ fn reference_replacement_sync_gc_and_destroy_never_mutate_external_files() {
     f.success(&["secrets", "replace", "token", "--file", second.to_str().unwrap()]);
     assert_eq!(f.current(), json!({"file":second}));
     f.success(&["secrets", "sync", "token", "--yes"]);
-    f.success(&["secrets", "gc", "--plan"]);
-    assert!(!f.command(&["secrets", "gc", first.to_str().unwrap(), "--yes"], None).status.success());
     f.success(&["destroy", "--yes"]);
     assert_eq!(fs::read(&first).unwrap(), b"first-provider-value");
     assert_eq!(fs::read(&second).unwrap(), b"second-provider-value");
@@ -399,25 +393,6 @@ fn reference_replacement_sync_gc_and_destroy_never_mutate_external_files() {
     f.assert_no_host_copy();
 }
 
-#[test]
-fn full_compose_destroy_allows_a_new_project_without_deleting_retained_credentials() {
-    let f = Fixture::new("compose", "lib.GenerateSecret {bytes = 32, encoding = \"hex\"}");
-    f.success(&["setup"]);
-    let reference = f.current();
-    let path = Path::new(reference["file"].as_str().unwrap());
-    let bytes = fs::read(path).unwrap();
-    let original_metadata = metadata(path);
-    dockstride::state::mark_resources(&f.root, true).unwrap();
-
-    f.success(&["down"]);
-    assert!(!f.command(&["config", "set", "project", "new-project"], None).status.success());
-    f.success(&["destroy", "--yes"]);
-    fs::rename(f.root.join("env.yaml"), f.root.join("env.yaml.old")).unwrap();
-    f.success(&["setup", "--set", "project=new-project"]);
-    assert_eq!(f.env()["project"], "new-project");
-    assert_eq!(fs::read(path).unwrap(), bytes);
-    assert_eq!(metadata(path), original_metadata);
-}
 
 #[test]
 fn swarm_publishes_only_to_docker_and_explicit_sync_uses_the_current_shared_source() {
@@ -429,19 +404,21 @@ fn swarm_publishes_only_to_docker_and_explicit_sync_uses_the_current_shared_sour
     let source = f.shared(json!({"file":first}));
     f.success(&["setup"]);
     assert_eq!(fs::read(f.temp.path().join("docker-secret-bytes")).unwrap(), b"first-swarm-provider-value");
-    let initial = f.env()["secrets"]["token"].clone();
-    assert_eq!(initial["external"], true);
+    let initial = f.env()["_dockstride"]["swarmSecrets"]["token"].clone();
+    assert!(f.env().get("secrets").is_none());
+    assert_eq!(f.current(), json!({"file":first}));
     let publications = fs::read(f.temp.path().join("docker-publications")).unwrap();
     fs::write(&source, serde_yaml::to_string(&json!({"secrets":{"token":{"file":second}}})).unwrap()).unwrap();
     let source_before = fs::read(&source).unwrap();
     f.success(&["setup"]);
-    assert_eq!(f.env()["secrets"]["token"], initial);
+    assert_eq!(f.env()["_dockstride"]["swarmSecrets"]["token"], initial);
     assert_eq!(fs::read(f.temp.path().join("docker-publications")).unwrap(), publications);
     assert_eq!(fs::read(f.temp.path().join("docker-secret-bytes")).unwrap(), b"first-swarm-provider-value");
     f.success(&["secrets", "sync", "token", "--yes"]);
-    let replacement = f.env()["secrets"]["token"].clone();
+    let replacement = f.env()["_dockstride"]["swarmSecrets"]["token"].clone();
     assert_ne!(replacement, initial);
-    assert_eq!(replacement["external"], true);
+    assert!(f.env().get("secrets").is_none());
+    assert_eq!(f.current(), json!({"file":second}));
     assert_eq!(fs::read(f.temp.path().join("docker-secret-bytes")).unwrap(), b"second-swarm-provider-value");
     assert_eq!(fs::read(&source).unwrap(), source_before);
     assert_eq!(fs::read(&first).unwrap(), b"first-swarm-provider-value");
@@ -493,15 +470,14 @@ fn shared_swarm_named_references_remain_externally_owned_and_native_updates_do_n
     let row = list["secrets"].as_array().unwrap().iter().find(|row| row["name"] == "token").unwrap();
     assert_eq!(row["reference"], first);
     assert_eq!(row["present"], true);
-    assert_eq!(row["owned"], false);
+    assert_eq!(row["binding"], Value::Null);
     f.success(&["config", "set", "secrets.token", &second.to_string(), "--shared"]);
     f.success(&["setup"]);
     let list = f.success(&["secrets", "list"]);
     let row = list["secrets"].as_array().unwrap().iter().find(|row| row["name"] == "token").unwrap();
     assert_eq!(row["reference"], second);
-    assert_eq!(row["owned"], false);
-    f.success(&["secrets", "gc", "--plan"]);
-    assert!(!f.command(&["secrets", "gc", "external-provider-first", "--yes"], None).status.success());
+    assert_eq!(row["binding"], Value::Null);
+    assert!(!f.command(&["secrets", "sync", "token", "--yes"], None).status.success());
     for name in ["external-provider-first", "external-provider-second"] {
         assert!(f.temp.path().join("docker-secrets").join(name).exists());
     }
@@ -553,12 +529,14 @@ fn declared_swarm_defaults_publish_and_retire_references_without_yaml_backend_co
     f.shared(json!({"file":original}));
     f.success(&["setup"]);
     let published = f.current();
-    assert_eq!(published["external"], true);
+    assert_eq!(published, json!({"file":original}));
+    let binding = f.env()["_dockstride"]["swarmSecrets"]["token"].clone();
     assert_eq!(fs::read(f.temp.path().join("docker-secret-bytes")).unwrap(), b"declared-default-provider");
     assert!(f.env().get("backend").is_none());
     f.success(&["down"]);
     f.success(&["destroy", "--yes"]);
     assert_eq!(f.current(), published);
+    assert_eq!(f.env()["_dockstride"]["swarmSecrets"]["token"], binding);
     assert!(f.env().get("backend").is_none());
     assert_eq!(metadata(&original), original_metadata);
     assert_eq!(fs::read(&original).unwrap(), b"declared-default-provider");

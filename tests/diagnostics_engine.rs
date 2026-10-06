@@ -4,7 +4,7 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command, time::
 
 fn project(root: &Path) -> Project {
     Project {
-        root: root.to_owned(),
+        root: root.canonicalize().unwrap(),
         env: json!({"project":"diagnostic-fixture","backend":"compose"}),
         model: json!({"name":"diagnostic-fixture","services":{
             "postgres":{"image":"postgres","secrets":[{"source":"password","target":"db-password"}]},
@@ -14,6 +14,7 @@ fn project(root: &Path) -> Project {
         metadata: json!({"commands":{"diagnose":{"argv":["python3","hook.py"],"timeoutSeconds":30}},
             "diagnostics":{"postgres":{"command":"diagnose","services":["postgres"],"on":["startup-failed"]}}}),
         fields: vec![],
+        swarm_secrets: Default::default(),
     }
 }
 
@@ -116,7 +117,7 @@ fn diagnostics_subprocess_worker() {
     assert_eq!(context["diagnostics"]["secretReferences"]["postgres"],json!([{"source":"password","target":"db-password","file":"/private/mounted-password"}]));
     assert_eq!(context["diagnostics"]["failedServices"][0]["service"], "migrate");
     assert_eq!(context["diagnostics"]["triggers"], json!(["startup-failed"]));
-    // An unreachable/missing ownership identity never authorizes resource IDs.
+    // An unreachable Docker observation never authorizes resource IDs.
     assert_eq!(context["diagnostics"]["observations"]["services"],json!([]));
 
     for (response, exit, expected) in [
@@ -138,13 +139,11 @@ fn diagnostics_subprocess_worker() {
     }
 
     // A healthy owned database is still relevant to a scoped migration failure.
-    dockstride::state::save(root, "identity", &json!({"id":"fixture-owner","project":"diagnostic-fixture","backend":"compose",
-        "root":root.canonicalize().unwrap(),"context":"host;DOCKER_HOST=unix:///diagnostic-fixture-unused.sock","resources":true})).unwrap();
     fs::write(root.join("containers.json"),json!([
-        {"Id":"PostgresVerifiedId","Config":{"Labels":{"io.dockstride.owner":"fixture-owner","io.dockstride.project":"diagnostic-fixture",
+        {"Id":"PostgresVerifiedId","Config":{"Labels":{"io.dockstride.owner":project.owner().unwrap(),"io.dockstride.project":"diagnostic-fixture",
             "com.docker.compose.project":"diagnostic-fixture","com.docker.compose.service":"postgres"},"Env":["PASSWORD=NEVER-FORWARD-CONTAINER"]},
             "State":{"Status":"running","Running":true,"ExitCode":0,"OOMKilled":false,"Health":{"Status":"healthy","Log":[{"Output":"NEVER-FORWARD-HEALTH-LOG"}]}}},
-        {"Id":"MigrationVerifiedId","Config":{"Labels":{"io.dockstride.owner":"fixture-owner","io.dockstride.project":"diagnostic-fixture",
+        {"Id":"MigrationVerifiedId","Config":{"Labels":{"io.dockstride.owner":project.owner().unwrap(),"io.dockstride.project":"diagnostic-fixture",
             "com.docker.compose.project":"diagnostic-fixture","com.docker.compose.service":"migrate"}},
             "State":{"Status":"exited","Running":false,"ExitCode":12,"OOMKilled":false}}
     ]).to_string()).unwrap();

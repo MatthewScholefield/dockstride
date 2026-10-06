@@ -28,7 +28,7 @@ def save():
     temporary.write_text(json.dumps(s))
     temporary.replace(p)
 def labels(name):
-    owner = json.loads((root / '.dockstride/identity.json').read_text())['id']
+    owner = str(root.resolve())
     return {'io.dockstride.owner': owner, 'io.dockstride.project': 'native-fixture',
             'com.docker.compose.project': 'native-fixture',
             'com.docker.compose.service': name, 'com.docker.compose.oneoff': 'False'}
@@ -431,7 +431,7 @@ fn applicable_native_compose_kinds_are_rejected_for_swarm_before_any_action_runs
             {"name":"must-not-run", "kind":"command", "argv":["python3", "defaults.py"], "workflows":["deploy"], "stage":"before"}, native
         ]));
         let before = fixture.state();
-        let output = fixture.run(&["deploy", "backend"]);
+        let output = fixture.run(&["deploy"]);
         assert!(!output.status.success(), "accepted {kind} on Swarm");
         assert_eq!(terminal(&output)["type"], "error");
         assert_eq!(fixture.state(), before);

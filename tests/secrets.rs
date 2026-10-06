@@ -10,11 +10,13 @@ use tempfile::TempDir;
 
 struct Fixture {
     temp: TempDir,
+    root: PathBuf,
 }
 impl Fixture {
     fn new(backend: &str, policy: &str, user: &str, rootless: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
+        let root = &temp.path().join("checkout");
+        fs::create_dir(root).unwrap();
         fs::create_dir(root.join("libs")).unwrap();
         fs::write(
             root.join("libs/dockstride.ncl"),
@@ -67,7 +69,7 @@ elif args[:2]==['ps','-aq'] or args[:2] in (['volume','ls'],['network','ls']): p
 elif args[:2] in (['service','ls'], ['ps','--all']): print('consumer' if (r/'consumer').exists() else '')
 elif args[:2]==['service','inspect']:
     if '--format' in args:
-        owner=json.loads((r/'.dockstride/identity.json').read_text())['id']
+        owner=str(r.resolve())
         print(json.dumps({'io.dockstride.owner':owner}))
     else:
         print(json.dumps([{'Spec':{'TaskTemplate':{'ContainerSpec':{'Secrets':[{'SecretName':(r/'consumer').read_text()}]}}}}]))
@@ -76,7 +78,7 @@ elif args[:1]==['inspect']:
 else: raise SystemExit(9)
 "#).unwrap();
         fs::set_permissions(root.join("bin/docker"), fs::Permissions::from_mode(0o700)).unwrap();
-        let directory = serde_json::to_string(&root.join("private")).unwrap();
+        let directory = serde_json::to_string(&temp.path().join("private")).unwrap();
         let uid = unsafe { libc::geteuid() };
         let gid = unsafe { libc::getegid() };
         let access = if rootless && user != "0" {
@@ -99,10 +101,10 @@ secrets=env.secrets,services.api={{image="alpine",user="{user}",secrets=["authKe
         )
         .unwrap();
         fs::write(root.join("rootless"), if rootless { "1" } else { "0" }).unwrap();
-        Self { temp }
+        Self { root:root.clone(), temp }
     }
     fn root(&self) -> &Path {
-        self.temp.path()
+        &self.root
     }
     fn command(&self, args: &[&str], stdin: Option<&[u8]>) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_dks"));
@@ -120,8 +122,8 @@ secrets=env.secrets,services.api={{image="alpine",user="{user}",secrets=["authKe
                 ),
             )
             .env("FIXTURE", self.root())
-            .env("HOME", self.root().join("home"))
-            .env("XDG_DATA_HOME", self.root().join("data"))
+            .env("HOME", self.temp.path().join("home"))
+            .env("XDG_DATA_HOME", self.temp.path().join("data"))
             .env(
                 "ROOTLESS",
                 fs::read_to_string(self.root().join("rootless")).unwrap(),
@@ -164,593 +166,188 @@ secrets=env.secrets,services.api={{image="alpine",user="{user}",secrets=["authKe
     fn env(&self) -> Value {
         serde_yaml::from_slice(&fs::read(self.root().join("env.yaml")).unwrap()).unwrap()
     }
-    fn history(&self) -> Value {
-        serde_json::from_slice(&fs::read(self.root().join(".dockstride/secrets.json")).unwrap())
-            .unwrap()
-    }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let user = format!("u{}", unsafe { libc::geteuid() });
-        for base in [
-            "private",
-            "data/dockstride/secrets",
-            "home/.local/share/dockstride/secrets",
-        ] {
-            let directory = self.root().join(base).join(&user);
-            if directory.exists() {
-                let _ = fs::set_permissions(directory, fs::Permissions::from_mode(0o700));
-            }
-        }
-    }
 }
 
 #[test]
-fn generate_once_missing_reference_fails_without_changing_credential() {
-    let fixture = Fixture::new(
-        "compose",
-        "lib.GenerateSecret {bytes=32,encoding=\"hex\"}",
-        "0",
-        false,
-    );
-    fixture.success(&["setup"], None);
-    let first = fixture.env()["secrets"]["authKey"].clone();
-    let path = first["file"].as_str().unwrap();
+fn generated_reference_and_bytes_survive_repeated_setup_and_disposable_state_removal() {
+    let f = Fixture::new("compose", "lib.GenerateSecret {bytes=32,encoding=\"hex\"}", "0", false);
+    f.success(&["setup"],None);
+    let first = f.env()["secrets"]["authKey"].clone();
+    let path = Path::new(first["file"].as_str().unwrap());
     let bytes = fs::read(path).unwrap();
-    fixture.success(&["setup"], None);
-    assert_eq!(fixture.env()["secrets"]["authKey"], first);
-    assert_eq!(fs::read(path).unwrap(), bytes);
-    assert_eq!(
-        fs::metadata(Path::new(path).parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o300
-    );
+    assert_eq!(bytes.len(),64);
+    assert!(!path.starts_with(f.root()));
+    assert_eq!(fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777,0o700);
+    fs::remove_dir_all(f.root().join(".dockstride")).unwrap();
+    f.success(&["setup"],None);
+    assert_eq!(f.env()["secrets"]["authKey"],first);
+    assert_eq!(fs::read(path).unwrap(),bytes);
     fs::remove_file(path).unwrap();
-    let failed = fixture.command(&["setup"], None);
-    assert!(!failed.status.success());
-    assert_eq!(fixture.env()["secrets"]["authKey"], first);
-    assert_eq!(fixture.history()["revisions"].as_array().unwrap().len(), 1);
+    assert!(!f.command(&["setup"],None).status.success());
+    assert_eq!(f.env()["secrets"]["authKey"],first);
 }
 
 #[test]
-fn replacement_is_atomic_reference_only_and_gc_checks_live_consumers() {
-    let fixture = Fixture::new(
-        "compose",
-        "lib.GenerateSecret {bytes=32,encoding=\"hex\"}",
-        "0",
-        false,
-    );
-    fixture.success(&["setup"], None);
-    let old = fixture.env()["secrets"]["authKey"].clone();
-    let secret = b"specific-sensitive-credential";
-    let output = fixture.command(&["secrets", "replace", "authKey", "--stdin"], Some(secret));
-    assert!(output.status.success());
-    for bytes in [
-        output.stdout,
-        output.stderr,
-        fs::read(fixture.root().join("env.yaml")).unwrap(),
-        fs::read(fixture.root().join(".dockstride/secrets.json")).unwrap(),
-        fs::read(fixture.root().join("docker-argv")).unwrap(),
-    ] {
-        assert!(!bytes.windows(secret.len()).any(|w| w == secret));
-    }
-    let new = fixture.env()["secrets"]["authKey"].clone();
-    assert_ne!(new, old);
-    assert_eq!(fs::read(new["file"].as_str().unwrap()).unwrap(), secret);
+fn replacement_keeps_old_material_and_never_discloses_new_bytes() {
+    let f = Fixture::new("compose", "lib.GenerateSecret {bytes=32,encoding=\"hex\"}", "0", false);
+    f.success(&["setup"],None);
+    let old = f.env()["secrets"]["authKey"].clone();
+    let bytes = b"specific-sensitive-credential";
+    let output = f.command(&["secrets","replace","authKey","--stdin"],Some(bytes));
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stdout));
+    let new = f.env()["secrets"]["authKey"].clone();
+    assert_ne!(old,new);
+    assert_eq!(fs::read(new["file"].as_str().unwrap()).unwrap(),bytes);
     assert!(Path::new(old["file"].as_str().unwrap()).exists());
-    let revision = fixture.history()["revisions"][0]["revision"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    fs::write(
-        fixture.root().join("consumer"),
-        old["file"].as_str().unwrap(),
-    )
-    .unwrap();
-    let failed = fixture.command(&["secrets", "gc", &revision, "--yes"], None);
-    assert!(!failed.status.success());
-    assert!(Path::new(old["file"].as_str().unwrap()).exists());
-    fs::remove_file(fixture.root().join("consumer")).unwrap();
-    fixture.success(&["secrets", "gc", &revision, "--yes"], None);
-    assert!(!Path::new(old["file"].as_str().unwrap()).exists());
-    assert!(Path::new(new["file"].as_str().unwrap()).exists());
-}
-
-#[test]
-fn symlink_and_unmarked_parent_are_not_adopted() {
-    let fixture = Fixture::new(
-        "compose",
-        "lib.GenerateSecret {bytes=32,encoding=\"hex\"}",
-        "0",
-        false,
-    );
-    fs::create_dir(fixture.root().join("unrelated")).unwrap();
-    symlink(
-        fixture.root().join("unrelated"),
-        fixture.root().join("private"),
-    )
-    .unwrap();
-    assert!(!fixture.command(&["setup"], None).status.success());
-    assert!(fixture.env().get("secrets").is_none());
-    fs::remove_file(fixture.root().join("private")).unwrap();
-    fs::create_dir(fixture.root().join("private")).unwrap();
-    assert!(!fixture.command(&["setup"], None).status.success());
-    assert!(!fixture.root().join("private/.dockstride-owner").exists());
-}
-
-#[test]
-fn nonroot_rootless_consumers_require_explicit_mapped_group_access() {
-    let fixture = Fixture::new(
-        "compose",
-        "lib.GenerateSecret {bytes=32,encoding=\"hex\"}",
-        "1000:0",
-        true,
-    );
-    fixture.success(&["setup"], None);
-    let path = fixture.env()["secrets"]["authKey"]["file"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert_eq!(
-        fs::metadata(path).unwrap().permissions().mode() & 0o777,
-        0o640
-    );
-    let wrong = Fixture::new(
-        "compose",
-        "lib.GenerateSecret {bytes=32,encoding=\"hex\"}",
-        "1000:1000",
-        true,
-    );
-    assert!(!wrong.command(&["setup"], None).status.success());
-}
-
-#[test]
-fn swarm_generation_requires_recovery_and_never_places_bytes_in_argv() {
-    let rejected = Fixture::new(
-        "swarm",
-        "lib.GenerateSecret {bytes=32,encoding=\"hex\"}",
-        "0",
-        false,
-    );
-    assert!(!rejected.command(&["setup"], None).status.success());
-    assert!(!rejected.root().join("last-secret-stdin").exists());
-    let fixture = Fixture::new(
-        "swarm",
-        "lib.GenerateSecret {bytes=32,encoding=\"hex\",durable=false}",
-        "0",
-        false,
-    );
-    fixture.success(&["setup"], None);
-    let bytes = fs::read(fixture.root().join("last-secret-stdin")).unwrap();
-    let reference = fixture.env()["secrets"]["authKey"].clone();
-    fixture.success(&["setup"], None);
-    assert_eq!(fixture.env()["secrets"]["authKey"], reference);
-    for path in ["docker-argv", "env.yaml", ".dockstride/secrets.json"] {
-        assert!(
-            !fs::read(fixture.root().join(path))
-                .unwrap()
-                .windows(bytes.len())
-                .any(|w| w == bytes)
-        );
+    for output in [output.stdout,output.stderr,fs::read(f.root().join("env.yaml")).unwrap(),fs::read(f.root().join("docker-argv")).unwrap()] {
+        assert!(!output.windows(bytes.len()).any(|window| window == bytes));
     }
-    fs::remove_file(
-        fixture
-            .root()
-            .join("fake-secrets")
-            .join(reference["name"].as_str().unwrap()),
-    )
-    .unwrap();
-    assert!(!fixture.command(&["setup"], None).status.success());
-    assert_eq!(fixture.env()["secrets"]["authKey"], reference);
+    assert!(!f.root().join(".dockstride/secrets.json").exists());
 }
 
 #[test]
-fn pending_owned_revision_recovers_without_generation_and_rotation_requires_procedure() {
-    let fixture = Fixture::new(
-        "compose",
-        "lib.GenerateSecret {bytes=32,encoding=\"hex\"}",
-        "0",
-        false,
-    );
-    fixture.success(&["setup"], None);
-    let reference = fixture.env()["secrets"]["authKey"].clone();
-    let mut history = fixture.history();
-    history["revisions"][0]["pending"] = json!(true);
-    fs::write(
-        fixture.root().join(".dockstride/secrets.json"),
-        serde_json::to_vec(&history).unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        fixture.root().join("env.yaml"),
-        "project: secret-fixture\nbackend: compose\n",
-    )
-    .unwrap();
-    fixture.success(&["setup"], None);
-    assert_eq!(fixture.env()["secrets"]["authKey"], reference);
-    assert_eq!(fixture.history()["revisions"][0]["pending"], false);
-    let output = fixture.command(
-        &["secrets", "replace", "authKey", "--stdin", "--apply"],
-        Some(b"must-not-be-committed"),
-    );
+fn original_file_input_is_never_copied_and_reuse_ignores_new_input() {
+    let f = Fixture::new("compose","lib.PromptSecret","0",false);
+    let provider = f.temp.path().join("provider");
+    fs::write(&provider,b"original-provider").unwrap();
+    fs::set_permissions(&provider,fs::Permissions::from_mode(0o600)).unwrap();
+    let input = format!("authKey={}",provider.display());
+    f.success(&["setup","--secret-file",&input],None);
+    assert_eq!(f.env()["secrets"]["authKey"],json!({"file":provider}));
+    f.success(&["setup","--secret-file","authKey=/missing-provider"],None);
+    assert!(!f.temp.path().join("private").exists());
+}
+
+#[test]
+fn swarm_generated_file_is_saved_before_failed_create_and_reused_on_retry() {
+    let f = Fixture::new("swarm","lib.GenerateSecret {bytes=32,encoding=\"hex\"}","0",false);
+    fs::write(f.root().join("creation-failure"),"").unwrap();
+    assert!(!f.command(&["setup"],None).status.success());
+    let source = f.env()["secrets"]["authKey"].clone();
+    let bytes = fs::read(source["file"].as_str().unwrap()).unwrap();
+    assert!(f.env()["_dockstride"]["swarmSecrets"]["authKey"].is_null());
+    fs::remove_file(f.root().join("creation-failure")).unwrap();
+    f.success(&["setup"],None);
+    assert_eq!(f.env()["secrets"]["authKey"],source);
+    assert_eq!(fs::read(f.root().join("last-secret-stdin")).unwrap(),bytes);
+    let binding = f.env()["_dockstride"]["swarmSecrets"]["authKey"].as_str().unwrap().to_owned();
+    assert_eq!(binding.len(),36);
+    let object: Value = serde_json::from_slice(&fs::read(f.root().join("fake-secrets").join(&binding)).unwrap()).unwrap();
+    assert_eq!(object["Spec"]["Labels"]["io.dockstride.owner"],json!(f.root().canonicalize().unwrap()));
+    fs::remove_dir_all(f.root().join(".dockstride")).unwrap();
+    f.success(&["setup"],None);
+    assert_eq!(f.env()["_dockstride"]["swarmSecrets"]["authKey"],binding);
+}
+
+#[test]
+fn missing_or_foreign_binding_is_not_automatically_republished_or_adopted() {
+    let f = Fixture::new("swarm","lib.GenerateSecret {bytes=32,encoding=\"hex\"}","0",false);
+    f.success(&["setup"],None);
+    let initial = f.env()["_dockstride"]["swarmSecrets"]["authKey"].as_str().unwrap().to_owned();
+    let object = f.root().join("fake-secrets").join(&initial);
+    fs::remove_file(&object).unwrap();
+    assert!(!f.command(&["setup"],None).status.success());
+    assert_eq!(f.env()["_dockstride"]["swarmSecrets"]["authKey"],initial);
+    f.success(&["secrets","sync","authKey","--yes"],None);
+    let current = f.env()["_dockstride"]["swarmSecrets"]["authKey"].as_str().unwrap().to_owned();
+    assert_ne!(initial,current);
+    let object = f.root().join("fake-secrets").join(&current);
+    let mut spec:Value = serde_json::from_slice(&fs::read(&object).unwrap()).unwrap();
+    spec["Spec"]["Labels"]["io.dockstride.owner"] = json!("foreign-checkout");
+    fs::write(&object,spec.to_string()).unwrap();
+    assert!(!f.command(&["setup"],None).status.success());
+    assert!(!f.command(&["secrets","sync","authKey","--yes"],None).status.success());
+    assert_eq!(f.env()["_dockstride"]["swarmSecrets"]["authKey"],current);
+}
+
+#[test]
+fn storage_symlinks_are_rejected_but_private_existing_directory_needs_no_marker() {
+    let f = Fixture::new("compose","lib.GenerateSecret {bytes=32,encoding=\"hex\"}","0",false);
+    fs::create_dir(f.temp.path().join("unrelated")).unwrap();
+    symlink(f.temp.path().join("unrelated"),f.temp.path().join("private")).unwrap();
+    assert!(!f.command(&["setup"],None).status.success());
+    fs::remove_file(f.temp.path().join("private")).unwrap();
+    fs::create_dir(f.temp.path().join("private")).unwrap();
+    fs::set_permissions(f.temp.path().join("private"),fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = f.temp.path().join("private").join(format!("u{}",unsafe{libc::geteuid()}));
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory,fs::Permissions::from_mode(0o300)).unwrap();
+    f.success(&["setup"],None);
+    assert_eq!(fs::metadata(&directory).unwrap().permissions().mode() & 0o777,0o300);
+    assert!(!f.temp.path().join("private/.dockstride-owner").exists());
+    fs::set_permissions(directory,fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn nonroot_rootless_consumers_require_declared_mapped_group() {
+    let f = Fixture::new("compose","lib.GenerateSecret {bytes=32,encoding=\"hex\"}","1000:0",true);
+    f.success(&["setup"],None);
+    assert_eq!(fs::metadata(f.env()["secrets"]["authKey"]["file"].as_str().unwrap()).unwrap().permissions().mode() & 0o777,0o640);
+    let wrong = Fixture::new("compose","lib.GenerateSecret {bytes=32,encoding=\"hex\"}","1000:1000",true);
+    assert!(!wrong.command(&["setup"],None).status.success());
+}
+
+#[test]
+fn unknown_inputs_and_missing_prompt_are_rejected_before_storage_publication() {
+    let f = Fixture::new("compose","lib.PromptSecret","0",false);
+    assert!(!f.command(&["setup","--secret-stdin","unknown"],Some(b"sensitive")).status.success());
+    let output = f.command(&["setup"],None);
     assert!(!output.status.success());
-    assert_eq!(fixture.env()["secrets"]["authKey"], reference);
+    let report:Value = serde_json::from_slice(output.stdout.split(|b| *b == b'\n').rfind(|line| !line.is_empty()).unwrap()).unwrap();
+    assert!(report["details"]["missingInputs"].is_array());
+    assert!(f.env().get("secrets").is_none());
 }
 
 #[test]
-fn swarm_recovery_backup_is_private_and_scope_change_does_not_adopt_same_name() {
-    let fixture = Fixture::new(
-        "swarm",
-        "lib.GenerateSecret {bytes=32,encoding=\"base64\",durable=false}",
-        "0",
-        false,
-    );
-    let recovery = fixture.root().join("recovery");
-    fs::create_dir(&recovery).unwrap();
-    fs::set_permissions(&recovery, fs::Permissions::from_mode(0o700)).unwrap();
-    let source = fs::read_to_string(fixture.root().join("compose.ncl"))
-        .unwrap()
-        .replace(
-            "durable=false",
-            &format!(
-                "recoveryFile={}",
-                serde_json::to_string(&recovery.join("credential-{revision}")).unwrap()
-            ),
-        );
-    fs::write(fixture.root().join("compose.ncl"), source).unwrap();
-    fixture.success(&["setup"], None);
-    let history = fixture.history();
-    let revision = history["revisions"][0]["revision"].as_str().unwrap();
-    let backup = recovery.join(format!("credential-{revision}"));
-    assert_eq!(
-        fs::read(&backup).unwrap(),
-        fs::read(fixture.root().join("last-secret-stdin")).unwrap()
-    );
-    assert_eq!(
-        fs::metadata(backup).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    let old = fixture.env()["secrets"]["authKey"].clone();
-    fs::write(fixture.root().join("cluster"), "cluster-b").unwrap();
-    assert!(!fixture.command(&["setup"], None).status.success());
-    assert_eq!(fixture.env()["secrets"]["authKey"], old);
-}
-
-#[test]
-fn secret_gc_plan_has_no_provisioning_or_environment_mutation() {
-    let fixture = Fixture::new(
-        "compose",
-        "lib.GenerateSecret {bytes=32,encoding=\"hex\"}",
-        "0",
-        false,
-    );
-    let before = fs::read(fixture.root().join("env.yaml")).unwrap();
-    fixture.success(&["secrets", "gc", "--plan"], None);
-    assert_eq!(fs::read(fixture.root().join("env.yaml")).unwrap(), before);
-    assert!(!fixture.root().join("private").exists());
-    assert!(!fixture.root().join(".dockstride").exists());
-}
-
-#[test]
-fn swarm_gc_refuses_foreign_labels_even_for_journaled_old_revision() {
-    let fixture = Fixture::new(
-        "swarm",
-        "lib.GenerateSecret {bytes=32,encoding=\"hex\",durable=false}",
-        "0",
-        false,
-    );
-    fixture.success(&["setup"], None);
-    let old = fixture.env()["secrets"]["authKey"].clone();
-    fixture.success(
-        &["secrets", "replace", "authKey", "--stdin"],
-        Some(b"replacement-known-secret"),
-    );
-    let revision = fixture.history()["revisions"][0]["revision"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let old_object = fixture
-        .root()
-        .join("fake-secrets")
-        .join(old["name"].as_str().unwrap());
-    let mut spec: Value = serde_json::from_slice(&fs::read(&old_object).unwrap()).unwrap();
-    spec["Spec"]["Labels"]["io.dockstride.owner"] = json!("foreign-owner");
-    fs::write(&old_object, serde_json::to_vec(&spec).unwrap()).unwrap();
-    assert!(
-        !fixture
-            .command(&["secrets", "gc", &revision, "--yes"], None)
-            .status
-            .success()
-    );
-    assert!(old_object.exists());
-    assert_ne!(fixture.env()["secrets"]["authKey"], old);
-}
-
-#[test]
-fn supplied_file_policy_rejects_traversal_and_never_copies_source_into_environment() {
-    let fixture = Fixture::new("compose", "lib.FileSecret \"input-key\"", "0", false);
-    let secret = b"from-private-file";
-    fs::write(fixture.root().join("input-key"), secret).unwrap();
-    fs::set_permissions(
-        fixture.root().join("input-key"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
-    fixture.success(&["setup"], None);
-    let path = fixture.env()["secrets"]["authKey"]["file"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert_eq!(fs::read(path).unwrap(), secret);
-    assert!(
-        !fs::read(fixture.root().join("env.yaml"))
-            .unwrap()
-            .windows(secret.len())
-            .any(|w| w == secret)
-    );
-    let rejected = Fixture::new("compose", "lib.FileSecret \"../input-key\"", "0", false);
-    assert!(!rejected.command(&["setup"], None).status.success());
-    assert!(rejected.env().get("secrets").is_none());
-}
-
-#[test]
-fn prompted_initial_secret_accepts_private_file_flag_and_reuses_reference_without_reading_new_input()
- {
-    let fixture = Fixture::new("compose", "lib.PromptSecret", "0", false);
-    let bytes = b"supplied-with-file-flag";
-    fs::write(fixture.root().join("input-key"), bytes).unwrap();
-    fs::set_permissions(
-        fixture.root().join("input-key"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
-    fixture.success(&["setup", "--secret-file", "authKey=input-key"], None);
-    let reference = fixture.env()["secrets"]["authKey"].clone();
-    assert_eq!(
-        fs::read(reference["file"].as_str().unwrap()).unwrap(),
-        bytes
-    );
-    fs::remove_file(fixture.root().join("input-key")).unwrap();
-    fixture.success(&["setup", "--secret-file", "authKey=input-key"], None);
-    assert_eq!(fixture.env()["secrets"]["authKey"], reference);
-    assert_eq!(fixture.history()["revisions"].as_array().unwrap().len(), 1);
-}
-
-#[test]
-fn prompted_initial_secret_accepts_stdin_flag_but_reuse_does_not_consume_empty_stdin() {
-    let fixture = Fixture::new("compose", "lib.PromptSecret", "0", false);
-    let bytes = b"supplied-with-stdin-flag";
-    let output = fixture.command(&["setup", "--secret-stdin", "authKey"], Some(bytes));
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let reference = fixture.env()["secrets"]["authKey"].clone();
-    assert_eq!(
-        fs::read(reference["file"].as_str().unwrap()).unwrap(),
-        bytes
-    );
-    assert!(!output.stdout.windows(bytes.len()).any(|w| w == bytes));
-    assert!(!output.stderr.windows(bytes.len()).any(|w| w == bytes));
-    fixture.success(&["setup", "--secret-stdin", "authKey"], Some(b""));
-    assert_eq!(fixture.env()["secrets"]["authKey"], reference);
-    assert_eq!(fixture.history()["revisions"].as_array().unwrap().len(), 1);
-    let replacement = fixture.command(&["secrets", "replace", "authKey"], None);
-    assert!(!replacement.status.success());
-    assert_eq!(fixture.env()["secrets"]["authKey"], reference);
-}
-
-#[test]
-fn unknown_initial_secret_flags_fail_and_unsupplied_prompt_is_structured_noninteractive_missing_input()
- {
-    let fixture = Fixture::new("compose", "lib.PromptSecret", "0", false);
-    let before = fs::read(fixture.root().join("env.yaml")).unwrap();
-    let unknown = fixture.command(
-        &["setup", "--secret-stdin", "notDeclared"],
-        Some(b"not-to-be-published"),
-    );
-    assert!(!unknown.status.success());
-    assert_eq!(fs::read(fixture.root().join("env.yaml")).unwrap(), before);
-    assert!(!fixture.root().join("private").exists());
-    let missing = fixture.command(&["setup"], None);
-    assert!(!missing.status.success());
-    let result: Value = serde_json::from_slice(
-        missing
-            .stdout
-            .split(|b| *b == b'\n')
-            .rfind(|line| !line.is_empty())
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(
-        result["details"]["missingInputs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|field| field["path"] == "secrets.authKey")
-    );
-    assert_eq!(fs::read(fixture.root().join("env.yaml")).unwrap(), before);
-}
-
-#[test]
-fn swarm_revision_names_fit_daemon_limit_without_losing_logical_identity_or_random_revision() {
-    let fixture = Fixture::new(
-        "swarm",
-        "lib.GenerateSecret {bytes=32,encoding=\"hex\",durable=false}",
-        "0",
-        false,
-    );
-    let project = format!("long-project-{}", "p".repeat(40));
-    let logical = format!("authKey{}", "s".repeat(100));
-    let source = fs::read_to_string(fixture.root().join("compose.ncl"))
-        .unwrap()
-        .replace("authKey", &logical);
-    fs::write(fixture.root().join("compose.ncl"), source).unwrap();
-    fs::write(
-        fixture.root().join("env.yaml"),
-        format!("project: {project}\nbackend: swarm\n"),
-    )
-    .unwrap();
-    fixture.success(&["setup"], None);
-    let env = fixture.env();
-    let name = env["secrets"][&logical]["name"].as_str().unwrap();
-    assert!(name.len() <= 64);
-    let history = fixture.history();
-    assert!(name.ends_with(history["revisions"][0]["revision"].as_str().unwrap()));
-    let spec: Value =
-        serde_json::from_slice(&fs::read(fixture.root().join("fake-secrets").join(name)).unwrap())
-            .unwrap();
-    assert_eq!(spec["Spec"]["Labels"]["io.dockstride.project"], project);
-    assert_eq!(spec["Spec"]["Labels"]["io.dockstride.secret"], logical);
-}
-
-#[test]
-fn secret_create_failure_retains_docker_status_and_useful_diagnostic_but_redacts_credentials() {
-    let fixture = Fixture::new("swarm", "lib.PromptSecret", "0", false);
-    fs::write(fixture.root().join("creation-failure"), "").unwrap();
-    let bytes = b"sensitive-request-body";
-    let encoded = b"c2Vuc2l0aXZlLXJlcXVlc3QtYm9keQ==";
-    let output = fixture.command(&["setup", "--secret-stdin", "authKey"], Some(bytes));
-    assert_eq!(output.status.code(), Some(4));
-    let result: Value = serde_json::from_slice(
-        output
-            .stdout
-            .split(|b| *b == b'\n')
-            .rfind(|line| !line.is_empty())
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(result["details"]["underlyingDockerStatus"], 42);
-    assert!(
-        result["message"]
-            .as_str()
-            .unwrap()
-            .contains("permission denied")
-    );
-    for stream in [&output.stdout, &output.stderr] {
-        assert!(!stream.windows(bytes.len()).any(|window| window == bytes));
-        assert!(
-            !stream
-                .windows(encoded.len())
-                .any(|window| window == encoded)
-        );
+fn external_boundary_rejects_checkout_repository_linked_worktree_and_symlinks() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    assert!(dockstride::secrets::ensure_external_path(&root,&root.join("secret")).is_err());
+    let repository = temp.path().join("other");
+    fs::create_dir(&repository).unwrap();
+    for marker in [false,true] {
+        if marker { fs::write(repository.join(".git"),"gitdir: /elsewhere").unwrap(); }
+        else { fs::create_dir(repository.join(".git")).unwrap(); }
+        assert!(dockstride::secrets::ensure_external_path(&root,&repository.join("future/secret")).is_err());
+        if marker { fs::remove_file(repository.join(".git")).unwrap(); }
+        else { fs::remove_dir(repository.join(".git")).unwrap(); }
     }
-    assert!(fixture.env().get("secrets").is_none());
-    assert_eq!(fixture.history()["revisions"][0]["pending"], true);
+    let safe = temp.path().join("safe");
+    fs::create_dir(&safe).unwrap();
+    assert!(dockstride::secrets::ensure_external_path(&root,&safe.join("future/secret")).is_ok());
+    let link = temp.path().join("link");
+    symlink(&safe,&link).unwrap();
+    assert!(dockstride::secrets::ensure_external_path(&root,&link.join("secret")).is_err());
 }
 
 #[test]
-fn declared_identity_defaults_select_the_secret_backend_without_yaml_copies() {
-    let fixture = Fixture::new(
-        "swarm",
-        "lib.GenerateSecret {bytes=32,encoding=\"hex\",durable=false}",
-        "0",
-        false,
-    );
-    let source = fs::read_to_string(fixture.root().join("compose.ncl"))
-        .unwrap()
-        .replace(
-            "project|String",
-            "project|String|default=\"default-production\"",
-        )
-        .replace(
-            "backend|lib.Backend|default=\"compose\"",
-            "backend|lib.Backend|default=\"swarm\"",
-        );
-    fs::write(fixture.root().join("compose.ncl"), source).unwrap();
-    fs::write(fixture.root().join("env.yaml"), "{}\n").unwrap();
-    fixture.success(&["setup"], None);
-    let reference = fixture.env()["secrets"]["authKey"].clone();
-    assert_eq!(reference["external"], true);
-    assert!(reference.get("file").is_none());
-    assert!(fixture.env().get("project").is_none());
-    assert!(fixture.env().get("backend").is_none());
-    let identity: Value = serde_json::from_slice(
-        &fs::read(fixture.root().join(".dockstride/identity.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(identity["project"], "default-production");
-    assert_eq!(identity["backend"], "swarm");
-    fixture.success(&["setup"], None);
-    assert_eq!(fixture.env()["secrets"]["authKey"], reference);
+fn default_generated_storage_uses_external_xdg_without_markers_or_home_fallback() {
+    let f=Fixture::new("compose","lib.GenerateSecret {bytes=32,encoding=\"hex\"}","0",false);
+    let source=fs::read_to_string(f.root().join("compose.ncl")).unwrap();
+    let declaration=format!("setup.secretDirectory={},",serde_json::to_string(&f.temp.path().join("private")).unwrap());
+    fs::write(f.root().join("compose.ncl"),source.replace(&declaration,"")).unwrap();
+    f.success(&["setup"],None);
+    let reference=f.env()["secrets"]["authKey"].clone();
+    let parent=f.temp.path().join("data/dockstride/secrets");
+    assert!(Path::new(reference["file"].as_str().unwrap()).starts_with(&parent));
+    assert!(!parent.join(".dockstride-owner").exists());
+    assert!(!f.temp.path().join("home/.local/share/dockstride").exists());
 }
 
 #[test]
-fn default_store_obeys_xdg_data_home_without_creating_a_home_store() {
-    let fixture = Fixture::new(
-        "compose",
-        "lib.GenerateSecret {bytes=32,encoding=\"hex\"}",
-        "0",
-        false,
-    );
-    let source = fs::read_to_string(fixture.root().join("compose.ncl")).unwrap();
-    let explicit = format!(
-        "setup.secretDirectory={},",
-        serde_json::to_string(&fixture.root().join("private")).unwrap()
-    );
-    assert!(source.contains(&explicit));
-    fs::write(
-        fixture.root().join("compose.ncl"),
-        source.replace(&explicit, ""),
-    )
-    .unwrap();
-    fixture.success(&["setup"], None);
-    let file = PathBuf::from(
-        fixture.env()["secrets"]["authKey"]["file"]
-            .as_str()
-            .unwrap(),
-    );
-    let expected = fixture
-        .root()
-        .join("data/dockstride/secrets")
-        .join(format!("u{}", unsafe { libc::geteuid() }));
-    assert_eq!(file.parent(), Some(expected.as_path()));
-    assert!(
-        !fixture
-            .root()
-            .join("home/.local/share/dockstride/secrets")
-            .exists()
-    );
-    assert_eq!(
-        fs::metadata(&expected).unwrap().permissions().mode() & 0o777,
-        0o300
-    );
-}
-
-#[test]
-fn rotation_preflight_rejects_invalid_or_inapplicable_actions_before_storage_publication() {
-    for invalid_prerequisite in [true, false] {
-        let fixture = Fixture::new("compose", "lib.GenerateSecret {bytes=32,encoding=\"hex\"}", "0", false);
-        let action = if invalid_prerequisite {
-            r#"{name="migration",kind="prerequisite",service="migrate",services=["migrate"],workflows=["rotate-auth"]}"#
-        } else {
-            r#"{name="unrelated",kind="command",argv=["true"],services=["other"],workflows=["rotate-auth"]}"#
-        };
-        let model = fs::read_to_string(fixture.root().join("compose.ncl")).unwrap();
-        fs::write(fixture.root().join("compose.ncl"), format!(r#"{model}
-& {{
-  dockstride = {{
-    setup.rotations.authKey = {{workflow="rotate-auth",services=["api"]}},
-    oneshots = ["migrate"],
-    actions = [{action}],
-  }},
-  services.api.depends_on.migrate.condition = "service_completed_successfully",
-  services.migrate = {{image="alpine",restart="no"}},
-  services.other.image = "alpine",
-}}
-"#)).unwrap();
-        fixture.success(&["setup"], None);
-        let reference = fixture.env()["secrets"]["authKey"].clone();
-        let history = fixture.history();
-        let bytes = fs::read(reference["file"].as_str().unwrap()).unwrap();
-        let result = fixture.command(&["secrets", "replace", "authKey", "--stdin", "--apply"], Some(b"must-not-be-published"));
-        assert!(!result.status.success());
-        assert_eq!(fixture.env()["secrets"]["authKey"], reference);
-        assert_eq!(fixture.history(), history);
-        assert_eq!(fs::read(reference["file"].as_str().unwrap()).unwrap(), bytes);
-    }
+fn existing_legacy_marker_and_credentials_are_neither_required_nor_deleted() {
+    let f=Fixture::new("compose","lib.GenerateSecret {bytes=32,encoding=\"hex\"}","0",false);
+    let parent=f.temp.path().join("private");
+    fs::create_dir(&parent).unwrap();
+    fs::set_permissions(&parent,fs::Permissions::from_mode(0o700)).unwrap();
+    let marker=parent.join(".dockstride-owner");
+    fs::write(&marker,b"old-marker-not-authority").unwrap();
+    fs::set_permissions(&marker,fs::Permissions::from_mode(0o600)).unwrap();
+    let old=parent.join("old-credential");
+    fs::write(&old,b"retained-private-material").unwrap();
+    fs::set_permissions(&old,fs::Permissions::from_mode(0o600)).unwrap();
+    f.success(&["setup"],None);
+    assert_eq!(fs::read(marker).unwrap(),b"old-marker-not-authority");
+    assert_eq!(fs::read(old).unwrap(),b"retained-private-material");
 }

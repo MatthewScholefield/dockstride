@@ -9,7 +9,7 @@ a = sys.argv[1:]
 s = json.loads((r / 'state.json').read_text())
 mode = (r / 'docker-mode').read_text().strip()
 backend = (r / 'backend').read_text().strip()
-owner = json.loads((r / '.dockstride/identity.json').read_text())['id']
+owner = str(r.resolve())
 def save(): (r / 'state.json').write_text(json.dumps(s))
 def labels(name):
     return {'io.dockstride.owner':owner,'io.dockstride.project':'diagnostic-fixture',
@@ -19,7 +19,8 @@ def row(name, c):
     label = labels(name)
     if mode == 'foreign': label['io.dockstride.owner'] = 'another-checkout'
     if backend == 'swarm':
-        label = {'com.docker.swarm.service.id':'serviceabc','com.docker.swarm.task.id':'taskabc'}
+        label = {'io.dockstride.owner':owner,'io.dockstride.project':'diagnostic-fixture',
+                 'com.docker.swarm.service.id':'serviceabc','com.docker.swarm.task.id':'taskabc'}
         if mode == 'foreign': label['io.dockstride.owner'] = 'another-checkout'
         if mode == 'wrong-task': label['com.docker.swarm.task.id'] = 'othertask'
     return {'Id':c['id'],'Config':{'Labels':label,'Env':['PASSWORD=must-not-leak']},
@@ -142,9 +143,6 @@ let env | contract = import "env.yaml" in
         fs::write(r.join("expected-proof"), "owned").unwrap();
         fs::write(r.join("backend"), backend).unwrap();
         let f = Self { temp };
-        dockstride::state::save(&r, "identity", &json!({"id":"fixture-owner","root":r,
-            "project":"diagnostic-fixture","backend":backend,
-            "context":"host;DOCKER_HOST=unix:///diagnostic-fixture.sock","resources":true})).unwrap();
         f.write_json("services.json", &json!({"db":{"image":"fixture"}}));
         f.write_json("actions.json", &json!([]));
         f.write_json("readiness.json", &json!({}));
@@ -243,21 +241,6 @@ fn doctor_exposes_only_owned_immutable_container_linkage() {
     }
 }
 
-#[test]
-fn replaced_daemon_cannot_supply_verified_ids_from_a_saved_registration() {
-    let f = Fixture::new("compose");
-    let setup = f.run(&["setup"]);
-    assert!(setup.status.success(), "{}", terminal(&setup));
-    f.write("docker-mode", "changed-daemon");
-    f.write("expected-proof", "blocked");
-    let output = f.run(&["doctor"]);
-    let record = terminal(&output);
-    assert!(output.status.success(), "{record}");
-    let report = &record["result"]["diagnostics"];
-    assert_eq!(report["findings"][0]["code"], "unverified-container-blocked", "{record}");
-    assert!(report["failures"].as_array().unwrap().iter().any(|row| row["stage"] == "observations"), "{record}");
-    assert!(!f.root().join("repair-ran").exists());
-}
 
 #[test]
 fn invalid_declarations_fail_before_starts_and_read_only_surfaces_do_not_dispatch() {

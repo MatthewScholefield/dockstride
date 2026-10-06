@@ -331,3 +331,51 @@ fn named_command_rejects_oversized_or_multiple_json_documents() {
         assert!(!dir.path().join("env.yaml").exists());
     }
 }
+
+#[test]
+fn removed_state_commands_and_selected_deploy_are_rejected_before_mutation() {
+    let dir = initialized();
+    let before = fs::read(dir.path().join("env.yaml")).unwrap();
+    for args in [
+        vec!["ports", "release", "--yes"],
+        vec!["ports", "gc", "--yes"],
+        vec!["env", "forget", ".", "--yes"],
+        vec!["env", "list", "--worktrees"],
+        vec!["secrets", "gc", "key", "--yes"],
+        vec!["deploy", "api"],
+    ] {
+        let output = cli(dir.path(), &args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert_eq!(fs::read(dir.path().join("env.yaml")).unwrap(), before);
+        assert!(!dir.path().join(".dockstride").exists());
+    }
+}
+
+#[test]
+fn setup_secret_preflight_uses_the_same_invocation_ordinary_inputs() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = initialized();
+    let external = tempfile::tempdir().unwrap();
+    let token = external.path().join("token");
+    fs::write(&token, b"private-original").unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(dir.path().join("compose.ncl"), r#"
+let lib = import "libs/dockstride.ncl" in
+let contract = {project | String, hostSecretGid | Number, secrets.token | lib.SecretSource} in
+let env | contract = import "env.yaml" in {
+  dockstride | not_exported = {Config = contract,
+    setup.secrets.token = lib.ReferenceSecret,
+    setup.secretAccess.token.gid = env.hostSecretGid},
+  name = env.project, secrets = env.secrets,
+  services.api = {image = "alpine", user = "0", secrets = ["token"]},
+}"#).unwrap();
+    let specification = format!("token={}", token.display());
+    let result = success(dir.path(), &["setup", "--plan", "--set", "project=preflight",
+        "--set", "hostSecretGid=1000", "--secret-file", &specification]);
+    assert_eq!(result["sideEffects"], false);
+    assert_eq!(result["providedSecretInputs"]["token"]["path"], token.to_str().unwrap());
+    assert!(!result.to_string().contains("private-original"));
+    assert_eq!(fs::read_to_string(dir.path().join("env.yaml")).unwrap(), "{}\n");
+    assert!(!dir.path().join(".dockstride").exists());
+}

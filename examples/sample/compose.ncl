@@ -9,7 +9,6 @@ let cfg = {
   containerGid | Number | doc "Rootless Docker group zero maps to the invoking user's host group." | default = 0,
   hostSecretUid | Number | doc "Explicit host owner of private secret files; set to id -u." | default = 1000,
   hostSecretGid | Number | doc "Explicit authorized host group; set to id -g." | default = 1000,
-  recoveryFile | String | doc "Private absolute Swarm backup path containing {revision}." | default = "",
   workerOnSeparateNode | Bool | doc "Constrain worker to a Swarm worker node when testing distribution." | default = false,
   swarmDirectNetworking | Bool | doc "Use host-mode API publication, DNS round-robin, and manager API placement instead of the IPVS routing mesh." | default = false,
   failHealth | Bool | default = false,
@@ -56,7 +55,7 @@ dc.ComposeFile {
     commands.devDefaults = { argv = ["python3", "dev-defaults.py"], timeoutSeconds = 30 },
     setup = {
       defaults = { command = "devDefaults", fields = ["project"], sources = true },
-      secrets.authKey = lib.GenerateSecret { bytes = 32, encoding = "hex", durable = true, recoveryFile = env.recoveryFile },
+      secrets.authKey = lib.GenerateSecret { bytes = 32, encoding = "hex" },
       secretAccess.authKey = { uid = env.hostSecretUid, gid = env.hostSecretGid },
       ports.apiPort = { service = "api", target = 8000, from = 49152, to = 65535 },
     },

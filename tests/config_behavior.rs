@@ -1,4 +1,4 @@
-use dockstride::{config, publication, state};
+use dockstride::{config, state};
 use serde_json::{Value, json};
 use std::fs;
 use std::sync::{Arc, Barrier};
@@ -30,15 +30,6 @@ let env | configContract = import "env.yaml" in
     directory
 }
 
-fn fixture_docker(root: &std::path::Path) -> String {
-    use std::os::unix::fs::PermissionsExt;
-    let bin = root.join("test-bin");
-    fs::create_dir_all(&bin).unwrap();
-    let docker = bin.join("docker");
-    fs::write(&docker, "#!/bin/sh\ncase \"$1\" in\n info) printf 'config-fixture-daemon\\n';;\n *) exit 0;;\nesac\n").unwrap();
-    fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
-    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
-}
 
 fn field(list: &Value, path: &str) -> Value {
     list["fields"]
@@ -165,26 +156,14 @@ fn simultaneous_edits_do_not_lose_each_others_fields() {
 }
 
 #[test]
-fn owned_resources_prevent_identity_and_backend_transitions() {
+fn project_and_backend_changes_are_ordinary_validated_edits() {
     let directory = fixture();
     let root = directory.path();
-    config::setup(
-        root,
-        &[
-            "project=app".into(),
-            "oauth.issuer=https://issuer.example".into(),
-        ],
-        true,
-    )
-    .unwrap();
-    state::ensure_identity(root, "app", "compose", "default").unwrap();
-    state::mark_resources(root, true).unwrap();
-    let original = fs::read(root.join("env.yaml")).unwrap();
-    assert!(config::set(root, "project", json!("other")).is_err());
-    assert!(config::set(root, "backend", json!("swarm")).is_err());
-    assert_eq!(fs::read(root.join("env.yaml")).unwrap(), original);
-    config::set(root, "apiPort", json!(9000)).unwrap();
-    assert_eq!(config::get(root, "apiPort").unwrap()["value"], 9000);
+    config::setup(root, &["project=app".into(), "oauth.issuer=example".into()], true).unwrap();
+    config::set(root, "project", json!("other")).unwrap();
+    config::set(root, "backend", json!("swarm")).unwrap();
+    assert_eq!(config::get(root, "project").unwrap()["value"], "other");
+    assert_eq!(config::get(root, "backend").unwrap()["value"], "swarm");
 }
 
 #[test]
@@ -271,41 +250,6 @@ fn complete_candidate_model_failure_does_not_overwrite_valid_environment() {
 }
 
 #[test]
-fn operational_identity_persists_and_journal_records_completed_phases() {
-    let directory = fixture();
-    let root = directory.path();
-    let first = state::ensure_identity(root, "app", "compose", "default").unwrap();
-    state::journal(
-        root,
-        "deploy",
-        &json!({"phase":"build","status":"complete"}),
-    )
-    .unwrap();
-    state::journal(root, "deploy", &json!({"phase":"apply","status":"started"})).unwrap();
-    assert_eq!(
-        state::ensure_identity(root, "app", "compose", "default").unwrap()["id"],
-        first["id"]
-    );
-    state::mark_resources(root, true).unwrap();
-    assert!(state::ensure_identity(root, "other", "compose", "default").is_err());
-    assert!(state::ensure_identity(root, "app", "compose", "other-context").is_err());
-    let events = state::journal_events(root, "deploy").unwrap();
-    assert_eq!(
-        events[0]["event"],
-        json!({"phase":"build","status":"complete"})
-    );
-    assert_eq!(
-        events[1]["event"],
-        json!({"phase":"apply","status":"started"})
-    );
-    state::mark_resources(root, false).unwrap();
-    assert_eq!(
-        state::ensure_identity(root, "app", "swarm", "default").unwrap()["id"],
-        first["id"]
-    );
-}
-
-#[test]
 fn record_replacement_cannot_remove_required_inputs_from_complete_environment() {
     let directory = fixture();
     let root = directory.path();
@@ -330,7 +274,7 @@ fn record_replacement_cannot_remove_required_inputs_from_complete_environment() 
 }
 
 #[test]
-fn lifecycle_lock_serializes_configuration_publication_and_identity_checks() {
+fn lifecycle_lock_serializes_configuration_edits() {
     let directory = fixture();
     let root = directory.path();
     config::setup(
@@ -339,213 +283,26 @@ fn lifecycle_lock_serializes_configuration_publication_and_identity_checks() {
         true,
     )
     .unwrap();
-    let home = root.join("isolated-home");
-    fs::create_dir(&home).unwrap();
-    let path = fixture_docker(root);
     let lifecycle = state::lock(root, "lifecycle").unwrap();
     let identity_root = root.to_owned();
-    let identity_home = home.clone();
-    let identity_path = path.clone();
     let (identity_tx, identity_rx) = std::sync::mpsc::channel();
     let identity_thread = std::thread::spawn(move || {
-        identity_tx
-            .send(std::process::Command::new(env!("CARGO_BIN_EXE_dks"))
-                .args(["--json", "--non-interactive", "-C"]).arg(identity_root)
-                .args(["config", "set", "project", "other"])
-                .env("PATH", identity_path).env_remove("DOCKER_CONTEXT")
-                .env("DOCKER_HOST", "unix:///config-fixture.sock")
-                .env("HOME", identity_home).output().unwrap().status.success()).unwrap();
+        identity_tx.send(config::set(&identity_root, "project", json!("other")).is_ok()).unwrap();
     });
     let port_root = root.to_owned();
-    let port_home = home;
     let (port_tx, port_rx) = std::sync::mpsc::channel();
     let port_thread = std::thread::spawn(move || {
-        port_tx
-            .send(std::process::Command::new(env!("CARGO_BIN_EXE_dks"))
-                .args(["--json", "--non-interactive", "-C"]).arg(port_root)
-                .args(["config", "set", "apiPort", "9091"])
-                .env("PATH", path).env_remove("DOCKER_CONTEXT")
-                .env("DOCKER_HOST", "unix:///config-fixture.sock")
-                .env("HOME", port_home).output().unwrap().status.success()).unwrap();
+        port_tx.send(config::set(&port_root, "apiPort", json!(9091)).is_ok()).unwrap();
     });
     let port_blocked = port_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err();
-    state::ensure_identity(root, "app", "compose", "host;DOCKER_HOST=unix:///config-fixture.sock").unwrap();
-    state::mark_resources(root, true).unwrap();
     drop(lifecycle);
     assert!(port_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
-    assert!(!identity_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+    assert!(identity_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
     port_thread.join().unwrap();
     identity_thread.join().unwrap();
     assert!(port_blocked, "configuration changed while lifecycle work held its guard");
-    assert_eq!(config::get(root, "project").unwrap()["value"], "app");
+    assert_eq!(config::get(root, "project").unwrap()["value"], "other");
     assert_eq!(config::get(root, "apiPort").unwrap()["value"], 9091);
-}
-
-#[test]
-fn secret_cluster_pinning_preserves_identity_and_rejects_cluster_changes() {
-    let directory = fixture();
-    let root = directory.path();
-    let original = state::ensure_identity(root, "app", "swarm", "default").unwrap();
-    state::pin_secret_cluster(root, "cluster-a").unwrap();
-    state::pin_secret_cluster(root, "cluster-a").unwrap();
-    assert!(state::pin_secret_cluster(root, "cluster-b").is_err());
-    let identity = state::read(root, "identity").unwrap();
-    assert_eq!(identity["id"], original["id"]);
-    assert_eq!(identity["secretCluster"], "cluster-a");
-}
-
-#[test]
-fn transition_probes_pinned_context_name_and_rejects_endpoint_retargeting() {
-    use std::os::unix::fs::PermissionsExt;
-    let directory = fixture();
-    let root = directory.path();
-    config::setup(
-        root,
-        &["project=app".into(), "oauth.issuer=example".into()],
-        true,
-    )
-    .unwrap();
-    state::ensure_identity(
-        root,
-        "app",
-        "compose",
-        "fixture;unix:///fixture-docker.sock",
-    )
-    .unwrap();
-    let bin = root.join("bin");
-    fs::create_dir(&bin).unwrap();
-    let docker = bin.join("docker");
-    fs::write(
-        &docker,
-        r#"#!/bin/sh
-if [ "$1" = "--context" ]; then
-  [ "$2" = "fixture" ] || exit 21
-  shift 2
-elif [ "$1" != "context" ]; then
-  exit 22
-fi
-if [ "$1" = "context" ] && [ "$2" = "show" ]; then printf 'fixture\n'; exit 0; fi
-if [ "$1" = "context" ] && [ "$2" = "inspect" ]; then
-  [ "$3" = "fixture" ] || exit 23
-  printf '%s\n' "$FIXTURE_DOCKER_ENDPOINT"
-  exit 0
-fi
-case "$1" in info) printf 'config-fixture-daemon\n';; ps|volume|network) exit 0;; *) exit 24;; esac
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
-    let launch = |name: &str, endpoint: &str| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_dks"))
-            .args([
-                "--json",
-                "--directory",
-                root.to_str().unwrap(),
-                "config",
-                "set",
-                "project",
-                name,
-            ])
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .env("HOME", root.join("isolated-home"))
-            .env_remove("DOCKER_CONTEXT")
-            .env_remove("DOCKER_HOST")
-            .env("FIXTURE_DOCKER_ENDPOINT", endpoint)
-            .output()
-            .unwrap()
-    };
-    let changed = launch("new-app", "unix:///fixture-docker.sock");
-    assert!(
-        changed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&changed.stderr)
-    );
-    assert_eq!(config::get(root, "project").unwrap()["value"], "new-app");
-    let original = fs::read(root.join("env.yaml")).unwrap();
-    assert!(
-        !launch("another-app", "unix:///different-docker.sock")
-            .status
-            .success()
-    );
-    assert_eq!(fs::read(root.join("env.yaml")).unwrap(), original);
-}
-
-#[test]
-fn state_inspection_rejects_symlinks_and_does_not_create_absent_state() {
-    use std::os::unix::fs::{PermissionsExt, symlink};
-    let directory = fixture();
-    let root = directory.path();
-    assert!(state::read(root, "identity").unwrap().is_null());
-    assert!(!root.join(".dockstride").exists());
-    state::save(root, "identity", &json!({"id":"trusted-owner"})).unwrap();
-    let foreign = root.join("foreign.json");
-    fs::write(&foreign, "{\"id\":\"foreign-owner\"}").unwrap();
-    fs::set_permissions(&foreign, fs::Permissions::from_mode(0o600)).unwrap();
-    fs::remove_file(root.join(".dockstride/identity.json")).unwrap();
-    symlink(&foreign, root.join(".dockstride/identity.json")).unwrap();
-    assert!(state::read(root, "identity").is_err());
-    fs::rename(root.join(".dockstride"), root.join("original-state")).unwrap();
-    symlink(root.join("original-state"), root.join(".dockstride")).unwrap();
-    assert!(state::read(root, "identity").is_err());
-}
-
-#[test]
-fn transition_probe_pins_previous_host_and_tls_but_cannot_transfer_to_current_context() {
-    use std::os::unix::fs::PermissionsExt;
-    let directory = fixture();
-    let root = directory.path();
-    config::setup(
-        root,
-        &["project=app".into(), "oauth.issuer=example".into()],
-        true,
-    )
-    .unwrap();
-    state::ensure_identity(
-        root,
-        "app",
-        "compose",
-        "host;DOCKER_HOST=tcp://original-host:2376",
-    )
-    .unwrap();
-    let bin = root.join("bin");
-    fs::create_dir(&bin).unwrap();
-    let docker = bin.join("docker");
-    fs::write(
-        &docker,
-        r#"#!/bin/sh
-[ -z "$DOCKER_CONTEXT" ] || exit 31
-[ "$DOCKER_HOST" = "tcp://original-host:2376" ] || exit 32
-[ "$DOCKER_TLS_VERIFY" = "1" ] || exit 33
-[ "$DOCKER_CERT_PATH" = "/fixture/certs" ] || exit 34
-case "$1" in info) printf 'config-fixture-daemon\n';; ps|volume|network) exit 0;; *) exit 35;; esac
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
-    let changed = std::process::Command::new(env!("CARGO_BIN_EXE_dks"))
-        .args([
-            "--json",
-            "--directory",
-            root.to_str().unwrap(),
-            "config",
-            "set",
-            "project",
-            "new-app",
-        ])
-        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-        .env("HOME", root.join("isolated-home"))
-        .env("DOCKER_CONTEXT", "different-context")
-        .env("DOCKER_HOST", "tcp://different-host:2376")
-        .env("DOCKER_TLS_VERIFY", "1")
-        .env("DOCKER_CERT_PATH", "/fixture/certs")
-        .output()
-        .unwrap();
-    assert!(
-        !changed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&changed.stderr)
-    );
-    assert_eq!(config::get(root, "project").unwrap()["value"], "app");
 }
 
 #[test]
@@ -769,7 +526,6 @@ fn editor_can_publish_concurrently_but_cannot_overwrite_the_new_configuration() 
         let root = directory.path();
         let home = root.join("home");
         fs::create_dir(&home).unwrap();
-        let path = fixture_docker(root);
         fs::write(
             root.join("env.yaml"),
             if shared {
@@ -813,7 +569,7 @@ finally:
             .arg(env!("CARGO_BIN_EXE_dks"))
             .arg(root)
             .env("HOME", &home)
-            .env("PATH", &path).env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_CONTEXT")
             .env("DOCKER_HOST", "unix:///config-fixture.sock")
             .env("EDITOR", format!("python3 {}", script.display()))
             .env("DKS_BINARY", env!("CARGO_BIN_EXE_dks"))
@@ -838,116 +594,51 @@ finally:
 }
 
 #[test]
-fn interrupted_source_and_setup_publications_recover_without_overwriting_edits() {
-    let directory = tempfile::tempdir().unwrap();
-    let result = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "config_publication_recovery_worker", "--nocapture"])
-        .env("DKS_CONFIG_PUBLICATION_HOME", directory.path())
-        .env("HOME", directory.path())
-        .output()
-        .unwrap();
-    assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+fn swarm_bindings_are_local_metadata_and_cannot_be_set_as_ordinary_fields() {
+    let directory = fixture();
+    let root = directory.path();
+    fs::write(root.join("env.yaml"), "project: app\noauth: {issuer: example}\n_dockstride:\n  swarmSecrets:\n    token: dks-0123456789abcdef0123456789abcdef\n").unwrap();
+    let snapshot = dockstride::sources::snapshot(root, None).unwrap();
+    assert!(snapshot.values.get("_dockstride").is_none());
+    assert_eq!(dockstride::sources::swarm_bindings(&snapshot.local).unwrap()["token"], "dks-0123456789abcdef0123456789abcdef");
+    let before = fs::read(root.join("env.yaml")).unwrap();
+    assert!(config::set(root, "_dockstride.swarmSecrets.token", json!("other")).is_err());
+    assert_eq!(fs::read(root.join("env.yaml")).unwrap(), before);
+    fs::write(root.join("shared.yaml"), "_dockstride:\n  swarmSecrets: {token: foreign}\n").unwrap();
+    assert!(config::sources_add(root, &root.join("shared.yaml"), false).is_err());
+    assert_eq!(fs::read(root.join("env.yaml")).unwrap(), before);
 }
 
 #[test]
-fn config_publication_recovery_worker() {
-    use std::os::unix::fs::PermissionsExt;
-    if std::env::var_os("DKS_CONFIG_PUBLICATION_HOME").is_none() {
-        return;
-    }
+fn malformed_swarm_binding_metadata_fails_before_yaml_changes() {
     let directory = fixture();
     let root = directory.path();
-    let source = root.join("shared.yaml");
-    let recovered = "# retained by recovery\nproject: recovered-project\noauth:\n  issuer: example\n_dockstride:\n  sources:\n    - path: shared.yaml\n";
-    {
-        let _lifecycle = state::lock(root, "lifecycle").unwrap();
-        let _global = state::global_lock().unwrap();
-        let _config = state::lock(root, "config").unwrap();
-        publication::stage_locked(root, "setup", vec![
-            publication::Change::create(&source, b"{}\n", 0o600).unwrap(),
-            publication::Change::replace(&root.join("env.yaml"), recovered.as_bytes(), 0o600).unwrap(),
-        ], json!({})).unwrap();
+    for map in ["{token: 42}", "{'invalid/name': valid}", "{token: 'invalid/name'}", "[]"] {
+        let text = format!("_dockstride:\n  swarmSecrets: {map}\n");
+        fs::write(root.join("env.yaml"), &text).unwrap();
+        assert!(config::set(root, "project", json!("app")).is_err());
+        assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), text);
     }
-    // Neither inspection nor a plan completes a staged operation or exposes its payload.
-    let summary = config::sources_list(root).unwrap();
-    assert_eq!(summary["pending"]["pending"], true);
-    assert!(!serde_json::to_string(&summary["pending"]).unwrap().contains("recovered-project"));
-    config::setup_plan_candidate(root, &[]).unwrap();
-    assert!(!source.exists());
-    assert!(!root.join("env.yaml").exists());
-    // Simulate interruption after the first create, before local selection publication.
-    fs::write(&source, "{}\n").unwrap();
-    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
-    let model = fs::read_to_string(root.join("compose.ncl")).unwrap();
-    fs::write(root.join("compose.ncl"), model.replace(
-        "dockstride | not_exported = { Config = configContract }",
-        "dockstride | not_exported = { Config = configContract, commands.defaults.argv = [\"cat\", \"invalid-response.json\"], setup.defaults = { command = \"defaults\", fields = [\"project\"], sources = true } }",
-    )).unwrap();
-    fs::write(root.join("invalid-response.json"), "invalid hook output").unwrap();
-    // Recovery must precede defaults discovery: the recovered values/selection
-    // satisfy the hook, so the intentionally invalid command is never needed.
-    config::setup(root, &[], true).unwrap();
-    assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), recovered);
-    assert_eq!(config::get(root, "project").unwrap()["value"], "recovered-project");
-    assert_eq!(config::sources_list(root).unwrap()["sources"][0]["resolved"], json!(source));
+}
 
-    let directory = fixture();
+#[test]
+fn required_nullable_values_remain_valid_ordinary_inputs() {
+    let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
-    let source = root.join("new-source.yaml");
-    let original = "# original\nproject: app\noauth:\n  issuer: example\n";
-    fs::write(root.join("env.yaml"), original).unwrap();
-    let selected = format!("{original}_dockstride:\n  sources:\n    - path: new-source.yaml\n");
-    {
-        let _lifecycle = state::lock(root, "lifecycle").unwrap();
-        let _global = state::global_lock().unwrap();
-        let _config = state::lock(root, "config").unwrap();
-        publication::stage_locked(root, "config-sources", vec![
-            publication::Change::create(&source, b"{}\n", 0o600).unwrap(),
-            publication::Change::replace(&root.join("env.yaml"), selected.as_bytes(), 0o600).unwrap(),
-        ], json!({})).unwrap();
-    }
-    fs::write(&source, "# external winner\napiPort: 9191\n").unwrap();
-    assert!(config::sources_add(root, &root.join("another.yaml"), true).is_err());
-    assert_eq!(fs::read_to_string(&source).unwrap(), "# external winner\napiPort: 9191\n");
-    assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), original);
-    assert!(!root.join("another.yaml").exists());
-    assert_eq!(config::sources_list(root).unwrap()["pending"]["pending"], true);
-    // Resolve the recorded transition explicitly and prove the next source
-    // mutation recovers before reading its local selection.
-    fs::write(&source, "{}\n").unwrap();
-    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
-    config::sources_remove(root, &source).unwrap();
-    assert_eq!(fs::read_to_string(&source).unwrap(), "{}\n");
-    assert_eq!(config::sources_list(root).unwrap()["sources"], json!([]));
-    assert!(fs::read_to_string(root.join("env.yaml")).unwrap().starts_with("# original\n"));
-
-    let directory = fixture();
-    let root = directory.path();
-    let source = root.join("generated-source.yaml");
-    let model = fs::read_to_string(root.join("compose.ncl")).unwrap();
-    fs::write(root.join("compose.ncl"), model.replace(
-        "dockstride | not_exported = { Config = configContract }",
-        "dockstride | not_exported = { Config = configContract, commands.defaults.argv = [\"python3\", \"hook.py\"], setup.defaults = { command = \"defaults\", fields = [\"project\"], sources = true } }",
-    ).replace("name = env.project", "name | String = if env.project == \"safe\" then env.project else 42")).unwrap();
-    fs::write(root.join("hook.py"), "import json, pathlib, sys\njson.load(sys.stdin)\nsys.stdout.buffer.write(pathlib.Path('response.json').read_bytes())\n").unwrap();
-    let response = |project: &str| {
-        fs::write(root.join("response.json"), serde_json::to_vec(&json!({
-            "schemaVersion": 1,
-            "values": {"project": project},
-            "sources": [{"path": source, "createIfMissing": true}],
-        })).unwrap()).unwrap();
-    };
-    response("invalid");
-    // A field-valid proposal can fail the completed operational model. Neither
-    // its proposed local values nor its empty source may escape that validation.
-    assert!(config::setup(root, &["oauth.issuer=example".into()], true).is_err());
-    assert!(!source.exists());
-    assert!(!root.join("env.yaml").exists());
-    response("safe");
-    config::setup(root, &["oauth.issuer=example".into()], true).unwrap();
-    assert_eq!(fs::read_to_string(&source).unwrap(), "{}\n");
-    assert_eq!(config::get(root, "project").unwrap()["value"], "safe");
-    assert_eq!(config::get(root, "oauth.issuer").unwrap()["value"], "example");
-    assert_eq!(config::sources_list(root).unwrap()["sources"][0]["resolved"], json!(source));
-    assert!(config::sources_list(root).unwrap()["pending"].is_null());
+    fs::write(root.join("compose.ncl"), r#"
+let contract = { project | String, setting | Dyn } in
+let env | contract = import "env.yaml" in {
+  dockstride | not_exported = { Config = contract },
+  name = env.project,
+  services.api.image = "nginx:alpine",
+}"#).unwrap();
+    fs::write(root.join("env.yaml"), "project: nullable\nsetting: null\n").unwrap();
+    assert_eq!(config::list(root).unwrap()["missing"], json!([]));
+    assert_eq!(config::setup(root, &[], true).unwrap()["complete"], true);
+    config::set(root, "setting", json!("value")).unwrap();
+    config::set(root, "setting", Value::Null).unwrap();
+    assert!(config::read_env(root).unwrap()["setting"].is_null());
+    let before = fs::read(root.join("env.yaml")).unwrap();
+    assert!(config::unset(root, "setting").is_err());
+    assert_eq!(fs::read(root.join("env.yaml")).unwrap(), before);
 }

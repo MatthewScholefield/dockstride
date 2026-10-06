@@ -3,11 +3,12 @@ use serde_json::{Value, json};
 
 fn project(service: Value, metadata: Value) -> Project {
     Project {
-        root: std::path::PathBuf::from("/path-that-does-not-exist"),
+        root: std::env::current_dir().unwrap().canonicalize().unwrap(),
         env: json!({"project":"scope-fixture","backend":"swarm"}),
         model: json!({"services":{"api":service}}),
         metadata,
         fields: Vec::new(),
+        swarm_secrets: Default::default(),
     }
 }
 fn output() -> Output {
@@ -23,15 +24,15 @@ fn incompatible_configuration_fails_before_touching_docker_or_state() {
         json!({"image":"registry.example/api","privileged":true}),
         json!({}),
     );
-    let error = deploy::deploy(&project, &[], false, 5, &output()).unwrap_err();
+    let error = deploy::deploy(&project, false, 5, &output()).unwrap_err();
     assert!(error.to_string().contains("privileged"));
 }
 
 #[test]
-fn selection_must_exist_even_for_readonly_plans() {
-    let project = project(json!({"image":"registry.example/api"}), json!({}));
-    let error = deploy::deploy(&project, &["database".into()], true, 5, &output()).unwrap_err();
-    assert!(error.to_string().contains("unknown service database"));
+fn digest_bearing_build_target_is_rejected_before_build_or_publication() {
+    let project = project(json!({"image":"registry.example/api@sha256:abc","build":"."}), json!({}));
+    let error = deploy::deploy(&project, true, 5, &output()).unwrap_err();
+    assert!(error.to_string().contains("build target cannot contain a digest"));
 }
 
 #[test]
@@ -43,23 +44,23 @@ fn compose_actions_are_rejected_before_swarm_publication() {
     ] {
         let directory = tempfile::tempdir().unwrap();
         let mut project = project(json!({"image":"registry.example/api"}), json!({"actions":[action],"oneshots":["api"]}));
-        project.root = directory.path().to_owned();
-        assert!(deploy::deploy(&project, &["api".into()], true, 5, &output()).is_err());
+        project.root = directory.path().canonicalize().unwrap();
+        assert!(deploy::deploy(&project, true, 5, &output()).is_err());
         assert!(!directory.path().join(".dockstride").exists());
     }
 }
 
 #[test]
-fn production_secrets_require_durable_external_references() {
+fn file_backed_swarm_secrets_require_a_current_binding() {
     let mut project = project(
         json!({"image":"registry.example/api","secrets":["key"]}),
         json!({}),
     );
     project.model["secrets"] = json!({"key":{"file":"/private/key"}});
-    let error = deploy::deploy(&project, &[], true, 5, &output()).unwrap_err();
+    let error = deploy::deploy(&project, true, 5, &output()).unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("external immutable provisioned reference")
+            .contains("binding")
     );
 }

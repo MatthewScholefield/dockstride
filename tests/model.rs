@@ -3,11 +3,12 @@ use serde_json::{Value, json};
 
 fn project(model: Value) -> Project {
     Project {
-        root: ".".into(),
+        root: std::fs::canonicalize(".").unwrap(),
         env: json!({"project":"adapter-check","backend":"swarm"}),
         model,
         metadata: json!({}),
         fields: vec![],
+        swarm_secrets: Default::default(),
     }
 }
 
@@ -62,4 +63,20 @@ fn ambiguous_or_invalid_project_identity_cannot_name_resources() {
         project.env["project"] = json!(name);
         assert!(project.name().is_err(), "{name}");
     }
+}
+
+#[test]
+fn swarm_file_sources_require_current_bindings_but_native_external_refs_do_not() {
+    let mut project = project(json!({
+        "services":{"api":{"image":"alpine","secrets":["token","native"]}},
+        "secrets":{"token":{"file":"/private/provider"},"native":{"external":true,"name":"provider-native"}}
+    }));
+    assert!(project.swarm().is_err());
+    project.swarm_secrets.insert("token".into(), "dks-current-object".into());
+    project.swarm_secrets.insert("unused".into(), "dks-unused-object".into());
+    let rendered = project.swarm().unwrap();
+    assert_eq!(rendered["secrets"]["token"], json!({"external":true,"name":"dks-current-object"}));
+    assert_eq!(rendered["secrets"]["native"], json!({"external":true,"name":"provider-native"}));
+    assert!(rendered["secrets"].get("unused").is_none());
+    assert_eq!(project.compose().unwrap()["secrets"]["token"], json!({"file":"/private/provider"}));
 }

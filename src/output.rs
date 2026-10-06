@@ -69,9 +69,6 @@ impl Output {
         details: Value,
     ) -> Result<()> {
         if !self.json {
-            if let Some(report) = details.get("ports") {
-                self.result(report)?;
-            }
             if let Some(report) = details.get("status") {
                 self.result(report)?;
             }
@@ -94,13 +91,18 @@ impl Output {
 }
 
 fn render_human(out: &mut impl Write, value: &Value) -> Result<bool> {
-    if matches!(value["operation"].as_str(), Some("ports-release" | "ports-gc")) {
-        return Ok(false);
+    if value["scope"] == "invoking-repository" {
+        writeln!(out, "Worktrees · {}", display_value(&value["status"]))?;
+        for worktree in value["worktrees"].as_array().into_iter().flatten() {
+            writeln!(out, "{}", display_value(&worktree["root"]))?;
+            writeln!(out, "  Configuration: {}", display_value(&worktree["configuration"]))?;
+        }
+        if let Some(error) = value.get("error") {
+            writeln!(out, "  {}", display_value(error))?;
+        }
+        return Ok(true);
     }
     if value["operation"] == "secrets-sync" {
-        if value["comparisonsDeferred"] == true {
-            writeln!(out, "Secret sync plan · credential comparisons deferred")?;
-        }
         for secret in value["secrets"].as_array().into_iter().flatten() {
             writeln!(out, "{:<22} {}", secret["name"].as_str().unwrap_or("?"),
                 secret["status"].as_str().unwrap_or("uncommitted"))?;
@@ -243,8 +245,8 @@ fn render_human(out: &mut impl Write, value: &Value) -> Result<bool> {
     if let Some(deployed) = value.get("deployed") {
         writeln!(out, "Deployed       {}", display_value(deployed))?;
         writeln!(out, "Context        {}", display_value(&value["context"]))?;
-        writeln!(out, "Revision       {}", display_value(&value["revision"]))?;
-        writeln!(out, "Snapshot       {}", display_value(&value["snapshot"]))?;
+        writeln!(out, "Services       {}", display_value(&value["services"]))?;
+        writeln!(out, "Convergence    {}", display_value(&value["convergence"]))?;
         writeln!(out, "Secrets        preserved")?;
         return Ok(true);
     }
@@ -274,7 +276,7 @@ fn render_human(out: &mut impl Write, value: &Value) -> Result<bool> {
     if let Some(secrets) = value.get("secrets").and_then(Value::as_array) {
         writeln!(
             out,
-            "{:<22} {:<12} {:<14} CONSUMERS / REVISION",
+            "{:<22} {:<12} {:<14} CONSUMERS",
             "SECRET", "BACKEND", "STATUS"
         )?;
         for secret in secrets {
@@ -288,25 +290,15 @@ fn render_human(out: &mut impl Write, value: &Value) -> Result<bool> {
                     });
             writeln!(
                 out,
-                "{:<22} {:<12} {:<14} {} / {}",
+                "{:<22} {:<12} {:<14} {}",
                 secret["name"].as_str().unwrap_or("?"),
                 secret["backend"].as_str().unwrap_or("configured"),
                 status,
                 secret
                     .get("consumers")
                     .map(display_value)
-                    .unwrap_or_default(),
-                secret["revision"].as_str().unwrap_or("-")
+                    .unwrap_or_default()
             )?;
-            if let Some(retained) = secret.get("retained").and_then(Value::as_array) {
-                for revision in retained {
-                    writeln!(
-                        out,
-                        "  retained     {}",
-                        revision["revision"].as_str().unwrap_or("?")
-                    )?;
-                }
-            }
         }
         return Ok(true);
     }

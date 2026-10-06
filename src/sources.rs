@@ -73,13 +73,15 @@ pub fn parse(text: &str, path: &Path) -> Result<Value> {
     ensure!(value.is_object(), "{} must contain a configuration mapping", path.display());
     crate::config::check_secrets(&value)?;
     descriptors(&value)?;
+    ensure!(value.pointer("/_dockstride/swarmSecrets").is_none(), "Swarm secret bindings must remain checkout-local, not in shared source {}", path.display());
     Ok(value)
 }
 
 pub fn descriptors(local: &Value) -> Result<Option<Vec<PathBuf>>> {
     let Some(metadata) = local.get("_dockstride") else { return Ok(None) };
     let metadata = metadata.as_object().context("_dockstride must be a mapping")?;
-    ensure!(metadata.keys().all(|key| key == "sources"), "unknown _dockstride metadata key");
+    ensure!(metadata.keys().all(|key| key == "sources" || key == "swarmSecrets"), "unknown _dockstride metadata key");
+    swarm_bindings(local)?;
     let Some(sources) = metadata.get("sources") else { return Ok(None) };
     let sources = sources.as_array().context("_dockstride.sources must be a list")?;
     sources.iter().map(|source| {
@@ -88,6 +90,17 @@ pub fn descriptors(local: &Value) -> Result<Option<Vec<PathBuf>>> {
         let path = descriptor["path"].as_str().filter(|path| !path.is_empty()).context("source path must be a nonempty string")?;
         Ok(PathBuf::from(path))
     }).collect::<Result<Vec<_>>>().map(Some)
+}
+
+/// Current immutable Docker objects, kept only in the local raw document.
+pub fn swarm_bindings(local: &Value) -> Result<BTreeMap<String, String>> {
+    let Some(bindings) = local.pointer("/_dockstride/swarmSecrets") else { return Ok(BTreeMap::new()); };
+    bindings.as_object().context("_dockstride.swarmSecrets must be a mapping")?.iter().map(|(name, object)| {
+        crate::secrets::valid_name(name)?;
+        let object = object.as_str().context("Swarm secret binding must be a Docker object name")?;
+        crate::secrets::valid_name(object)?;
+        Ok((name.clone(), object.to_owned()))
+    }).collect()
 }
 
 pub fn merge(target: &mut Value, overlay: &Value) {
@@ -150,6 +163,7 @@ fn resolve(snapshot: &mut EnvironmentSnapshot, file: &Path, value: Value, stack:
                 .with_context(|| format!("reading shared source {} declared by {}", canonical.display(), file.display()))?
         };
         crate::config::check_secrets(&child)?;
+        ensure!(child.pointer("/_dockstride/swarmSecrets").is_none(), "Swarm secret bindings must remain checkout-local, not in shared source {}", canonical.display());
         snapshot.shared_documents.insert(canonical.clone(), child.clone());
         snapshot.fingerprints.insert(canonical.clone(), fingerprint);
         if !snapshot.sources.contains(&canonical) { snapshot.sources.push(canonical.clone()); }
@@ -199,8 +213,7 @@ pub fn unchanged(snapshot: &EnvironmentSnapshot) -> Result<bool> {
 }
 
 /// Canonical identities, sorted independently of source declaration/precedence order.
-/// Caller first holds the invoking checkout's lifecycle, global environment/
-/// allocation, optional local allocation, and config coordination guards.
+/// Caller first holds the invoking checkout's lifecycle and config guards.
 /// Include the local document and every source in both the current and proposed
 /// graph. This acquires only canonical file guards, never another lifecycle lock.
 /// Verify the snapshot after acquisition before publishing any document.

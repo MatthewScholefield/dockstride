@@ -29,39 +29,38 @@ parent=$(dirname -- "$directory")
 ancestor=$parent
 while :; do
     [ ! -L "$ancestor" ] || fail "symlink ancestor: $ancestor"
+    [ -r "$ancestor" ] && [ -x "$ancestor" ] || fail "unreadable storage ancestry: $ancestor"
     [ "$(stat -c %u -- "$ancestor")" = 0 ] || fail "non-root-owned ancestor: $ancestor"
     mode=$(stat -c %a -- "$ancestor")
     [ $((0$mode & 0022)) -eq 0 ] || fail "group/world-writable ancestor: $ancestor"
+    [ ! -e "$ancestor/.git" ] && [ ! -L "$ancestor/.git" ] || fail "storage must be outside Git repositories: $ancestor"
     [ "$ancestor" != / ] || break
     ancestor=$(dirname -- "$ancestor")
 done
-marker=$directory/.dockstride-owner
 if [ -e "$directory" ] || [ -L "$directory" ]; then
     [ -d "$directory" ] && [ ! -L "$directory" ] || fail 'existing storage parent must not be a symlink'
+    [ ! -e "$directory/.git" ] && [ ! -L "$directory/.git" ] || fail 'storage parent is a Git repository'
     [ "$(stat -c %u -- "$directory")" = 0 ] && [ "$(stat -c %a -- "$directory")" = 755 ] || fail 'existing storage parent has incompatible ownership or mode; it will not be changed'
-    [ -f "$marker" ] && [ ! -L "$marker" ] || fail 'existing storage parent has no valid Dockstride marker; it will not be adopted'
-    [ "$(stat -c %u -- "$marker")" = 0 ] && [ "$(stat -c %a -- "$marker")" = 644 ] || fail 'incompatible marker ownership or permissions'
-    printf 'dockstride-private-secrets-v1\n' | cmp -s - "$marker" || fail 'incompatible storage marker'
 fi
 private=$directory/u$uid
 if [ -e "$private" ] || [ -L "$private" ]; then
     [ -d "$private" ] && [ ! -L "$private" ] || fail 'existing per-user path is not an ordinary directory'
-    [ "$(stat -c %u -- "$private")" = "$uid" ] && [ "$(stat -c %a -- "$private")" = 300 ] || fail 'existing per-user directory has incompatible ownership or mode; it will not be changed'
+    [ ! -e "$private/.git" ] && [ ! -L "$private/.git" ] || fail 'private storage path is a Git repository'
+    [ "$(stat -c %u -- "$private")" = "$uid" ] || fail 'existing per-user directory has incompatible ownership; it will not be changed'
+    mode=$(stat -c %a -- "$private")
+    [ $((0$mode & 0077)) -eq 0 ] && [ $((0$mode & 0300)) -eq 0300 ] || fail 'existing per-user directory is not private and owner-writable/traversable; it will not be changed'
 fi
 if [ "$plan" -eq 1 ]; then
-    printf 'Managed parent: %s (root:root 0755)\nMarker: %s (root:root 0644)\nPrivate directory: %s (%s:%s 0300)\nNo changes made.\n' "$directory" "$marker" "$private" "$uid" "$gid"
+    printf 'Managed parent: %s (root:root 0755)\nPrivate directory: %s (%s:%s 0700 when new)\nNo changes made.\n' "$directory" "$private" "$uid" "$gid"
     exit 0
 fi
 [ "$(id -u)" -eq 0 ] || fail 'run this explicit administrative operation with sudo; the CLI does not elevate itself'
 if [ ! -d "$directory" ]; then
     mkdir -m 0755 -- "$directory"
     chown 0:0 -- "$directory"
-    (umask 022; set -C; printf 'dockstride-private-secrets-v1\n' > "$marker")
-    chown 0:0 -- "$marker"
-    chmod 0644 -- "$marker"
 fi
 if [ ! -d "$private" ]; then
-    mkdir -m 0300 -- "$private"
+    mkdir -m 0700 -- "$private"
     chown "$uid:$gid" -- "$private"
 fi
 printf 'Secret storage ready: %s\nSet dockstride.setup.secretDirectory = "%s" in compose.ncl.\n' "$private" "$directory"

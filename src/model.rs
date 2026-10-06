@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::path::PathBuf;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Field {
@@ -20,9 +21,15 @@ pub struct Project {
     pub model: Value,
     pub metadata: Value,
     pub fields: Vec<Field>,
+    pub swarm_secrets: BTreeMap<String, String>,
 }
 
 impl Project {
+    /// Evaluation establishes the canonical absolute root once per project.
+    pub fn owner(&self) -> Result<&str> {
+        self.root.to_str().context("checkout path is not UTF-8; move the checkout to a UTF-8 path")
+    }
+
     pub fn name(&self) -> Result<&str> {
         let name = self
             .env
@@ -121,6 +128,16 @@ impl Project {
             }
             if service.get("image").and_then(Value::as_str).is_none() {
                 bail!("services.{name}.image is required for Swarm; Swarm does not build images");
+            }
+        }
+        if let Some(secrets) = record.get_mut("secrets").and_then(Value::as_object_mut) {
+            for (name, reference) in secrets {
+                if reference.get("file").is_some() {
+                    let binding = self.swarm_secrets.get(name).with_context(|| format!(
+                        "Swarm secret {name} has no local binding; run dks setup or dks secrets sync {name} --yes"
+                    ))?;
+                    *reference = json!({"external":true,"name":binding});
+                }
             }
         }
         Ok(model)

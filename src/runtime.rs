@@ -3,10 +3,11 @@ use crate::{model::Project, output::Output, state};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+#[cfg(test)]
+use std::fs;
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     ffi::OsString,
-    fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, UdpSocket},
     path::{Path, PathBuf},
@@ -21,20 +22,14 @@ use std::{
 
 const OWNER: &str = "io.dockstride.owner";
 const PROJECT: &str = "io.dockstride.project";
-static MANAGED_INVOCATION: AtomicBool = AtomicBool::new(false);
-static INVOCATION_DOCKER: LazyLock<Arc<DockerEnvironment>> = LazyLock::new(|| Arc::new(DockerEnvironment {
-    values: DOCKER_ENV.map(std::env::var_os),
-    connection: OnceLock::new(),
-}));
+static INVOCATION_DOCKER: OnceLock<Arc<DockerEnvironment>> = OnceLock::new();
 
 /// Pin one CLI invocation without contacting Docker or forcing configuration.
 pub fn pin_invocation() {
-    LazyLock::force(&INVOCATION_DOCKER);
-    MANAGED_INVOCATION.store(true, Ordering::Relaxed);
-}
-
-pub(crate) fn managed_invocation() -> bool {
-    MANAGED_INVOCATION.load(Ordering::Relaxed)
+    let _ = INVOCATION_DOCKER.set(Arc::new(DockerEnvironment {
+        values: DOCKER_ENV.map(std::env::var_os),
+        connection: OnceLock::new(),
+    }));
 }
 static CANCEL: LazyLock<std::result::Result<Arc<AtomicBool>, String>> = LazyLock::new(|| {
     let flag = Arc::new(AtomicBool::new(false));
@@ -291,14 +286,12 @@ impl Docker {
             output,
             deadline: None,
             profiles: None,
-            environment: if managed_invocation() {
-                Arc::clone(&INVOCATION_DOCKER)
-            } else {
+            environment: INVOCATION_DOCKER.get().cloned().unwrap_or_else(|| {
                 Arc::new(DockerEnvironment {
                     values: DOCKER_ENV.map(std::env::var_os),
                     connection: OnceLock::new(),
                 })
-            },
+            }),
         }
     }
     pub(crate) fn with_deadline(&self, deadline: Instant) -> Self {
@@ -455,27 +448,6 @@ impl Docker {
             }
         }
         Ok(())
-    }
-    fn recorded_command(&self, fingerprint: &str) -> Result<Command> {
-        let (name, endpoint) = fingerprint
-            .split_once(';')
-            .context("Recorded Docker connection lacks an endpoint fingerprint")?;
-        let mut command = self.base_command();
-        command
-            .env_remove("DOCKER_CONTEXT")
-            .env_remove("DOCKER_HOST");
-        if let Some(host) = endpoint.strip_prefix("DOCKER_HOST=") {
-            ensure!(!host.is_empty(), "Recorded Docker host is empty");
-            command.env("DOCKER_HOST", host);
-        } else {
-            let current = self.named_connection(name.to_owned())?;
-            ensure!(
-                current.fingerprint == fingerprint,
-                "Recorded Docker context endpoint changed; refusing to query a different daemon"
-            );
-            command.args(["--context", name]);
-        }
-        Ok(command)
     }
     pub fn capture(&self, args: &[String], stdin: Option<&[u8]>) -> Result<String> {
         self.capture_timeout(args, stdin, 300)
@@ -692,18 +664,6 @@ impl Docker {
         )
     }
 }
-pub fn connection_fingerprint(root: &Path) -> Result<String> {
-    Docker::new(root, Output::default()).context()
-}
-pub fn pinned_command(root: &Path, fingerprint: &str) -> Result<Command> {
-    Docker::new(root, Output::default()).recorded_command(fingerprint)
-}
-pub fn capture_pinned(root: &Path, fingerprint: &str, args: &[String]) -> Result<String> {
-    let docker = Docker::new(root, Output::default());
-    let mut command = docker.recorded_command(fingerprint)?;
-    command.args(args);
-    docker.capture_command(args, command, None, 30)
-}
 fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).to_owned()).collect()
 }
@@ -719,55 +679,12 @@ pub fn compose_args(project: &Project, file: &Path) -> Result<Vec<String>> {
     ])
 }
 
-fn check_ownership(project: &Project, docker: &Docker, creating: bool) -> Result<Value> {
-    check_ownership_with_identity(project, docker, creating, None)
-}
-
-/// Verify proposed ownership without publishing or temporarily changing identity.
-pub(crate) fn check_registry_resources(project: &Project, docker: &Docker, owner: &str) -> Result<Value> {
-    let identity = json!({"id":owner,"project":project.name()?,"backend":project.backend()?,
-        "context":docker.context()?,"root":fs::canonicalize(&project.root)?,"resources":false});
-    check_ownership_with_identity(project, docker, true, Some(&identity))
-}
-
-fn check_ownership_with_identity(project: &Project, docker: &Docker, creating: bool, proposed: Option<&Value>) -> Result<Value> {
-    let context = docker.context()?;
-    let root = fs::canonicalize(&project.root)?
-        .to_string_lossy()
-        .into_owned();
-    let mut identity = match proposed {
-        Some(identity) => identity.clone(),
-        None => state::read(&project.root, "identity")?,
-    };
-    let missing = identity.get("id").and_then(Value::as_str).is_none();
-    if missing {
-        ensure!(
-            creating,
-            "No Dockstride ownership identity: refusing to operate on resources by project name alone"
-        );
-        identity = json!({"id":"","project":project.name()?,"backend":project.backend()?,"context":context,"root":root,"resources":false});
-    } else {
-        ensure!(
-            identity["root"].as_str() == Some(root.as_str()),
-            "This environment identity belongs to another checkout; create a separately configured environment"
-        );
-        ensure!(
-            identity["project"].as_str() == Some(project.name()?)
-                && identity["backend"].as_str() == Some(project.backend()?),
-            "Project/backend differs from persisted identity; an explicit transition is required"
-        );
-        if identity["context"].as_str().is_some_and(|s| !s.is_empty()) {
-            ensure!(
-                identity["context"].as_str() == Some(context.as_str()),
-                "Docker context differs from the environment's recorded context; refusing cross-context operations"
-            );
-        } else {
-            identity["context"] = json!(context);
-        }
-    }
-    let id = identity["id"].as_str().unwrap().to_owned();
+/// Check the selected Docker target against this checkout's canonical path.
+pub fn validate_ownership(project: &Project, docker: &Docker) -> Result<()> {
+    let id = project.owner()?;
     let name = project.name()?;
     let swarm = project.backend()? == "swarm";
+    let model = project.compose()?;
     for (kind, filter, listing) in [
         ("container", "com.docker.compose.project", vec!["ps", "-aq"]),
         (
@@ -788,6 +705,17 @@ fn check_ownership_with_identity(project: &Project, docker: &Docker, creating: b
         };
         let found = namespace_resources(docker, &listing, name, filters)?;
         for resource in &found {
+            let field = if kind == "volume" { "volumes" } else { "networks" };
+            if kind != "container"
+                && let Some(definitions) = model[field].as_object()
+                && definitions.values().any(|definition| definition["external"] == true)
+            {
+                let actual_name = docker.capture(&strings(&[kind, "inspect", resource, "--format", "{{.Name}}"]), None)?;
+                if definitions.iter().any(|(logical, definition)| definition["external"] == true
+                    && definition["name"].as_str().unwrap_or(logical) == actual_name.trim()) {
+                    continue;
+                }
+            }
             let labels = docker.capture(
                 &strings(&[
                     kind,
@@ -803,38 +731,18 @@ fn check_ownership_with_identity(project: &Project, docker: &Docker, creating: b
                 None,
             )?;
             let labels: Value = serde_json::from_str(&labels)?;
-            let mut owned = labels[OWNER].as_str() == Some(&id);
-            if !owned && swarm && kind == "container" && labels.get(OWNER).is_none()
-                && let (Some(service_id), Some(task_id)) = (
-                    labels["com.docker.swarm.service.id"].as_str(),
-                    labels["com.docker.swarm.task.id"].as_str(),
-                )
-            {
-                let service: Value = serde_json::from_str(&docker.capture(
-                    &strings(&["service", "inspect", service_id]), None,
-                )?)?;
-                let task: Value = serde_json::from_str(&docker.capture(
-                    &strings(&["inspect", "--type", "task", task_id]), None,
-                )?)?;
-                let container_id = docker.capture(
-                    &strings(&["container", "inspect", resource, "--format", "{{.Id}}"]), None,
-                )?;
-                owned = service[0]["ID"].as_str() == Some(service_id)
-                    && service[0]["Spec"]["Labels"][OWNER].as_str() == Some(&id)
-                    && service[0]["Spec"]["Labels"][PROJECT].as_str() == Some(name)
-                    && task[0]["ID"].as_str() == Some(task_id)
-                    && task[0]["ServiceID"].as_str() == Some(service_id)
-                    && task[0]["Status"]["ContainerStatus"]["ContainerID"].as_str()
-                        == Some(container_id.trim());
+            if !filters.iter().any(|filter| labels[*filter].as_str() == Some(name)) {
+                continue;
             }
+            let owned = labels[OWNER].as_str() == Some(id)
+                && labels[PROJECT].as_str() == Some(name);
             ensure!(
                 owned,
-                "Unrelated {kind} {resource} uses project {}; refusing to reuse or delete it",
-                project.name()?
+                "Foreign {kind} {resource} occupies project {name}; observed owner {:?}, expected {id}",
+                labels[OWNER].as_str()
             );
         }
     }
-    let model = project.compose()?;
     for (field, kind) in [("volumes", "volume"), ("networks", "network")] {
         let mut definitions = model[field].as_object().cloned().unwrap_or_default();
         if field == "networks" && !definitions.contains_key("default") {
@@ -856,8 +764,8 @@ fn check_ownership_with_identity(project: &Project, docker: &Docker, creating: b
                     None,
                 )?)?;
                 ensure!(
-                    !id.is_empty() && labels[OWNER].as_str() == Some(&id),
-                    "Unrelated {kind} {expected} occupies a declared managed resource name; use external=true for intentional sharing"
+                    labels[OWNER].as_str() == Some(id) && labels[PROJECT].as_str() == Some(name),
+                    "Foreign {kind} {expected} occupies a declared managed resource name; observed owner {:?}, expected {id}", labels[OWNER].as_str()
                 );
             }
         }
@@ -872,53 +780,52 @@ fn check_ownership_with_identity(project: &Project, docker: &Docker, creating: b
             "Selected Docker context is not an active Swarm"
         );
         for kind in ["service", "secret", "config"] {
-            let resources = namespace_resources(docker, &[kind, "ls", "-q"], name,
-                &["com.docker.stack.namespace", PROJECT])?;
+            let filters: &[&str] = if kind == "secret" {
+                &["com.docker.stack.namespace"]
+            } else { &["com.docker.stack.namespace", PROJECT] };
+            let resources = namespace_resources(docker, &[kind, "ls", "-q"], name, filters)?;
             for resource in &resources {
                 let labels: Value = serde_json::from_str(&docker.capture(
                     &strings(&[kind, "inspect", resource, "--format", "{{json .Spec.Labels}}"]),
                     None,
                 )?)?;
-                ensure!(labels[OWNER].as_str() == Some(&id),
-                    "Unrelated Swarm {kind} {resource} occupies stack {name}");
+                if !filters.iter().any(|filter| labels[*filter].as_str() == Some(name)) {
+                    continue;
+                }
+                ensure!(labels[OWNER].as_str() == Some(id) && labels[PROJECT].as_str() == Some(name),
+                    "Foreign Swarm {kind} {resource} occupies stack {name}; observed owner {:?}, expected {id}", labels[OWNER].as_str());
+            }
+        }
+        if let Some(secrets) = model["secrets"].as_object()
+            && project.swarm_secrets.keys().any(|logical| secrets.get(logical).is_some_and(|reference| reference.get("file").is_some()))
+        {
+            let existing = docker.capture(&strings(&["secret", "ls", "--format", "{{.Name}}"]), None)?;
+            let existing: HashSet<&str> = existing.lines().collect();
+            for (logical, binding) in &project.swarm_secrets {
+                if !secrets.get(logical).is_some_and(|reference| reference.get("file").is_some())
+                    || !existing.contains(binding.as_str()) {
+                    continue;
+                }
+                let labels: Value = serde_json::from_str(&docker.capture(
+                    &strings(&["secret", "inspect", binding, "--format", "{{json .Spec.Labels}}"]), None)?)?;
+                ensure!(labels[OWNER].as_str() == Some(id) && labels[PROJECT].as_str() == Some(name)
+                    && labels["io.dockstride.secret"].as_str() == Some(logical),
+                    "Foreign Swarm secret {binding} occupies current binding {logical}; observed owner {:?}, expected {id}",
+                    labels[OWNER].as_str());
             }
         }
     }
-    Ok(identity)
-}
-/// The invoking checkout lifecycle lock must already be held.
-pub(crate) fn recover_publication(root: &Path) -> Result<()> {
-    let _global = state::global_lock()?;
-    let _config = state::lock(root, "config")?;
-    crate::publication::recover_locked(root)?;
     Ok(())
-}
-
-/// The invoking checkout lifecycle lock must already be held.
-pub fn validate_ownership(project: &Project, docker: &Docker, creating: bool) -> Result<String> {
-    let _global = state::global_lock()?;
-    let _config = state::lock(&project.root, "config")?;
-    crate::publication::recover_locked(&project.root)?;
-    let snapshot = crate::sources::snapshot(&project.root, None)?;
-    let _sources = crate::sources::lock_paths(snapshot.fingerprints.keys().cloned())?;
-    snapshot.verify()?;
-    if !creating {
-        ensure!(state::read(&project.root, "identity")?["id"].as_str().is_some(),
-            "No Dockstride ownership identity: refusing to operate on resources by project name alone");
-    }
-    let registration = crate::registry::prepare_with_docker(project, &snapshot.sources, docker, None)?;
-    snapshot.verify()?;
-    crate::publication::publish(&project.root, "register-environment", registration.changes, registration.claims)?;
-    Ok(registration.owner_id)
 }
 pub fn doctor(project: &Project, output: &Output) -> Result<Value> {
     let docker = Docker::new(&project.root, output.clone());
-    let checked = check_ownership(project, &docker, true)?;
+    validate_ownership(project, &docker)?;
+    let context = docker.context()?;
     if project.backend()? == "compose" {
         detect_ports(project, &[], &docker)?;
     }
     Ok(
-        json!({"ownership":"unambiguous","context":checked["context"],"ports":"no detected conflicts","remotePortCaveat":!local_context(checked["context"].as_str().unwrap_or(""))}),
+        json!({"ownership":"unambiguous","context":context,"ports":"no detected conflicts","remotePortCaveat":!local_context(&context)}),
     )
 }
 fn add_labels(record: &mut Value, id: &str, name: &str) -> Result<()> {
@@ -948,19 +855,7 @@ pub fn render_document(project: &Project, target: &str) -> Result<Value> {
         "swarm" => project.swarm()?,
         _ => bail!("Unknown render target {target}"),
     };
-    let identity = state::read(&project.root, "identity")?;
-    let Some(id) = identity["id"].as_str() else {
-        return Ok(model);
-    };
-    let root = fs::canonicalize(&project.root)?
-        .to_string_lossy()
-        .into_owned();
-    ensure!(
-        identity["root"].as_str() == Some(root.as_str())
-            && identity["project"].as_str() == Some(project.name()?)
-            && identity["backend"].as_str() == Some(project.backend()?),
-        "Rendered environment differs from its recorded ownership identity"
-    );
+    let id = project.owner()?;
     for service in model["services"]
         .as_object_mut()
         .context("Missing services")?
@@ -982,6 +877,9 @@ pub fn render_document(project: &Project, target: &str) -> Result<Value> {
             model[field] = json!({"default":{}});
         }
         if let Some(resources) = model.get_mut(field).and_then(Value::as_object_mut) {
+            if field == "networks" {
+                resources.entry("default").or_insert_with(|| json!({}));
+            }
             for resource in resources.values_mut() {
                 if resource.is_null() {
                     *resource = json!({});
@@ -994,20 +892,16 @@ pub fn render_document(project: &Project, target: &str) -> Result<Value> {
     }
     Ok(model)
 }
-pub fn write_render(project: &Project, target: &str) -> Result<PathBuf> {
-    ensure!(
-        state::read(&project.root, "identity")?["id"]
-            .as_str()
-            .is_some(),
-        "Ownership identity must be validated before rendering an executable snapshot"
-    );
+pub fn write_render(project: &Project, target: &str) -> Result<tempfile::NamedTempFile> {
     let model = render_document(project, target)?;
-    let path = project
-        .root
-        .join(".dockstride")
-        .join(format!("render-{target}.yaml"));
-    state::atomic_write(&path, serde_yaml::to_string(&model)?.as_bytes(), 0o600)?;
-    Ok(path)
+    state::prepare(&project.root)?;
+    let mut file = tempfile::Builder::new()
+        .prefix(&format!("render-{target}-"))
+        .suffix(".yaml")
+        .tempfile_in(project.root.join(".dockstride"))?;
+    file.write_all(serde_yaml::to_string(&model)?.as_bytes())?;
+    file.flush()?;
+    Ok(file)
 }
 
 struct Dependency<'a> {
@@ -1066,17 +960,12 @@ fn valid_profile(name: &str) -> bool {
     bytes.next().is_some_and(|byte| byte.is_ascii_alphanumeric())
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
 }
-fn active_profiles(project: &Project, flags: &[String], saved_fallback: bool) -> Result<Vec<String>> {
+fn active_profiles(flags: &[String]) -> Result<Vec<String>> {
     let environment = std::env::var_os("COMPOSE_PROFILES");
     let mut profiles: BTreeSet<String> = flags.iter().cloned().collect();
     if let Some(value) = &environment {
         let value = value.to_str().context("COMPOSE_PROFILES must be UTF-8")?;
         profiles.extend(value.split(',').map(str::trim).filter(|name| !name.is_empty()).map(str::to_owned));
-    } else if flags.is_empty() && saved_fallback {
-        let operation = state::read(&project.root, "operation")?;
-        if let Some(saved) = operation.get("appliedProfiles") {
-            profiles.extend(argv(saved).context("Invalid recorded active profiles")?);
-        }
     }
     for name in &profiles {
         ensure!(name == "*" || valid_profile(name), "Invalid Compose profile {name:?}");
@@ -1111,7 +1000,7 @@ fn selected_services_with_profiles(project: &Project, selected: &[String], profi
     Ok(scope)
 }
 fn selected_services(project: &Project, selected: &[String]) -> Result<Vec<String>> {
-    selected_services_with_profiles(project, selected, &active_profiles(project, &[], false)?)
+    selected_services_with_profiles(project, selected, &active_profiles(&[])?)
 }
 fn applicable(action: &Value, workflow: &str, selected: &[String]) -> bool {
     let workflows = action["workflows"].as_array();
@@ -1296,7 +1185,7 @@ fn revalidate_completed(project: &Project, docker: &Docker, operation: &NativeOp
 }
 fn stop_running(project: &Project, targets: &[String], docker: &Docker, operation: &mut NativeOperation) -> Result<()> {
     if targets.is_empty() { return Ok(()) }
-    check_ownership(project, docker, false)?;
+    validate_ownership(project, docker)?;
     let rows = container_rows(project, docker)?;
     let running = running_services(&rows);
     let targets: BTreeSet<_> = targets.iter().cloned().collect();
@@ -1307,7 +1196,7 @@ fn stop_running(project: &Project, targets: &[String], docker: &Docker, operatio
     };
     if running.is_empty() { return Ok(()) }
     let file = write_render(project, "compose")?;
-    let mut args = compose_args(project, &file)?;
+    let mut args = compose_args(project, file.path())?;
     args.push("stop".into());
     args.extend(running.iter().cloned());
     docker.run(&args, None)?;
@@ -1383,7 +1272,7 @@ fn start_ordered(project: &Project, scope: &[String], docker: &Docker, operation
         if operation.started.contains(&service) { continue }
         revalidate_completed(project, docker, operation)?;
         let file = write_render(project, "compose")?;
-        let mut args = compose_args(project, &file)?;
+        let mut args = compose_args(project, file.path())?;
         args.extend(strings(&["up", "--detach", "--build", "--no-deps", &service]));
         docker.run(&args, None)?;
         operation.started.insert(service);
@@ -1430,7 +1319,7 @@ fn execute_native_action(project: &Project, action: &Value, docker: &Docker, out
     let already_running = existing.iter().any(|row| row["State"]["Running"] == true);
     if fresh || (!retained_success && !already_running) {
         let file = write_render(project, "compose")?;
-        let mut args = compose_args(project, &file)?;
+        let mut args = compose_args(project, file.path())?;
         args.extend(strings(&["up", "--detach", "--build", "--no-deps"]));
         if fresh { args.push("--force-recreate".into()); }
         args.push(service.into());
@@ -1440,10 +1329,6 @@ fn execute_native_action(project: &Project, action: &Value, docker: &Docker, out
     let ids = completed_ids(&container_rows(project, docker)?, service)?;
     operation.completed.insert(service.into(), ids);
     operation.started.insert(service.into());
-    let mut saved = state::read(&project.root, "operation")?;
-    if !saved.is_object() { saved = json!({}); }
-    saved["prerequisites"] = json!(operation.completed);
-    state::save(&project.root, "operation", &saved)?;
     Ok(())
 }
 fn argv(value: &Value) -> Result<Vec<String>> {
@@ -1483,7 +1368,7 @@ fn execute_action(
         "Action {name}: Compose {kind} is not a Swarm prerequisite; use an explicit project argv command"
     );
     let file = write_render(project, "compose")?;
-    let mut args = compose_args(project, &file)?;
+    let mut args = compose_args(project, file.path())?;
     let service = action["service"]
         .as_str()
         .context("Compose actions require service")?;
@@ -1548,6 +1433,9 @@ fn execute_validated_sequence(
     docker: &Docker,
     output: &Output,
 ) -> Result<()> {
+    if !planned.is_empty() {
+        output.event("target", &format!("{} ({}) checkout={} target={}", project.name()?, project.backend()?, project.owner()?, docker.context()?))?;
+    }
     let native = planned.iter().any(|action| action["kind"] == "prerequisite");
     let budget = planned.iter().map(|action| action["timeout"].as_u64().unwrap_or(300)).max().unwrap_or(300);
     let docker = docker.with_deadline(Instant::now() + Duration::from_secs(budget));
@@ -1651,7 +1539,15 @@ pub(crate) fn local_context(context: &str) -> bool {
     context.contains(";unix://") || context.contains(";DOCKER_HOST=unix://")
 }
 fn container_rows(project: &Project, docker: &Docker) -> Result<Vec<Value>> {
-    container_rows_timeout(project, docker, 300)
+    let rows = container_rows_timeout(project, docker, 300)?;
+    for row in &rows {
+        ensure!(row["Config"]["Labels"]["com.docker.compose.project"].as_str() == Some(project.name()?)
+            && row["Config"]["Labels"][OWNER].as_str() == Some(project.owner()?)
+            && row["Config"]["Labels"][PROJECT].as_str() == Some(project.name()?),
+            "Foreign container {:?}; observed owner {:?}, expected {}", row["Id"].as_str(),
+            row["Config"]["Labels"][OWNER].as_str(), project.owner()?);
+    }
+    Ok(rows)
 }
 fn container_rows_timeout(project: &Project, docker: &Docker, timeout: u64) -> Result<Vec<Value>> {
     let started = Instant::now();
@@ -1670,12 +1566,12 @@ fn container_rows_timeout(project: &Project, docker: &Docker, timeout: u64) -> R
     }
     let mut args = strings(&["container", "inspect"]);
     args.extend(ids.split_whitespace().map(str::to_owned));
-    serde_json::from_str(&docker.capture_timeout(
+    let rows: Vec<Value> = serde_json::from_str(&docker.capture_timeout(
         &args,
         None,
         timeout.saturating_sub(started.elapsed().as_secs()).max(1),
-    )?)
-    .context("Invalid Docker container inspection")
+    )?).context("Invalid Docker container inspection")?;
+    Ok(rows)
 }
 fn detect_ports(project: &Project, selected: &[String], docker: &Docker) -> Result<()> {
     let context = docker.context()?;
@@ -1741,7 +1637,7 @@ fn detect_ports(project: &Project, selected: &[String], docker: &Docker) -> Resu
         seen.push(port.clone());
         ensure!(
             !foreign.contains(&(port.published, port.protocol.clone())),
-            "Port {}/{} needed by {} is published by an unrelated container; choose another port (nothing was stopped)",
+            "Port {}/{} needed by {} is published by an unrelated container; edit its ordinary configuration field (nothing was stopped)",
             port.published,
             port.protocol,
             port.service
@@ -1749,7 +1645,7 @@ fn detect_ports(project: &Project, selected: &[String], docker: &Docker) -> Resu
         if local_context(&context) && !owned.contains(&(port.published, port.protocol.clone())) {
             ensure!(
                 bindable(&port.host, port.published, &port.protocol),
-                "Port {}:{}/{} needed by {} is occupied; refusing to stop/reuse another process",
+                "Port {}:{}/{} needed by {} is occupied; edit its ordinary configuration field (nothing was stopped)",
                 port.host,
                 port.published,
                 port.protocol,
@@ -1937,6 +1833,7 @@ struct LogChild {
     child: Child,
     out: Option<thread::JoinHandle<()>>,
     err: Option<thread::JoinHandle<()>>,
+    _render: tempfile::NamedTempFile,
 }
 impl Drop for LogChild {
     fn drop(&mut self) {
@@ -1956,7 +1853,7 @@ fn startup_logs(
     output: &Output,
 ) -> Result<LogChild> {
     let file = write_render(project, "compose")?;
-    let mut args = compose_args(project, &file)?;
+    let mut args = compose_args(project, file.path())?;
     args.extend(strings(&["logs", "--follow", "--tail", "30", "--no-color"]));
     args.extend_from_slice(selected);
     let mut child = docker
@@ -1971,6 +1868,7 @@ fn startup_logs(
         child,
         out: Some(out),
         err: Some(err),
+        _render: file,
     })
 }
 fn wait_ready(
@@ -2041,18 +1939,6 @@ fn wait_ready(
         "services":observations.into_values().collect::<Vec<_>>(),
     }))))
 }
-fn journal(project: &Project, workflow: &str, phase: &str, selected: &[String]) -> Result<()> {
-    let mut saved = state::read(&project.root, "operation")?;
-    if !saved.is_object() { saved = json!({}); }
-    if phase == "starting" {
-        saved.as_object_mut().unwrap().remove("prerequisites");
-    }
-    saved["workflow"] = json!(workflow);
-    saved["phase"] = json!(phase);
-    saved["services"] = json!(selected);
-    saved["time"] = json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs());
-    state::save(&project.root, "operation", &saved)
-}
 /// Only attach secondary evidence; neither hook failures nor a new diagnostic
 /// deadline may replace the original lifecycle error or cancellation.
 pub(crate) fn startup_diagnostics(
@@ -2072,33 +1958,10 @@ pub(crate) fn startup_diagnostics(
     error.context(crate::diagnostics::DiagnosticReport(report))
 }
 
-/// Read the existing identity without creating/adopting an environment.
-fn diagnostic_owner(project: &Project, docker: &Docker) -> Result<(String, String)> {
+/// Derive diagnostic context without creating or adopting any resources.
+fn diagnostic_owner<'a>(project: &'a Project, docker: &Docker) -> Result<(&'a str, String)> {
     docker.remaining(Duration::from_secs(10))?;
-    let context = docker.context()?;
-    let identity = state::read(&project.root, "identity")?;
-    let owner = identity["id"].as_str().filter(|id| !id.is_empty())
-        .context("Diagnostics require an existing ownership identity")?;
-    let root = fs::canonicalize(&project.root)?;
-    let root_key = root.to_str().context("Diagnostic checkout path must be UTF-8")?;
-    ensure!(identity["root"].as_str() == Some(root_key)
-        && identity["project"].as_str() == Some(project.name()?)
-        && identity["backend"].as_str() == Some(project.backend()?),
-        "Diagnostic ownership identity does not match this environment");
-    ensure!(identity["context"].as_str() == Some(context.as_str()),
-        "Diagnostic Docker connection differs from the recorded ownership identity");
-    let registry = crate::registry::read()?;
-    if let Some(entry) = registry["environments"].get(root_key) {
-        ensure!(entry["ownerId"].as_str() == Some(owner)
-            && entry["project"].as_str() == Some(project.name()?)
-            && entry["backend"].as_str() == Some(project.backend()?)
-            && entry["connection"].as_str() == Some(context.as_str()),
-            "Diagnostic environment differs from its saved registration");
-        let daemon = docker.capture_timeout(&strings(&["info", "--format", "{{.ID}}"]), None, 10)?;
-        ensure!(entry["daemonId"].as_str() == Some(daemon.trim()),
-            "Diagnostic Docker daemon differs from its saved registration");
-    }
-    Ok((owner.into(), context))
+    Ok((project.owner()?, docker.context()?))
 }
 
 pub(crate) fn diagnostic_container_state(container: &Value) -> Value {
@@ -2126,19 +1989,19 @@ pub(crate) fn diagnostic_observations(
 ) -> Result<Value> {
     let (owner, context) = diagnostic_owner(project, docker)?;
     if project.backend()? == "swarm" {
-        return crate::deploy::diagnostic_observations(project, selected, docker, &owner, &context);
+        return crate::deploy::diagnostic_observations(project, selected, docker, owner, &context);
     }
     let fallback_profiles;
     let profiles = match &docker.profiles {
         Some(profiles) => profiles.as_slice(),
         None => {
-            fallback_profiles = active_profiles(project, &[], selected.is_empty())?;
+            fallback_profiles = active_profiles(&[])?;
             fallback_profiles.as_slice()
         }
     };
     let scope = selected_services_with_profiles(project, selected, profiles)?;
     ensure!(!scope.is_empty(), "Diagnostics have no required Compose services");
-    let containers = container_rows(project, docker)?;
+    let containers = container_rows_timeout(project, docker, 10)?;
     let mut services = Vec::new();
     for service in scope {
         docker.remaining(Duration::from_secs(10))?;
@@ -2151,7 +2014,7 @@ pub(crate) fn diagnostic_observations(
         for container in rows {
             let labels = &container["Config"]["Labels"];
             let id = diagnostic_resource_id(&container["Id"]);
-            if labels[OWNER].as_str() != Some(owner.as_str())
+            if labels[OWNER].as_str() != Some(owner)
                 || labels[PROJECT].as_str() != Some(project.name()?)
                 || labels["com.docker.compose.project"].as_str() != Some(project.name()?)
                 || id.is_none() {
@@ -2177,7 +2040,7 @@ pub(crate) fn diagnostic_observations(
         }
         services.push(row);
     }
-    Ok(json!({"backend":"compose","project":project.name()?,"context":context,
+    Ok(json!({"backend":"compose","project":project.name()?,"owner":owner,"context":context,
         "activeProfiles":profiles,"services":services}))
 }
 
@@ -2199,7 +2062,7 @@ pub fn lifecycle(
         ["up", "dev", "down", "destroy"].contains(&workflow),
         "Unknown lifecycle {workflow}"
     );
-    let active_profiles = active_profiles(project, profiles, false)?;
+    let active_profiles = active_profiles(profiles)?;
     let selected_full = selected_services_with_profiles(project, selected, &active_profiles)?;
     if workflow == "up" || workflow == "dev" {
         ensure!(!selected_full.is_empty(), "No required Compose services; select services or activate profiles");
@@ -2232,7 +2095,6 @@ pub fn lifecycle(
         "Destruction requires explicit confirmation (--yes)"
     );
     let _lock = state::lock(&project.root, "lifecycle")?;
-    recover_publication(&project.root)?;
     let fresh = crate::nickel::evaluate(&project.root, None)?;
     ensure!(
         fresh.name()? == project.name()? && fresh.backend()? == project.backend()?,
@@ -2254,11 +2116,11 @@ pub fn lifecycle(
     }
     output.event(
         "check",
-        &format!("{} ({})", project.name()?, project.backend()?),
+        &format!("{} ({}) checkout={} target={}", project.name()?, project.backend()?, project.owner()?, docker.context()?),
     )?;
     let preflight = (|| -> Result<()> {
         docker.check()?;
-        validate_ownership(project, &docker, workflow == "up" || workflow == "dev")?;
+        validate_ownership(project, &docker)?;
         Ok(())
     })();
     if let Err(error) = preflight {
@@ -2269,18 +2131,6 @@ pub fn lifecycle(
     if workflow == "down" || workflow == "destroy" {
         return teardown(project, workflow == "destroy", selected, &docker, output);
     }
-    let evaluated;
-    let allocated = crate::allocations::allocate(&project.root, &docker).map_err(|error| {
-        if error.is::<DockerError>() || error.is::<DeadlineExceeded>() {
-            startup_diagnostics(error, project, &initial_scope, timeout, &docker, output)
-        } else { error }
-    })?;
-    let project = if allocated {
-        evaluated = crate::nickel::evaluate(&project.root, None)?;
-        &evaluated
-    } else {
-        project
-    };
     let mut selected_full = selected_services_with_profiles(project, selected, &active_profiles)?;
     crate::diagnostics::validate(project)?;
     for service in &selected_full { validate_readiness(project, service)?; }
@@ -2301,8 +2151,6 @@ pub fn lifecycle(
         })?;
     }
     let file = write_render(project, "compose")?;
-    journal(project, workflow, "starting", &selected_full)?;
-    state::mark_resources(&project.root, true)?;
     let startup = (|| -> Result<Value> {
         for action in planned.iter().filter(|a| a["stage"].as_str().unwrap_or("before") == "before") {
             if native || action["kind"] == "stop" {
@@ -2317,15 +2165,11 @@ pub fn lifecycle(
             operation.scope = selected_full.clone();
             start_ordered(project, &selected_full, &docker, &mut operation)?;
         } else {
-            let mut up = compose_args(project, &file)?;
+            let mut up = compose_args(project, file.path())?;
             up.extend(strings(&["up", "--detach", "--build"]));
             up.extend_from_slice(&selected_full);
             docker.run_timeout(&up, None, timeout)?;
         }
-        journal(project, workflow, "waiting", &selected_full)?;
-        let mut applied = state::read(&project.root, "operation")?;
-        applied["appliedProfiles"] = json!(active_profiles);
-        state::save(&project.root, "operation", &applied)?;
         let logs = startup_logs(project, &selected_full, &docker, output)?;
         let readiness = wait_ready(project, &selected_full, &docker, output, timeout)?;
         drop(logs);
@@ -2342,9 +2186,8 @@ pub fn lifecycle(
     let readiness = match startup {
         Ok(readiness) => readiness,
         Err(error) => {
-            let _ = journal(project, workflow, if error.is::<Cancelled>() { "cancelled" } else { "failed" }, &selected_full);
             if !error.is::<Cancelled>() && docker.remaining(Duration::from_secs(10)).is_ok() {
-                let mut logs = compose_args(project, &file)?;
+                let mut logs = compose_args(project, file.path())?;
                 logs.extend(strings(&["logs", "--tail", "30", "--no-color"]));
                 logs.extend_from_slice(&selected_full);
                 logs.extend(operation.prerequisites.iter().filter(|service| !selected_full.contains(service)).cloned());
@@ -2354,7 +2197,6 @@ pub fn lifecycle(
             return Err(startup_diagnostics(error, project, &selected_full, timeout, &docker, output));
         }
     };
-    journal(project, workflow, "ready", &selected_full)?;
     let result = json!({"project":project.name()?,"services":readiness,"endpoints":project.endpoints(),"detached":true});
     output.event(
         "ready",
@@ -2387,7 +2229,7 @@ pub fn lifecycle(
                     "dev",
                     "Starting Compose watch; Ctrl-C stops watch, not detached containers",
                 )?;
-                let mut args = compose_args(project, &file)?;
+                let mut args = compose_args(project, file.path())?;
                 args.extend(strings(&["watch", "--no-up"]));
                 args.extend(watched);
                 docker.run(&args, None)?;
@@ -2403,7 +2245,8 @@ fn teardown(
     docker: &Docker,
     output: &Output,
 ) -> Result<Value> {
-    let id = validate_ownership(project, docker, false)?;
+    validate_ownership(project, docker)?;
+    let id = project.owner()?;
     let rows = container_rows(project, docker)?;
     let names: HashSet<&str> = selected.iter().map(String::as_str).collect();
     let mut removed = Vec::new();
@@ -2415,10 +2258,19 @@ fn teardown(
             continue;
         }
         ensure!(
-            row["Config"]["Labels"][OWNER].as_str() == Some(&id),
+            row["Config"]["Labels"][OWNER].as_str() == Some(id)
+                && row["Config"]["Labels"][PROJECT].as_str() == Some(project.name()?),
             "Container ownership changed; refusing removal"
         );
         let resource = row["Id"].as_str().context("Missing container id")?;
+        let current: Vec<Value> = serde_json::from_str(&docker.capture(
+            &strings(&["container", "inspect", resource]), None,
+        )?)?;
+        ensure!(current.len() == 1 && current[0]["Id"].as_str() == Some(resource)
+            && current[0]["Config"]["Labels"][OWNER].as_str() == Some(id)
+            && current[0]["Config"]["Labels"][PROJECT].as_str() == Some(project.name()?)
+            && current[0]["Config"]["Labels"]["com.docker.compose.project"].as_str() == Some(project.name()?),
+            "Container {resource} identity/ownership changed; refusing removal");
         docker.run(&strings(&["container", "rm", "--force", resource]), None)?;
         removed.push(resource.to_owned());
     }
@@ -2428,36 +2280,39 @@ fn teardown(
         } else {
             vec!["network"]
         } {
-            let resources = docker.capture(
-                &strings(&[
-                    kind,
-                    "ls",
-                    "-q",
-                    "--filter",
-                    &format!("label={OWNER}={id}"),
-                    "--filter",
-                    &format!("label={PROJECT}={}", project.name()?),
-                ]),
-                None,
-            )?;
+            let mut listing = strings(&[
+                kind, "ls", "-q", "--filter", &format!("label={OWNER}={id}"),
+                "--filter", &format!("label={PROJECT}={}", project.name()?),
+            ]);
+            if kind == "network" { listing.push("--no-trunc".into()); }
+            let resources = docker.capture(&listing, None)?;
             for resource in resources.split_whitespace() {
+                let inspected: Vec<Value> = serde_json::from_str(&docker.capture(
+                    &strings(&[kind, "inspect", resource]), None,
+                )?)?;
+                ensure!(inspected.len() == 1, "Cannot verify {kind} {resource} before removal");
+                let current = &inspected[0];
+                ensure!(current["Labels"][OWNER].as_str() == Some(id)
+                    && current["Labels"][PROJECT].as_str() == Some(project.name()?),
+                    "{kind} {resource} ownership changed; refusing removal");
+                let immutable = if kind == "network" {
+                    current["Id"].as_str().context("Network inspection lacks immutable id")?
+                } else {
+                    current["Name"].as_str().context("Volume inspection lacks name")?
+                };
+                ensure!(immutable == resource, "{kind} {resource} identity changed; refusing removal");
+                let external = project.model[if kind == "network" { "networks" } else { "volumes" }]
+                    .as_object().into_iter().flat_map(|resources| resources.iter())
+                    .any(|(logical, definition)| definition["external"] == true
+                        && Some(definition["name"].as_str().unwrap_or(logical))
+                            == current["Name"].as_str());
+                if external { continue; }
                 // No force: attached external/other-project resources must survive.
                 docker.run(&strings(&[kind, "rm", resource]), None)?;
                 removed.push(resource.into());
             }
         }
-        // Down retains data and identity. A full Compose destroy retires the
-        // deployment; retained credential files still belong to the same owner.
-        if destroy {
-            state::mark_resources(&project.root, false)?;
-        }
     }
-    journal(
-        project,
-        if destroy { "destroy" } else { "down" },
-        "complete",
-        selected,
-    )?;
     output.event("teardown",if destroy {"Removed owned containers/networks/volumes; secret references and allocated endpoints preserved"} else {"Removed owned containers/networks; volumes, secrets, and allocated endpoints preserved"})?;
     Ok(json!({"removed":removed,"volumesPreserved":!destroy,"secretsPreserved":true}))
 }
@@ -2486,7 +2341,7 @@ pub fn status(
             "containerReady":false, "applicationReady":null, "ready":false,
             "status":"unobserved", "containers":[]
         })).collect::<Vec<_>>());
-        let active = active_profiles(project, profiles, selected.is_empty())?;
+        let active = active_profiles(profiles)?;
         report["activeProfiles"] = json!(active);
         let scope = selected_services_with_profiles(project, selected, &active)?;
         report["requiredServices"] = json!(scope);
@@ -2502,8 +2357,8 @@ pub fn status(
             Ok(())
         })().map_err(|error| error.context(crate::status::StatusConfiguration))?;
         report["context"] = json!(docker.context()?);
-        let identity = check_ownership(project, &docker, true)?;
-        report["owner"] = identity["id"].clone();
+        validate_ownership(project, &docker)?;
+        report["owner"] = json!(project.owner()?);
         report["ownershipVerified"] = json!(true);
         let containers = container_rows(project, &docker)?;
         // Record all container observations before probing any application so
@@ -2575,14 +2430,20 @@ pub fn passthrough(
     output: &Output,
 ) -> Result<Value> {
     let docker = Docker::new(&project.root, output.clone());
+    let _lifecycle = if namespace != "docker" {
+        Some(state::lock(&project.root, "lifecycle")?)
+    } else { None };
+    let render;
+    if namespace != "docker" {
+        output.event("target", &format!("{} ({}) checkout={} target={}", project.name()?, project.backend()?, project.owner()?, docker.context()?))?;
+        validate_ownership(project, &docker)?;
+    }
     let mut command = match namespace {
         "docker" => Vec::new(),
         "stack" => strings(&["stack"]),
         "compose" | "logs" | "exec" => {
-            let _lifecycle = state::lock(&project.root, "lifecycle")?;
-            validate_ownership(project, &docker, true)?;
-            let file = write_render(project, "compose")?;
-            compose_args(project, &file)?
+            render = write_render(project, "compose")?;
+            compose_args(project, render.path())?
         }
         _ => bail!("Passthrough must explicitly select docker, compose, or stack"),
     };
@@ -2609,11 +2470,12 @@ mod tests {
     use super::*;
     fn project(root: &Path, services: Value, metadata: Value) -> Project {
         Project {
-            root: root.into(),
+            root: fs::canonicalize(root).unwrap(),
             env: json!({"project":"fixture","backend":"compose"}),
             model: json!({"services":services}),
             metadata,
             fields: Vec::new(),
+            swarm_secrets: BTreeMap::new(),
         }
     }
     fn container(service: &str, state: Value) -> Value {
@@ -2623,10 +2485,6 @@ mod tests {
     fn owned_sparse_render_keeps_optional_resource_sections_valid() {
         let dir = tempfile::tempdir().unwrap();
         let project = project(dir.path(), json!({"app":{"image":"python:3.13-alpine"}}), json!({}));
-        state::save(dir.path(), "identity", &json!({
-            "id":"owner","root":fs::canonicalize(dir.path()).unwrap(),
-            "project":"fixture","backend":"compose"
-        })).unwrap();
         let rendered = render_document(&project, "compose").unwrap();
         for field in ["volumes", "networks"] {
             assert!(rendered.get(field).is_none_or(Value::is_object));
@@ -2738,15 +2596,11 @@ mod tests {
             json!({}),
         );
         project.model["volumes"] = json!({"data":{},"shared":{"external":true}});
-        let raw = render_document(&project, "compose").unwrap();
-        assert_eq!(raw["services"]["api"]["labels"], json!(["application=yes"]));
-        assert!(!dir.path().join(".dockstride").exists());
-        let identity =
-            state::ensure_identity(dir.path(), "fixture", "compose", "test-context").unwrap();
         let rendered = render_document(&project, "compose").unwrap();
-        assert_eq!(rendered["services"]["api"]["labels"][OWNER], identity["id"]);
+        assert_eq!(rendered["services"]["api"]["labels"][OWNER], project.owner().unwrap());
         assert_eq!(rendered["services"]["api"]["labels"]["application"], "yes");
-        assert_eq!(rendered["volumes"]["data"]["labels"][OWNER], identity["id"]);
+        assert_eq!(rendered["volumes"]["data"]["labels"][OWNER], project.owner().unwrap());
+        assert!(!dir.path().join(".dockstride").exists());
         assert!(rendered["volumes"]["shared"].get("labels").is_none());
         assert!(!dir.path().join(".dockstride/render-compose.yaml").exists());
     }
@@ -2808,11 +2662,12 @@ mod readiness_tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let project = Project {
-            root: dir.path().into(),
+            root: dir.path().canonicalize().unwrap(),
             env: json!({"project":"fixture"}),
             model: json!({"services":{"api":{}}}),
             metadata: json!({"readiness":{"api":{"url":format!("http://{address}/ready"),"json":{"application":"fixture","ready":true}}}}),
             fields: Vec::new(),
+            swarm_secrets: BTreeMap::new(),
         };
         let docker = Docker::new(&project.root, Output::default());
         assert!(!readiness_check(&project, "api", &docker, &Output::default(), 5).unwrap());

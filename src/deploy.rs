@@ -177,7 +177,7 @@ fn validate_model(project: &Project) -> Result<()> {
         for (name, spec) in secrets {
             ensure!(
                 spec.get("external").and_then(Value::as_bool) == Some(true),
-                "Swarm secret {name} must be an external immutable provisioned reference; run setup with a durable recovery source first"
+                "Swarm secret {name} must be an external immutable provisioned reference; provision or sync its current binding first"
             );
         }
     }
@@ -293,112 +293,49 @@ fn digest(docker: &Docker, image: &str) -> Result<String> {
         pin.contains("@sha256:"),
         "registry did not return a sha256 digest for {image}"
     );
-    Ok(pin.into())
+    let (_, digest) = pin.split_once('@').context("registry digest has no separator")?;
+    Ok(format!("{}@{digest}", named_image(image)))
 }
 fn resolve_images(
     project: &Project,
     names: &[String],
-    previous: &Value,
     docker: &Docker,
     output: &Output,
-    operation: &str,
-) -> Result<Map<String, Value>> {
-    let mut images = previous
-        .get("images")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+) -> Result<BTreeMap<String, String>> {
+    let mut images = BTreeMap::new();
     for name in names {
         let image = image_name(project, name)?;
-        let old = images.get(name).cloned().unwrap_or(Value::Null);
-        let result = if project.services()?[name].get("build").is_some() {
-            let repo = repository(&image);
-            ensure!(
-                registry(repo).is_some(),
-                "built service {name} needs an explicit registry repository, not {image}"
-            );
-            let revision = state::random_id()?;
-            let tag = format!("{repo}:dks-{revision}");
-            let argv = build_args(project, name, &tag)?;
-            operation_run(project, docker, operation, output, "build", &argv)?;
-            let id = docker
-                .capture(
-                    &args(&["image", "inspect", "--format", "{{.Id}}", &tag]),
-                    None,
-                )?
-                .trim()
-                .to_owned();
-            if old.get("imageId").and_then(Value::as_str) == Some(id.as_str())
-                && old.get("repository").and_then(Value::as_str) == Some(repo)
-            {
-                let pin = old
-                    .get("digest")
-                    .and_then(Value::as_str)
-                    .context("previous build revision has no digest")?;
-                operation_run(
-                    project,
-                    docker,
-                    operation,
-                    output,
-                    "verify-image",
-                    &args(&["pull", pin]),
-                )?;
-                output.event(
-                    "publish",
-                    &format!("{name}: reusing immutable revision {pin}"),
-                )?;
-                old
-            } else {
-                operation_run(
-                    project,
-                    docker,
-                    operation,
-                    output,
-                    "publish",
-                    &args(&["push", &tag]),
-                )?;
-                json!({"repository":repo,"tag":tag,"revision":revision,"imageId":id,"digest":digest(docker,&tag)?})
-            }
+        let pin = if project.services()?[name].get("build").is_some() {
+            ensure!(!image.contains('@'),
+                "service {name}: a build target cannot contain a digest; declare a registry repository/tag");
+            ensure!(registry(repository(&image)).is_some(),
+                "built service {name} needs an explicit registry repository, not {image}");
+            let tag = named_image(&image);
+            operation_run(docker, output, "build", &build_args(project, name, &tag)?)?;
+            operation_run(docker, output, "publish", &args(&["push", &tag]))?;
+            digest(docker, &tag)?
         } else {
-            operation_run(
-                project,
-                docker,
-                operation,
-                output,
-                "pull",
-                &args(&["pull", &image]),
-            )?;
-            json!({"repository":repository(&image),"digest":digest(docker,&image)?})
+            operation_run(docker, output, "pull", &args(&["pull", &image]))?;
+            if image.contains('@') { image } else { digest(docker, &image)? }
         };
-        images.insert(name.clone(), result);
+        images.insert(name.clone(), pin);
     }
     Ok(images)
 }
-fn journal(project: &Project, operation: &str, entry: Value) -> Result<()> {
-    state::journal(&project.root, operation, &entry)
+
+fn named_image(image: &str) -> String {
+    let image = image.split('@').next().unwrap_or(image);
+    if image.rfind(':').is_some_and(|index| !image[index..].contains('/')) {
+        image.into()
+    } else {
+        format!("{image}:latest")
+    }
 }
-fn operation_run(
-    project: &Project,
-    docker: &Docker,
-    operation: &str,
-    output: &Output,
-    phase: &str,
-    argv: &[String],
-) -> Result<()> {
-    journal(
-        project,
-        operation,
-        json!({"phase":phase,"state":"started","docker":argv}),
-    )?;
+
+fn operation_run(docker: &Docker, output: &Output, phase: &str, argv: &[String]) -> Result<()> {
     output.event(phase, &format!("docker {}", argv.join(" ")))?;
-    docker
-        .run(argv, None)
-        .with_context(|| format!("{phase} failed: docker {}", argv.join(" ")))?;
-    journal(
-        project,
-        operation,
-        json!({"phase":phase,"state":"completed","docker":argv}),
-    )
+    docker.run(argv, None)
+        .with_context(|| format!("{phase} failed: docker {}", argv.join(" ")))
 }
 fn set_labels(value: &mut Value, owner: &str, project: &str) -> Result<()> {
     let map = value
@@ -508,27 +445,9 @@ fn resource_name(project: &str, key: &str, spec: &Value) -> String {
             }
         })
 }
-fn shared_scope(rendered: &Value, previous: &Value, selected: bool) -> Result<()> {
-    if !selected {
-        return Ok(());
-    }
-    ensure!(
-        previous.get("active").and_then(Value::as_bool) == Some(true),
-        "selected-service deployment requires an active full deployment; deploy the full stack first to create shared resources"
-    );
-    let old = previous.get("rendered").context("selected-service deployment requires an existing full deployment snapshot; deploy the full stack first so shared resources are explicit")?;
-    for kind in ["networks", "volumes", "configs"] {
-        ensure!(
-            rendered.get(kind) == old.get(kind),
-            "selected deployment would change shared {kind}; apply an explicitly reviewed full deployment first (unrelated services will not be updated implicitly)"
-        );
-    }
-    Ok(())
-}
 fn check_resources(
     project: &Project,
     rendered: &Value,
-    previous: &Value,
     names: &[String],
     docker: &Docker,
     owner: &str,
@@ -539,13 +458,12 @@ fn check_resources(
         let native = format!("{}_{}", project.name()?, name);
         if service_names.contains(native.as_str()) {
             let service = inspect(docker, "service", &native)?;
+            let labels = &service["Spec"]["Labels"];
             ensure!(
-                service
-                    .pointer("/Spec/Labels")
-                    .and_then(|v| v.get(OWNER))
-                    .and_then(Value::as_str)
-                    == Some(owner),
-                "refusing to adopt or modify unrelated service {native}"
+                labels[OWNER].as_str() == Some(owner)
+                    && labels[PROJECT].as_str() == Some(project.name()?),
+                "refusing to modify foreign service {native}; observed owner {}",
+                labels[OWNER]
             );
         }
     }
@@ -574,963 +492,17 @@ fn check_resources(
                 let item = inspect(docker, command, &name)?;
                 let labels = item.get("Labels").or_else(|| item.pointer("/Spec/Labels"));
                 ensure!(
-                    labels.and_then(|l| l.get(OWNER)).and_then(Value::as_str) == Some(owner),
-                    "refusing to modify unrelated {command} {name}; its ownership label differs or is absent"
+                    labels.and_then(|l| l.get(OWNER)).and_then(Value::as_str) == Some(owner)
+                        && labels.and_then(|l| l.get(PROJECT)).and_then(Value::as_str) == Some(project.name()?),
+                    "refusing to modify foreign {command} {name}; observed owner {}",
+                    labels.and_then(|l| l.get(OWNER)).unwrap_or(&Value::Null)
                 );
-                if let Some(old) = previous["rendered"][kind].get(key) {
-                    ensure!(
-                        old == spec || resource_name(project.name()?, key, old) != name,
-                        "existing shared {command} {name} cannot be reconfigured safely; declare a new resource name and explicitly migrate consumers"
-                    );
-                }
             }
         }
     }
     Ok(())
 }
 
-// The selected-service adapter intentionally supports a finite, validated subset.
-// Anything outside it is rejected before build/apply rather than silently dropped.
-#[derive(Clone, Default)]
-struct ServiceOptions {
-    scalar: BTreeMap<String, String>,
-    lists: BTreeMap<String, BTreeMap<String, String>>,
-    command: Option<Vec<String>>,
-    image: String,
-}
-fn list_insert(options: &mut ServiceOptions, kind: &str, key: String, value: String) {
-    options
-        .lists
-        .entry(kind.into())
-        .or_default()
-        .insert(key, value);
-}
-fn strings(value: &Value, what: &str) -> Result<Vec<String>> {
-    value
-        .as_array()
-        .with_context(|| {
-            format!("{what} must use argv/list syntax for selected service deployment")
-        })?
-        .iter()
-        .map(|v| {
-            v.as_str()
-                .map(str::to_owned)
-                .context("argv entries must be strings")
-        })
-        .collect()
-}
-fn adapter(project: &str, service: &Value, rendered: &Value) -> Result<ServiceOptions> {
-    let mut options = ServiceOptions::default();
-    let fields = object(service, "service")?;
-    for key in fields.keys() {
-        ensure!(
-            [
-                "image",
-                "environment",
-                "command",
-                "entrypoint",
-                "user",
-                "working_dir",
-                "hostname",
-                "read_only",
-                "init",
-                "tty",
-                "stop_grace_period",
-                "stop_signal",
-                "labels",
-                "networks",
-                "volumes",
-                "ports",
-                "secrets",
-                "configs",
-                "healthcheck",
-                "deploy",
-                "logging"
-            ]
-            .contains(&key.as_str()),
-            "selected-service adapter does not support field {key}; use an explicitly reviewed full deployment or simplify that service"
-        );
-    }
-    options.image = service
-        .get("image")
-        .and_then(Value::as_str)
-        .context("Swarm service needs image")?
-        .into();
-    for (field, option) in [
-        ("user", "user"),
-        ("working_dir", "workdir"),
-        ("hostname", "hostname"),
-        ("stop_grace_period", "stop-grace-period"),
-        ("stop_signal", "stop-signal"),
-        ("read_only", "read-only"),
-        ("init", "init"),
-        ("tty", "tty"),
-    ] {
-        if let Some(value) = fields.get(field) {
-            options.scalar.insert(option.into(), text(value)?);
-        }
-    }
-    if let Some(command) = fields.get("command") {
-        options.command = Some(strings(command, "command")?);
-    }
-    if let Some(entrypoint) = fields.get("entrypoint") {
-        options.scalar.insert(
-            "entrypoint".into(),
-            strings(entrypoint, "entrypoint")?
-                .iter()
-                .map(|s| shell_quote(s))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-    }
-    for (field, kind) in [("environment", "env"), ("labels", "container-label")] {
-        if let Some(value) = fields.get(field) {
-            for (key, value) in key_values(value)? {
-                list_insert(&mut options, kind, key.clone(), format!("{key}={value}"));
-            }
-        }
-    }
-    if let Some(deploy) = fields.get("deploy") {
-        let deploy = object(deploy, "deploy")?;
-        for key in deploy.keys() {
-            ensure!(
-                [
-                    "mode",
-                    "replicas",
-                    "labels",
-                    "endpoint_mode",
-                    "placement",
-                    "restart_policy",
-                    "update_config",
-                    "rollback_config",
-                    "resources"
-                ]
-                .contains(&key.as_str()),
-                "selected-service adapter does not support deploy.{key}"
-            );
-        }
-        for (field, option) in [
-            ("mode", "mode"),
-            ("replicas", "replicas"),
-            ("endpoint_mode", "endpoint-mode"),
-        ] {
-            if let Some(value) = deploy.get(field) {
-                options.scalar.insert(option.into(), text(value)?);
-            }
-        }
-        if let Some(labels) = deploy.get("labels") {
-            for (key, value) in key_values(labels)? {
-                list_insert(&mut options, "label", key.clone(), format!("{key}={value}"));
-            }
-        }
-        for (field, prefix, allowed) in [
-            (
-                "update_config",
-                "update",
-                &[
-                    "parallelism",
-                    "delay",
-                    "failure_action",
-                    "monitor",
-                    "max_failure_ratio",
-                    "order",
-                ][..],
-            ),
-            (
-                "rollback_config",
-                "rollback",
-                &[
-                    "parallelism",
-                    "delay",
-                    "failure_action",
-                    "monitor",
-                    "max_failure_ratio",
-                    "order",
-                ][..],
-            ),
-            (
-                "restart_policy",
-                "restart",
-                &["condition", "delay", "max_attempts", "window"][..],
-            ),
-        ] {
-            if let Some(value) = deploy.get(field) {
-                for (key, value) in object(value, field)? {
-                    ensure!(
-                        allowed.contains(&key.as_str()),
-                        "unsupported deploy.{field}.{key}"
-                    );
-                    options
-                        .scalar
-                        .insert(format!("{prefix}-{}", key.replace('_', "-")), text(value)?);
-                }
-            }
-        }
-        if let Some(placement) = deploy.get("placement") {
-            for key in object(placement, "placement")?.keys() {
-                ensure!(
-                    ["constraints", "max_replicas_per_node"].contains(&key.as_str()),
-                    "unsupported placement.{key}"
-                );
-            }
-            if let Some(values) = placement.get("constraints") {
-                for value in strings(values, "constraints")? {
-                    list_insert(&mut options, "constraint", value.clone(), value);
-                }
-            }
-            if let Some(value) = placement.get("max_replicas_per_node") {
-                options
-                    .scalar
-                    .insert("replicas-max-per-node".into(), text(value)?);
-            }
-        }
-        if let Some(resources) = deploy.get("resources") {
-            for (kind, values) in object(resources, "resources")? {
-                ensure!(
-                    ["limits", "reservations"].contains(&kind.as_str()),
-                    "unsupported resources.{kind}"
-                );
-                let prefix = if kind == "limits" { "limit" } else { "reserve" };
-                for (key, value) in object(values, "resource values")? {
-                    ensure!(
-                        ["cpus", "memory"].contains(&key.as_str()),
-                        "unsupported resources.{kind}.{key}"
-                    );
-                    options.scalar.insert(
-                        format!("{prefix}-{}", if key == "cpus" { "cpu" } else { "memory" }),
-                        text(value)?,
-                    );
-                }
-            }
-        }
-    }
-    options
-        .scalar
-        .entry("mode".into())
-        .or_insert_with(|| "replicated".into());
-    if options.scalar["mode"] == "replicated" {
-        options
-            .scalar
-            .entry("replicas".into())
-            .or_insert_with(|| "1".into());
-    }
-    options
-        .scalar
-        .entry("endpoint-mode".into())
-        .or_insert_with(|| "vip".into());
-    list_insert(
-        &mut options,
-        "label",
-        "com.docker.stack.namespace".into(),
-        format!("com.docker.stack.namespace={project}"),
-    );
-    let stack_image = options.image.clone();
-    list_insert(
-        &mut options,
-        "label",
-        "com.docker.stack.image".into(),
-        format!("com.docker.stack.image={stack_image}"),
-    );
-    let default_network = json!(["default"]);
-    let networks = fields.get("networks").unwrap_or(&default_network);
-    let entries: Vec<(String, Value)> = if let Some(map) = networks.as_object() {
-        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-    } else {
-        strings(networks, "networks")?
-            .into_iter()
-            .map(|s| (s, Value::Null))
-            .collect()
-    };
-    for (key, spec) in entries {
-        let definitions = rendered
-            .get("networks")
-            .and_then(|v| v.get(&key))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let name = resource_name(project, &key, &definitions);
-        let mut value = format!("name={name}");
-        if let Some(map) = spec.as_object() {
-            for field in map.keys() {
-                ensure!(
-                    field == "aliases",
-                    "unsupported selected network attachment field {field}"
-                );
-            }
-            if let Some(aliases) = spec.get("aliases") {
-                for alias in strings(aliases, "network aliases")?
-                    .into_iter()
-                    .collect::<BTreeSet<_>>()
-                {
-                    ensure!(
-                        !alias.contains(','),
-                        "network aliases containing commas are unsupported"
-                    );
-                    value.push_str(&format!(",alias={alias}"));
-                }
-            }
-        }
-        list_insert(&mut options, "network", name, value);
-    }
-    if let Some(volumes) = fields.get("volumes") {
-        for volume in volumes.as_array().context("volumes must be a list")? {
-            let (kind, source, target, read_only) = if let Some(s) = volume.as_str() {
-                let parts: Vec<_> = s.split(':').collect();
-                ensure!(
-                    parts.len() >= 2 && parts.len() <= 3,
-                    "selected deployment requires explicit source:target mounts"
-                );
-                ensure!(
-                    parts.len() != 3 || ["ro", "rw"].contains(&parts[2]),
-                    "unsupported mount mode"
-                );
-                (
-                    if parts[0].starts_with('/') || parts[0].starts_with('.') {
-                        "bind"
-                    } else {
-                        "volume"
-                    },
-                    parts[0].to_owned(),
-                    parts[1].to_owned(),
-                    parts.get(2) == Some(&"ro"),
-                )
-            } else {
-                for key in object(volume, "mount")?.keys() {
-                    ensure!(
-                        ["type", "source", "target", "read_only"].contains(&key.as_str()),
-                        "unsupported selected mount field {key}"
-                    );
-                }
-                (
-                    volume
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("volume"),
-                    volume
-                        .get("source")
-                        .and_then(Value::as_str)
-                        .context("mount requires source")?
-                        .into(),
-                    volume
-                        .get("target")
-                        .and_then(Value::as_str)
-                        .context("mount requires target")?
-                        .into(),
-                    volume
-                        .get("read_only")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                )
-            };
-            ensure!(
-                ["bind", "volume"].contains(&kind),
-                "unsupported mount type {kind}"
-            );
-            ensure!(
-                kind != "bind" || source.starts_with('/'),
-                "Swarm bind source must be an absolute host path, not {source}"
-            );
-            let source = if kind == "volume" {
-                resource_name(project, &source, &rendered["volumes"][&source])
-            } else {
-                source
-            };
-            ensure!(
-                !source.contains(',') && !target.contains(','),
-                "mount paths containing commas need a full deployment"
-            );
-            list_insert(
-                &mut options,
-                "mount",
-                target.clone(),
-                format!("type={kind},source={source},target={target},readonly={read_only}"),
-            );
-        }
-    }
-    if let Some(ports) = fields.get("ports") {
-        for port in ports.as_array().context("ports must be a list")? {
-            let (target, published, protocol, mode) = if let Some(s) = port.as_str() {
-                let (s, protocol) = s.split_once('/').unwrap_or((s, "tcp"));
-                let parts: Vec<_> = s.split(':').collect();
-                ensure!(
-                    parts.len() == 2,
-                    "selected Swarm ports require published:target without a host IP or range"
-                );
-                (
-                    parts[1].into(),
-                    parts[0].into(),
-                    protocol.into(),
-                    "ingress".into(),
-                )
-            } else {
-                for key in object(port, "port")?.keys() {
-                    ensure!(
-                        ["target", "published", "protocol", "mode"].contains(&key.as_str()),
-                        "unsupported selected port field {key}"
-                    );
-                }
-                (
-                    text(&port["target"])?,
-                    text(&port["published"])?,
-                    port.get("protocol")
-                        .and_then(Value::as_str)
-                        .unwrap_or("tcp")
-                        .into(),
-                    port.get("mode")
-                        .and_then(Value::as_str)
-                        .unwrap_or("ingress")
-                        .into(),
-                )
-            };
-            let (target, published, protocol, mode): (String, String, String, String) =
-                (target, published, protocol, mode);
-            ensure!(
-                target.parse::<u16>().is_ok() && published.parse::<u16>().is_ok(),
-                "ports must be single numeric ports"
-            );
-            list_insert(
-                &mut options,
-                "publish",
-                format!("{target}/{protocol}"),
-                format!("target={target},published={published},protocol={protocol},mode={mode}"),
-            );
-        }
-    }
-    for kind in ["secrets", "configs"] {
-        if let Some(values) = fields.get(kind) {
-            for value in values
-                .as_array()
-                .context("secret/config references must be a list")?
-            {
-                let logical = value
-                    .as_str()
-                    .or_else(|| value.get("source").and_then(Value::as_str))
-                    .context("secret/config reference requires source")?;
-                if let Some(map) = value.as_object() {
-                    for field in map.keys() {
-                        ensure!(
-                            ["source", "target", "uid", "gid", "mode"].contains(&field.as_str()),
-                            "unsupported {kind} attachment {field}"
-                        );
-                    }
-                }
-                let source = resource_name(project, logical, &rendered[kind][logical]);
-                let mut entry = format!(
-                    "source={source},target={}",
-                    value
-                        .get("target")
-                        .and_then(Value::as_str)
-                        .unwrap_or(logical)
-                );
-                for field in ["uid", "gid", "mode"] {
-                    let encoded = if let Some(v) = value.get(field) {
-                        if field == "mode" && v.is_number() {
-                            format!("{:04o}", v.as_u64().context("mode must be nonnegative")?)
-                        } else {
-                            text(v)?
-                        }
-                    } else {
-                        if field == "mode" {
-                            "0444".into()
-                        } else {
-                            "0".into()
-                        }
-                    };
-                    entry.push_str(&format!(",{field}={encoded}"));
-                }
-                list_insert(
-                    &mut options,
-                    if kind == "secrets" {
-                        "secret"
-                    } else {
-                        "config"
-                    },
-                    source,
-                    entry,
-                );
-            }
-        }
-    }
-    if let Some(health) = fields.get("healthcheck") {
-        for key in object(health, "healthcheck")?.keys() {
-            ensure!(
-                [
-                    "disable",
-                    "test",
-                    "interval",
-                    "timeout",
-                    "retries",
-                    "start_period",
-                    "start_interval"
-                ]
-                .contains(&key.as_str()),
-                "unsupported healthcheck.{key}"
-            );
-        }
-        if health.get("disable").and_then(Value::as_bool) == Some(true) {
-            options
-                .scalar
-                .insert("no-healthcheck".into(), "true".into());
-        }
-        if let Some(test) = health.get("test") {
-            let test = strings(test, "healthcheck test")?;
-            ensure!(
-                test.first().map(String::as_str) == Some("CMD-SHELL") && test.len() == 2,
-                "selected healthcheck requires [CMD-SHELL, command] syntax"
-            );
-            options.scalar.insert("health-cmd".into(), test[1].clone());
-        }
-        for field in [
-            "interval",
-            "timeout",
-            "retries",
-            "start_period",
-            "start_interval",
-        ] {
-            if let Some(value) = health.get(field) {
-                options
-                    .scalar
-                    .insert(format!("health-{}", field.replace('_', "-")), text(value)?);
-            }
-        }
-    }
-    if let Some(logging) = fields.get("logging") {
-        for field in object(logging, "logging")?.keys() {
-            ensure!(
-                ["driver", "options"].contains(&field.as_str()),
-                "unsupported logging.{field}"
-            );
-        }
-        if let Some(driver) = logging.get("driver") {
-            options.scalar.insert("log-driver".into(), text(driver)?);
-        }
-        if let Some(values) = logging.get("options") {
-            for (key, value) in key_values(values)? {
-                list_insert(
-                    &mut options,
-                    "log-opt",
-                    key.clone(),
-                    format!("{key}={value}"),
-                );
-            }
-        }
-    }
-    Ok(options)
-}
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-fn live_options(
-    service: &Value,
-    networks: &BTreeMap<String, String>,
-    recorded: &ServiceOptions,
-    intent: Option<&ServiceOptions>,
-) -> Result<ServiceOptions> {
-    let spec = service
-        .get("Spec")
-        .context("live service is missing Spec")?;
-    let container = spec
-        .pointer("/TaskTemplate/ContainerSpec")
-        .context("live service has no container specification")?;
-    let mut old = recorded.clone();
-    old.lists.clear();
-    if let Some(intent) = intent {
-        for (key, value) in &intent.scalar {
-            old.scalar.insert(key.clone(), value.clone());
-        }
-    }
-    old.image = container
-        .get("Image")
-        .and_then(Value::as_str)
-        .context("live service has no image")?
-        .into();
-    old.scalar.insert(
-        "mode".into(),
-        if spec.pointer("/Mode/Global").is_some() {
-            "global"
-        } else {
-            "replicated"
-        }
-        .into(),
-    );
-    old.command = container
-        .get("Args")
-        .and_then(Value::as_array)
-        .filter(|v| {
-            !v.is_empty()
-                || recorded.command.is_some()
-                || intent.is_some_and(|i| i.command.is_some())
-        })
-        .map(|v| strings(&json!(v), "live args"))
-        .transpose()?;
-    for (field, option) in [
-        ("User", "user"),
-        ("Dir", "workdir"),
-        ("Hostname", "hostname"),
-    ] {
-        if let Some(value) = container
-            .get(field)
-            .and_then(Value::as_str)
-            .filter(|v| !v.is_empty())
-        {
-            old.scalar.insert(option.into(), value.into());
-        }
-    }
-    if let Some(command) = container
-        .get("Command")
-        .and_then(Value::as_array)
-        .filter(|v| !v.is_empty())
-    {
-        old.scalar.insert(
-            "entrypoint".into(),
-            strings(&json!(command), "live entrypoint")?
-                .iter()
-                .map(|v| shell_quote(v))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-    }
-    for (field, option) in [("ReadOnly", "read-only"), ("Init", "init"), ("TTY", "tty")] {
-        if container.get(field).and_then(Value::as_bool) == Some(true) {
-            old.scalar.insert(option.into(), "true".into());
-        }
-    }
-    for field in ["CapabilityAdd", "CapabilityDrop", "Groups", "Hosts"] {
-        ensure!(
-            container
-                .get(field)
-                .and_then(Value::as_array)
-                .is_none_or(Vec::is_empty),
-            "live selected service contains unsupported {field}; inspect the recorded intent and explicitly reconcile with a reviewed full deployment"
-        );
-    }
-    if let Some(env) = container.get("Env") {
-        for (key, value) in key_values(env)? {
-            list_insert(&mut old, "env", key.clone(), format!("{key}={value}"));
-        }
-    }
-    for (value, kind) in [
-        (container.get("Labels"), "container-label"),
-        (spec.get("Labels"), "label"),
-    ] {
-        if let Some(value) = value {
-            for (key, value) in key_values(value)? {
-                list_insert(&mut old, kind, key.clone(), format!("{key}={value}"));
-            }
-        }
-    }
-    if let Some(attachments) = spec
-        .pointer("/TaskTemplate/Networks")
-        .and_then(Value::as_array)
-    {
-        for attachment in attachments {
-            let target = attachment
-                .get("Target")
-                .and_then(Value::as_str)
-                .context("live network has no target")?;
-            let name = networks
-                .get(target)
-                .context("live network target has no ownership-checked name resolution")?;
-            let mut value = format!("name={name}");
-            if let Some(aliases) = attachment.get("Aliases") {
-                for alias in strings(aliases, "live aliases")?
-                    .into_iter()
-                    .collect::<BTreeSet<_>>()
-                {
-                    ensure!(
-                        !alias.contains(','),
-                        "live network alias cannot be safely represented"
-                    );
-                    value.push_str(&format!(",alias={alias}"));
-                }
-            }
-            list_insert(&mut old, "network", name.clone(), value);
-        }
-    }
-    if let Some(mounts) = container.get("Mounts").and_then(Value::as_array) {
-        for mount in mounts {
-            let kind = mount
-                .get("Type")
-                .and_then(Value::as_str)
-                .context("live mount has no type")?;
-            ensure!(
-                ["bind", "volume"].contains(&kind),
-                "live mount type {kind} cannot be reconciled through selected apply; explicitly reconcile the full deployment"
-            );
-            let source = mount
-                .get("Source")
-                .and_then(Value::as_str)
-                .context("live mount has no source")?;
-            let target = mount
-                .get("Target")
-                .and_then(Value::as_str)
-                .context("live mount has no target")?;
-            ensure!(
-                !source.contains(',') && !target.contains(','),
-                "live mount paths cannot be represented safely"
-            );
-            let readonly = mount
-                .get("ReadOnly")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            list_insert(
-                &mut old,
-                "mount",
-                target.into(),
-                format!("type={kind},source={source},target={target},readonly={readonly}"),
-            );
-        }
-    }
-    if let Some(ports) = spec
-        .pointer("/EndpointSpec/Ports")
-        .and_then(Value::as_array)
-    {
-        for port in ports {
-            let target = port
-                .get("TargetPort")
-                .and_then(Value::as_u64)
-                .context("live published port has no target")?;
-            let published = port
-                .get("PublishedPort")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let protocol = port
-                .get("Protocol")
-                .and_then(Value::as_str)
-                .unwrap_or("tcp");
-            let mode = port
-                .get("PublishMode")
-                .and_then(Value::as_str)
-                .unwrap_or("ingress");
-            list_insert(
-                &mut old,
-                "publish",
-                format!("{target}/{protocol}"),
-                format!("target={target},published={published},protocol={protocol},mode={mode}"),
-            );
-        }
-    }
-    for (field, kind, name_field) in [
-        ("Secrets", "secret", "SecretName"),
-        ("Configs", "config", "ConfigName"),
-    ] {
-        if let Some(references) = container.get(field).and_then(Value::as_array) {
-            for reference in references {
-                let name = reference
-                    .get(name_field)
-                    .and_then(Value::as_str)
-                    .context("live immutable reference has no native name")?;
-                let file = reference
-                    .get("File")
-                    .context("live immutable reference is not a supported file attachment")?;
-                let target = file
-                    .get("Name")
-                    .and_then(Value::as_str)
-                    .context("live immutable reference has no file target")?;
-                let uid = file.get("UID").and_then(Value::as_str).unwrap_or("0");
-                let gid = file.get("GID").and_then(Value::as_str).unwrap_or("0");
-                let mode = file.get("Mode").and_then(Value::as_u64).unwrap_or(0o444);
-                list_insert(
-                    &mut old,
-                    kind,
-                    name.into(),
-                    format!("source={name},target={target},uid={uid},gid={gid},mode={mode:04o}"),
-                );
-            }
-        }
-    }
-    if let Some(constraints) = spec.pointer("/TaskTemplate/Placement/Constraints") {
-        for constraint in strings(constraints, "live constraints")? {
-            list_insert(&mut old, "constraint", constraint.clone(), constraint);
-        }
-    }
-    if let Some(options) = spec.pointer("/TaskTemplate/LogDriver/Options") {
-        for (key, value) in key_values(options)? {
-            list_insert(&mut old, "log-opt", key.clone(), format!("{key}={value}"));
-        }
-    }
-    Ok(old)
-}
-fn current_options(
-    project: &Project,
-    docker: &Docker,
-    native: &str,
-    owner: &str,
-    recorded: &ServiceOptions,
-) -> Result<(String, ServiceOptions)> {
-    let service = inspect(docker, "service", native)?;
-    ensure!(
-        service
-            .pointer("/Spec/Labels")
-            .and_then(|v| v.get(OWNER))
-            .and_then(Value::as_str)
-            == Some(owner)
-            && service
-                .pointer("/Spec/Labels")
-                .and_then(|v| v.get(PROJECT))
-                .and_then(Value::as_str)
-                == Some(project.name()?),
-        "live service {native} is not owned; refusing to adopt its state"
-    );
-    let id = service
-        .get("ID")
-        .and_then(Value::as_str)
-        .context("live service has no immutable ID")?
-        .to_owned();
-    let mut networks = BTreeMap::new();
-    if let Some(attachments) = service
-        .pointer("/Spec/TaskTemplate/Networks")
-        .and_then(Value::as_array)
-    {
-        for attachment in attachments {
-            let target = attachment
-                .get("Target")
-                .and_then(Value::as_str)
-                .context("live network has no target")?;
-            let network = inspect(docker, "network", target)?;
-            networks.insert(
-                target.into(),
-                network
-                    .get("Name")
-                    .and_then(Value::as_str)
-                    .context("live network has no name")?
-                    .into(),
-            );
-        }
-    }
-    let intents = state::read(&project.root, "deployment-intents")?;
-    let intent = if let Some(intent) = intents["services"].get(native) {
-        ensure!(
-            intents["owner"].as_str() == Some(owner)
-                && intents["context"].as_str() == Some(docker.context()?.as_str()),
-            "interrupted deployment intent belongs to another context/owner"
-        );
-        Some(adapter(
-            project.name()?,
-            &intent["definition"],
-            &intent["rendered"],
-        )?)
-    } else {
-        None
-    };
-    let options = live_options(&service, &networks, recorded, intent.as_ref())?;
-    Ok((id, options))
-}
-
-fn selected_operation(
-    name: &str,
-    desired: &ServiceOptions,
-    previous: Option<&ServiceOptions>,
-) -> Result<Vec<String>> {
-    let update = previous.is_some();
-    let mut argv = args(&[
-        "service",
-        if update { "update" } else { "create" },
-        "--detach",
-        "--with-registry-auth",
-    ]);
-    if !update {
-        flag(&mut argv, "--name", name);
-    }
-    if let Some(old) = previous {
-        ensure!(
-            old.scalar.get("mode") == desired.scalar.get("mode"),
-            "selected update cannot change service mode; recreate that service explicitly"
-        );
-        for key in old.scalar.keys() {
-            ensure!(
-                desired.scalar.contains_key(key),
-                "selected update cannot safely reset removed option {key}; declare an explicit value or use a full deployment"
-            );
-        }
-        ensure!(
-            old.command.is_none() || desired.command.is_some(),
-            "selected update cannot reset command to unknown image defaults; declare explicit argv or use full deployment"
-        );
-    }
-    for (key, value) in &desired.scalar {
-        if update && key == "mode" {
-            continue;
-        }
-        if key == "no-healthcheck" {
-            if value == "true" {
-                argv.push("--no-healthcheck".into());
-            }
-            continue;
-        }
-        if ["read-only", "init", "tty"].contains(&key.as_str()) {
-            argv.push(format!("--{key}={value}"));
-        } else {
-            flag(&mut argv, &format!("--{key}"), value.clone());
-        }
-    }
-    for kind in [
-        "env",
-        "container-label",
-        "label",
-        "network",
-        "mount",
-        "publish",
-        "secret",
-        "config",
-        "constraint",
-        "log-opt",
-    ] {
-        let new = desired.lists.get(kind);
-        let old = previous.and_then(|p| p.lists.get(kind));
-        if update && kind == "log-opt" {
-            ensure!(
-                old.is_none_or(|o| o.keys().all(|k| new.is_some_and(|n| n.contains_key(k)))),
-                "selected update cannot remove logging options safely; use a full deployment"
-            );
-        }
-        if let Some(old) = old {
-            for (key, value) in old {
-                if new.and_then(|n| n.get(key)) != Some(value) && kind != "log-opt" {
-                    flag(&mut argv, &format!("--{kind}-rm"), key.clone());
-                }
-            }
-        }
-        if let Some(new) = new {
-            for (key, value) in new {
-                if !update || old.and_then(|o| o.get(key)) != Some(value) {
-                    flag(
-                        &mut argv,
-                        &format!(
-                            "--{kind}{}",
-                            if update && kind != "log-opt" {
-                                "-add"
-                            } else {
-                                ""
-                            }
-                        ),
-                        value.clone(),
-                    );
-                }
-            }
-        }
-    }
-    if update {
-        flag(&mut argv, "--image", desired.image.clone());
-        if let Some(command) = &desired.command {
-            flag(
-                &mut argv,
-                "--args",
-                command
-                    .iter()
-                    .map(|s| shell_quote(s))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
-        }
-        argv.push(name.into());
-    } else {
-        argv.push(desired.image.clone());
-        if let Some(command) = &desired.command {
-            argv.extend(command.clone());
-        }
-    }
-    Ok(argv)
-}
 fn owned_services(project: &Project, docker: &Docker, owner: &str) -> Result<Vec<String>> {
     let names = docker.capture(
         &args(&[
@@ -1646,6 +618,17 @@ fn disappeared_tasks(error: &anyhow::Error, ids: &[&str]) -> bool {
                 .is_some_and(|id| ids.contains(&id))
         })
 }
+
+fn validate_task_linkage(service: &Value, tasks: Option<&[Value]>) -> Result<()> {
+    let id = service["ID"].as_str().context("service has no immutable ID")?;
+    if let Some(tasks) = tasks {
+        for task in tasks {
+            ensure!(task["ServiceID"].as_str() == Some(id) && task["ID"].as_str().is_some(),
+                "Swarm task immutable service linkage could not be verified");
+        }
+    }
+    Ok(())
+}
 fn wait_convergence(
     project: &Project,
     names: &[String],
@@ -1661,7 +644,13 @@ fn wait_convergence(
         for name in names {
             let native = format!("{}_{}", project.name()?, name);
             let service = inspect(docker, "service", &native)?;
-            let tasks = tasks(docker, &native)?;
+            ensure!(service["Spec"]["Labels"][OWNER].as_str() == Some(project.owner()?)
+                && service["Spec"]["Labels"][PROJECT].as_str() == Some(project.name()?),
+                "service {native} ownership changed during convergence; observed owner {}",
+                service["Spec"]["Labels"][OWNER]);
+            let id = service["ID"].as_str().context("service has no immutable ID")?;
+            let tasks = tasks(docker, id)?;
+            validate_task_linkage(&service, tasks.as_deref())?;
             let pin = rendered["services"][name]["image"]
                 .as_str()
                 .context("missing pinned image")?;
@@ -1699,7 +688,7 @@ fn wait_convergence(
             let oneshot = runtime::one_shot(project, name)?;
             let (ready, successful, failure) = swarm_container_status(&service, tasks.as_deref(), desired, oneshot);
             if let Some(reason) = failure {
-                bail!("{native}: {reason}; completed prerequisites/migrations are not rolled back, previous snapshots and secret revisions are retained");
+                bail!("{native}: {reason}; completed prerequisites/migrations are not rolled back; inspect Docker's live service state");
             }
             all &= ready && service.pointer("/Spec/TaskTemplate/ContainerSpec/Image")
                 .and_then(Value::as_str) == Some(pin);
@@ -1778,126 +767,10 @@ fn run_actions(
     actions: &[&Value],
     docker: &Docker,
     output: &Output,
-    operation: &str,
 ) -> Result<()> {
-    journal(
-        project,
-        operation,
-        json!({"phase":"prerequisites","state":"started","actions":actions}),
-    )?;
-    runtime::execute_action_sequence(project, "deploy", names, actions, docker, output)?;
-    journal(
-        project,
-        operation,
-        json!({"phase":"prerequisites","state":"completed","actions":actions}),
-    )
+    runtime::execute_action_sequence(project, "deploy", names, actions, docker, output)
 }
-fn read_owner(project: &Project, context: &str, required: bool) -> Result<String> {
-    let identity = state::read(&project.root, "identity")?;
-    let Some(id) = identity.get("id").and_then(Value::as_str) else {
-        ensure!(
-            !required,
-            "no Dockstride ownership identity; refusing to operate by stack name alone"
-        );
-        return Ok("<new-owner>".into());
-    };
-    let root = std::fs::canonicalize(&project.root)?
-        .to_string_lossy()
-        .into_owned();
-    ensure!(
-        identity["root"].as_str() == Some(root.as_str()),
-        "environment identity belongs to another checkout"
-    );
-    ensure!(
-        identity["project"].as_str() == Some(project.name()?)
-            && identity["backend"].as_str() == Some(project.backend()?),
-        "project/backend differs from recorded ownership identity"
-    );
-    if let Some(recorded) = identity
-        .get("context")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        ensure!(
-            recorded == context,
-            "Docker context differs from environment ownership identity"
-        );
-    }
-    Ok(id.into())
-}
-fn merge_selected_snapshot(
-    previous: &Value,
-    rendered: &Value,
-    names: &[String],
-    project: &str,
-) -> Result<Value> {
-    let mut committed = previous.clone();
-    if !committed["secrets"].is_object() {
-        committed["secrets"] = json!({});
-    }
-    if let Some(old_secrets) = previous.get("secrets").and_then(Value::as_object) {
-        for (logical, old) in old_secrets {
-            if rendered["secrets"].get(logical) == Some(old) {
-                continue;
-            }
-            let retained = resource_name(project, logical, old);
-            let alias = format!("dks-retained-{retained}");
-            if let Some(existing) = committed["secrets"].get(&alias) {
-                ensure!(
-                    existing == old,
-                    "retained secret alias conflicts with project declaration"
-                );
-            }
-            committed["secrets"][&alias] = old.clone();
-            for (name, service) in committed["services"]
-                .as_object_mut()
-                .context("snapshot services must be a record")?
-            {
-                if names.contains(name) {
-                    continue;
-                }
-                if let Some(references) = service.get_mut("secrets").and_then(Value::as_array_mut) {
-                    for reference in references {
-                        if reference.as_str() == Some(logical.as_str()) {
-                            *reference = json!({"source":alias,"target":logical});
-                        } else if reference.get("source").and_then(Value::as_str)
-                            == Some(logical.as_str())
-                        {
-                            reference["source"] = json!(alias);
-                            if reference.get("target").is_none() {
-                                reference["target"] = json!(logical);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if let Some(secrets) = rendered.get("secrets").and_then(Value::as_object) {
-        for (key, value) in secrets {
-            committed["secrets"][key] = value.clone();
-        }
-    }
-    for name in names {
-        committed["services"][name] = rendered["services"][name].clone();
-    }
-    Ok(committed)
-}
-
-fn deployment_state(root: &std::path::Path) -> Result<Value> {
-    let committed = state::read(root, "deployment")?;
-    let applied = state::read(root, "deployment-applied")?;
-    if applied.get("active").and_then(Value::as_bool) == Some(true)
-        && applied.get("revision") != committed.get("revision")
-    {
-        Ok(applied)
-    } else {
-        Ok(committed)
-    }
-}
-
 fn recheck_environment(project: &Project) -> Result<()> {
-    runtime::recover_publication(&project.root)?;
     let current = crate::sources::snapshot(&project.root, None)?.values;
     let fields = if current.get("project").is_none() || current.get("backend").is_none() {
         crate::nickel::schema_values(&project.root, &current)?
@@ -1915,23 +788,28 @@ fn recheck_environment(project: &Project) -> Result<()> {
 
 pub fn deploy(
     project: &Project,
-    selected: &[String],
     plan_only: bool,
     timeout: u64,
     output: &Output,
 ) -> Result<Value> {
-    ensure!(
-        project.backend()? == "swarm",
-        "deploy requires backend=swarm"
-    );
+    ensure!(project.backend()? == "swarm", "deploy requires backend=swarm");
     validate_model(project)?;
     crate::diagnostics::validate(project)?;
-    let names = selection(project, selected)?;
+    let names = selection(project, &[])?;
     let before = deployment_actions(project, &names, "before")?;
     let after = deployment_actions(project, &names, "after")?;
-    let _lock = if plan_only {
-        None
-    } else {
+    // Validate every authored build target before any command can build/publish.
+    for name in &names {
+        let image = image_name(project, name)?;
+        if project.services()?[name].get("build").is_some() {
+            ensure!(!image.contains('@'),
+                "service {name}: a build target cannot contain a digest; declare a registry repository/tag");
+            ensure!(registry(repository(&image)).is_some(),
+                "service {name}: built images require an explicit registry repository");
+            build_args(project, name, &named_image(&image))?;
+        }
+    }
+    let _lock = if plan_only { None } else {
         let lock = state::lock(&project.root, "lifecycle")?;
         recheck_environment(project)?;
         Some(lock)
@@ -1939,301 +817,106 @@ pub fn deploy(
     let docker = Docker::new(&project.root, output.clone())
         .with_deadline(Instant::now() + Duration::from_secs(timeout.max(1)));
     let preflight = (|| -> Result<(String, Value)> {
-        let context = docker.context()?;
-        let info = manager(&docker)?;
-        Ok((context, info))
+        Ok((docker.context()?, manager(&docker)?))
     })();
     let (context, info) = preflight.map_err(|error| {
         if plan_only { error }
         else { runtime::startup_diagnostics(error, project, &names, timeout, &docker, output) }
     })?;
-    let previous = deployment_state(&project.root)?;
-    if previous.get("active").and_then(Value::as_bool) == Some(true) {
-        ensure!(
-            previous.get("context").and_then(Value::as_str) == Some(context.as_str()),
-            "deployment snapshot belongs to a different Docker context; switch back or explicitly create a separate environment"
-        );
-    }
-    let owner = if plan_only {
-        read_owner(project, &context, false)?
-    } else {
-        runtime::validate_ownership(project, &docker, true)
-            .map_err(|error| runtime::startup_diagnostics(error, project, &names, timeout, &docker, output))?
-    };
-    let mut rendered = render_owned(project, &owner)?;
-    shared_scope(&rendered, &previous, !selected.is_empty())?;
+    let owner = project.owner()?;
+    runtime::validate_ownership(project, &docker)?;
+    let mut rendered = render_owned(project, owner)?;
     for name in &names {
         let image = image_name(project, name)?;
-        if project.services()?[name].get("build").is_some() {
-            ensure!(
-                registry(repository(&image)).is_some(),
-                "service {name}: built images require an explicit registry repository"
-            );
-        }
-        if info
-            .pointer("/Swarm/Nodes")
-            .and_then(Value::as_u64)
-            .unwrap_or(1)
-            > 1
-            && let Some(host) = registry(repository(&image))
-        {
-            let loopback = host == "localhost"
-                || host.starts_with("localhost:")
-                || host == "127.0.0.1"
-                || host.starts_with("127.0.0.1:")
-                || host.starts_with("[::1]")
-                || host.starts_with("0.0.0.0");
-            ensure!(
-                !loopback,
-                "service {name}: a multi-node Swarm cannot distribute images through a loopback-only registry"
-            );
-        }
-        if !selected.is_empty() {
-            adapter(project.name()?, &rendered["services"][name], &rendered)?;
-            if let Some(old) = previous.pointer(&format!("/rendered/services/{name}")) {
-                let old = adapter(project.name()?, old, &previous["rendered"])?;
-                let new = adapter(project.name()?, &rendered["services"][name], &rendered)?;
-                selected_operation(&format!("{}_{}", project.name()?, name), &new, Some(&old))?;
-            }
+        if info.pointer("/Swarm/Nodes").and_then(Value::as_u64).unwrap_or(1) > 1
+            && let Some(host) = registry(repository(&image)) {
+            let loopback = host == "localhost" || host.starts_with("localhost:")
+                || host == "127.0.0.1" || host.starts_with("127.0.0.1:")
+                || host.starts_with("[::1]") || host.starts_with("0.0.0.0");
+            ensure!(!loopback,
+                "service {name}: a multi-node Swarm cannot distribute images through a loopback-only registry");
         }
     }
+    check_resources(project, &rendered, &names, &docker, owner)?;
     let mut image_plan = Map::new();
-    for name in &names {
-        let image = image_name(project, name)?;
-        image_plan.insert(name.clone(),json!({"source":image,"build":project.services()?[name].get("build"),"revision":if project.services()?[name].get("build").is_some(){"new immutable revision or reusable identical image"}else{"resolve registry digest"},"previous":previous["images"][name],"registry":registry(repository(&image))}));
-    }
     let mut operations = Vec::new();
     for name in &names {
         let image = image_name(project, name)?;
-        if project.services()?[name].get("build").is_some() {
-            let tag = format!("{}:dks-<new-revision>", repository(&image));
+        let build = project.services()?[name].get("build");
+        image_plan.insert(name.clone(), json!({"source":image,"build":build,
+            "registry":registry(repository(&image))}));
+        if build.is_some() {
+            let tag = named_image(&image);
             operations.push(json!({"phase":"build","argv":build_args(project,name,&tag)?}));
-            operations.push(json!({"phase":"publish","argv":["push",tag],"condition":"image ID differs from the recorded immutable revision"}));
+            operations.push(json!({"phase":"publish","argv":["push",tag]}));
         } else {
             operations.push(json!({"phase":"pull","argv":["pull",image]}));
         }
     }
     for action in &before {
-        operations.push(
-            json!({"phase":"prerequisite","name":action["name"],"projectArgv":action["argv"]}),
-        );
+        operations.push(json!({"phase":"prerequisite","name":action["name"],"projectArgv":action["argv"]}));
     }
-    if selected.is_empty() {
-        operations.push(json!({"phase":"apply","argv":["stack","deploy","--detach=true","--with-registry-auth","--compose-file","<pinned-snapshot>",project.name()?]}));
-    } else {
-        for name in &names {
-            let mut desired = rendered["services"][name].clone();
-            desired["image"] = json!("<registry-digest>");
-            let new = adapter(project.name()?, &desired, &rendered)?;
-            let native = format!("{}_{}", project.name()?, name);
-            let existing = owned_services(project, &docker, &owner)?;
-            let (native_id, old) = if existing.contains(&native) {
-                let recorded = adapter(
-                    project.name()?,
-                    previous["rendered"]["services"]
-                        .get(name)
-                        .context("owned selected service has no recorded specification")?,
-                    &previous["rendered"],
-                )?;
-                let (id, current) = current_options(project, &docker, &native, &owner, &recorded)?;
-                (id, Some(current))
-            } else {
-                (native, None)
-            };
-            operations.push(
-                json!({"phase":"apply","argv":selected_operation(&native_id,&new,old.as_ref())?}),
-            );
-        }
-    }
-    operations.push(json!({"phase":"convergence","argv":["service","inspect","<selected-service>"],"timeoutSeconds":timeout}));
+    operations.push(json!({"phase":"apply","argv":["stack","deploy","--detach=true",
+        "--with-registry-auth","--compose-file","<temporary-full-manifest>",project.name()?]}));
+    operations.push(json!({"phase":"convergence","services":names,"timeoutSeconds":timeout}));
     for action in &after {
-        operations
-            .push(json!({"phase":"after","name":action["name"],"projectArgv":action["argv"]}));
+        operations.push(json!({"phase":"after","name":action["name"],"projectArgv":action["argv"]}));
     }
-    let plan = json!({"backend":"swarm","context":context,"project":project.name()?,"selectedServices":names,"scope":if selected.is_empty(){"full stack, no pruning"}else{"selected services only; no implicit dependencies"},"images":image_plan,"prerequisites":{"before":before,"after":after},"secrets":rendered.get("secrets"),"sharedResources":{"networks":rendered.get("networks"),"volumes":rendered.get("volumes"),"configs":rendered.get("configs")},"dockerOperations":operations,"planOnly":plan_only});
     if plan_only {
-        return Ok(plan);
+        return Ok(json!({"backend":"swarm","context":context,"project":project.name()?,
+            "owner":owner,"services":names,"scope":"full stack, no pruning","images":image_plan,
+            "prerequisites":{"before":before,"after":after},"secrets":rendered.get("secrets"),
+            "sharedResources":{"networks":rendered.get("networks"),"volumes":rendered.get("volumes"),
+                "configs":rendered.get("configs")},"dockerOperations":operations,"planOnly":true}));
     }
-    // Keep the baseline check next to application even while holding the lifecycle lock.
-    ensure!(
-        deployment_state(&project.root)? == previous,
-        "deployment changed while planning; rerun against the new snapshot"
-    );
-    check_resources(project, &rendered, &previous, &names, &docker, &owner).map_err(|error| {
-        if error.is::<runtime::DockerError>() || error.is::<runtime::DeadlineExceeded>() {
-            runtime::startup_diagnostics(error, project, &names, timeout, &docker, output)
-        } else { error }
-    })?;
-    let operation = format!("deploy-{}", state::random_id()?);
-    journal(
-        project,
-        &operation,
-        json!({"state":"started","plan":plan,"previous":previous}),
-    )?;
+    output.event("target", &format!("project={} backend=swarm checkout={owner} Docker target={context}", project.name()?))?;
     let result = (|| -> Result<Value> {
-        let images = resolve_images(project, &names, &previous, &docker, output, &operation)?;
+        let images = resolve_images(project, &names, &docker, output)?;
         for name in &names {
-            rendered["services"][name]["image"] = images[name]["digest"].clone();
+            rendered["services"][name]["image"] = json!(images[name]);
         }
-        let snapshot_rendered = if selected.is_empty() {
-            rendered.clone()
-        } else {
-            merge_selected_snapshot(&previous["rendered"], &rendered, &names, project.name()?)?
-        };
-        let snapshot_path = project
-            .root
-            .join(".dockstride")
-            .join(format!("{operation}.yaml"));
-        state::atomic_write(
-            &snapshot_path,
-            serde_yaml::to_string(&snapshot_rendered)?.as_bytes(),
-            0o600,
-        )?;
-        state::save(
-            &project.root,
-            &format!("snapshot-{operation}"),
-            &json!({"context":context,"owner":owner,"selectedServices":names,"rendered":snapshot_rendered,"images":images,"previous":previous}),
-        )?;
-        output.event("prerequisites","running only explicitly declared deploy prerequisites; Swarm does not infer depends_on")?;
-        run_actions(project, &names, &before, &docker, output, &operation)?;
-        state::mark_resources(&project.root, true)?;
-        let mut applied = previous.clone();
-        if !applied.is_object() {
-            applied = json!({});
-        }
-        applied["active"] = json!(true);
-        applied["context"] = json!(context);
-        applied["owner"] = json!(owner);
-        applied["project"] = json!(project.name()?);
-        applied["revision"] = json!(operation);
-        applied["images"] = json!(images);
-        applied["snapshot"] = json!(snapshot_path);
-        if selected.is_empty() {
-            operation_run(
-                project,
-                &docker,
-                &operation,
-                output,
-                "apply",
-                &args(&[
-                    "stack",
-                    "deploy",
-                    "--detach=true",
-                    "--with-registry-auth",
-                    "--compose-file",
-                    snapshot_path
-                        .to_str()
-                        .context("snapshot path is not UTF-8")?,
-                    project.name()?,
-                ]),
-            )?;
-            applied["rendered"] = rendered.clone();
-            state::save(&project.root, "deployment-applied", &applied)?;
-        } else {
-            let existing = owned_services(project, &docker, &owner)?;
-            for name in &names {
-                let native = format!("{}_{}", project.name()?, name);
-                let new = adapter(project.name()?, &rendered["services"][name], &rendered)?;
-                let (native_id, old) = if existing.contains(&native) {
-                    let recorded=adapter(project.name()?,previous["rendered"]["services"].get(name).context("existing selected service has no recorded specification; refuse unsafe adoption")?,&previous["rendered"])?;
-                    let (id, current) =
-                        current_options(project, &docker, &native, &owner, &recorded)?;
-                    (id, Some(current))
-                } else {
-                    (native.clone(), None)
-                };
-                let mut argv = selected_operation(&native_id, &new, old.as_ref())?;
-                // Stack namespace label keeps native stack tooling transparent for scoped creates.
-                if old.is_none() {
-                    argv.splice(
-                        2..2,
-                        args(&[
-                            "--label",
-                            &format!("com.docker.stack.namespace={}", project.name()?),
-                        ]),
-                    );
-                }
-                let mut intents = state::read(&project.root, "deployment-intents")?;
-                if !intents.is_object() {
-                    intents = json!({"services":{}});
-                }
-                intents["owner"] = json!(owner);
-                intents["context"] = json!(context);
-                intents["services"][&native] = json!({"operation":operation,"definition":rendered["services"][name],"rendered":rendered,"docker":argv});
-                state::save(&project.root, "deployment-intents", &intents)?;
-                journal(
-                    project,
-                    &operation,
-                    json!({"phase":"apply-intent","service":native,"nativeId":native_id,"docker":argv}),
-                )?;
-                operation_run(project, &docker, &operation, output, "apply", &argv)?;
-                applied["rendered"] = merge_selected_snapshot(
-                    &applied["rendered"],
-                    &rendered,
-                    std::slice::from_ref(name),
-                    project.name()?,
-                )?;
-                state::save(&project.root, "deployment-applied", &applied)?;
-                intents["services"]
-                    .as_object_mut()
-                    .context("intent services must be a record")?
-                    .remove(&native);
-                state::save(&project.root, "deployment-intents", &intents)?;
-            }
-        }
+        let mut temporary_project = project.clone();
+        temporary_project.model = rendered.clone();
+        let manifest = runtime::write_render(&temporary_project, "swarm")?;
+        output.event("prerequisites",
+            "running only explicitly declared deploy prerequisites; Swarm does not infer depends_on")?;
+        run_actions(project, &names, &before, &docker, output)?;
+        runtime::validate_ownership(project, &docker)?;
+        check_resources(project, &rendered, &names, &docker, owner)?;
+        operation_run(&docker, output, "apply", &args(&["stack","deploy","--detach=true",
+            "--with-registry-auth","--compose-file",
+            manifest.path().to_str().context("temporary manifest path is not UTF-8")?,project.name()?]))?;
         let convergence = wait_convergence(project, &names, &rendered, &docker, timeout, output)?;
-        run_actions(project, &names, &after, &docker, output, &operation)?;
-        let committed = snapshot_rendered;
-        let record = json!({"active":true,"context":context,"owner":owner,"project":project.name()?,"revision":operation,"snapshot":snapshot_path,"rendered":committed,"images":images,"selectedServices":names,"convergence":convergence});
-        state::save(&project.root, "deployment", &record)?;
-        state::save(&project.root, "deployment-applied", &record)?;
-        journal(
-            project,
-            &operation,
-            json!({"state":"completed","deployment":record}),
-        )?;
-        Ok(
-            json!({"deployed":names,"context":context,"snapshot":snapshot_path,"revision":operation,"convergence":convergence,"secretsRetained":true}),
-        )
+        run_actions(project, &names, &after, &docker, output)?;
+        Ok(json!({"deployed":names,"context":context,"services":images,"convergence":convergence}))
     })();
-    match result {
-        Ok(result) => Ok(result),
-        Err(error) => {
-            // Failure journaling is best effort and must never obscure an
-            // already-applied deployment or the actual Docker/operation error.
-            let _ = journal(
-                project,
-                &operation,
-                json!({"state":if error.is::<runtime::Cancelled>() {"cancelled"} else {"failed"},
-                    "error":format!("{error:#}"),"rollback":"not attempted; migration/application state is not transactional","secretsRetained":true}),
-            );
-            Err(runtime::startup_diagnostics(error, project, &names, timeout, &docker, output))
-        }
-    }
+    result.map_err(|error| runtime::startup_diagnostics(error, project, &names, timeout, &docker, output))
 }
 
-fn status_scope(project: &Project, applied: &Value, selected: &[String]) -> Result<(Value, Vec<String>)> {
-    let rendered = if applied.get("active").and_then(Value::as_bool) == Some(true) {
-        applied.get("rendered").cloned().context("active deployment has no rendered service scope")?
-    } else {
-        project.swarm()?
-    };
-    let services = rendered.get("services").and_then(Value::as_object)
-        .context("deployment services must be a record")?;
-    // selectedServices describes the last operation, not the accumulated applied
-    // scope. Selected updates retain all previously applied services in rendered.
-    let names = if selected.is_empty() {
-        services.keys().cloned().collect()
-    } else {
-        let mut seen = BTreeSet::new();
-        for name in selected {
-            ensure!(services.contains_key(name), "unknown applied service {name}");
-            ensure!(seen.insert(name), "service {name} was selected twice");
-        }
-        selected.to_vec()
-    };
-    ensure!(!names.is_empty(), "status has no required services");
-    Ok((rendered, names))
+fn status_scope(project: &Project, selected: &[String]) -> Result<(Value, Vec<String>)> {
+    Ok((project.swarm()?, selection(project, selected)?))
+}
+
+fn normalized_image(image: &str) -> String {
+    let named = named_image(image);
+    let repo = repository(&named);
+    let tag = &named[repo.len()..];
+    let hub_path = repo.strip_prefix("docker.io/")
+        .or_else(|| repo.strip_prefix("index.docker.io/"))
+        .or_else(|| repo.strip_prefix("registry-1.docker.io/"));
+    let repo = if let Some(path) = hub_path {
+        if path.contains('/') { format!("docker.io/{path}") }
+        else { format!("docker.io/library/{path}") }
+    } else if registry(repo).is_none() {
+        if repo.contains('/') { format!("docker.io/{repo}") }
+        else { format!("docker.io/library/{repo}") }
+    } else { repo.to_owned() };
+    format!("{repo}{tag}")
+}
+
+fn image_matches(authored: &str, live: &str) -> bool {
+    if authored.contains('@') { authored == live }
+    else { normalized_image(authored) == normalized_image(live) }
 }
 
 fn current_status_tasks<'a>(service: &Value, tasks: &'a [Value]) -> BTreeMap<(u64, &'a str), &'a Value> {
@@ -2311,20 +994,8 @@ pub(crate) fn diagnostic_observations(
     context: &str,
 ) -> Result<Value> {
     manager(docker)?;
-    let applied = deployment_state(&project.root)?;
-    if applied["active"] == true {
-        ensure!(applied["context"].as_str() == Some(context)
-            && applied["owner"].as_str() == Some(owner),
-            "Diagnostic deployment ownership or connection differs from the environment");
-    }
-    // Startup may be adding services outside the previous applied scope.
-    // Explicit selection is desired scope; doctor without selection uses the
-    // accumulated applied scope, with no Compose dependency/profile expansion.
-    let (rendered, names) = if selected.is_empty() {
-        status_scope(project, &applied, selected)?
-    } else {
-        (project.swarm()?, selection(project, selected)?)
-    };
+    ensure!(owner == project.owner()?, "Diagnostic checkout ownership differs from the project");
+    let (rendered, names) = status_scope(project, selected)?;
     let existing: BTreeSet<_> = owned_services(project, docker, owner)?.into_iter().collect();
     let mut services = Vec::new();
     for name in names {
@@ -2385,13 +1056,10 @@ pub(crate) fn diagnostic_observations(
                             let labels = &container["Config"]["Labels"];
                             let direct_owner = labels[OWNER].as_str() == Some(owner)
                                 && labels[PROJECT].as_str() == Some(project.name()?);
-                            let legacy_owner = labels.get(OWNER).is_none()
-                                && labels.get(PROJECT).is_none_or(|project_label|
-                                    project_label.as_str() == Some(project.name().unwrap_or("")));
                             if container["Id"].as_str() == Some(container_id)
                                 && labels["com.docker.swarm.service.id"].as_str() == Some(service_id)
                                 && labels["com.docker.swarm.task.id"].as_str() == Some(task_id)
-                                && (direct_owner || legacy_owner) {
+                                && direct_owner {
                                 let mut state = runtime::diagnostic_container_state(&container);
                                 state["id"] = json!(container_id);
                                 state["taskId"] = json!(task_id);
@@ -2453,14 +1121,10 @@ pub fn status(
         "inspectOnly":inspect_only,"ready":false,"deadlineExceeded":false,
         "requiredServices":[],"excludedServices":[],"services":[],"endpoints":project.endpoints()});
     let result = (|| -> Result<()> {
-        let applied = deployment_state(&project.root).context(crate::status::StatusConfiguration)?;
-        let recorded = applied.get("active").and_then(Value::as_bool) == Some(true);
-        let (rendered, names) = status_scope(project, &applied, selected).context(crate::status::StatusConfiguration)?;
+        let (rendered, names) = status_scope(project, selected).context(crate::status::StatusConfiguration)?;
         let required: BTreeSet<_> = names.iter().cloned().collect();
         let mut visible: BTreeSet<_> = project.services()?.keys().cloned().collect();
         visible.extend(rendered["services"].as_object().context("missing services")?.keys().cloned());
-        report["deploymentRecorded"] = json!(recorded);
-        if !recorded { report["error"] = json!("No recorded deployment; deploy this environment first"); }
         report["requiredServices"] = json!(names);
         report["excludedServices"] = json!(visible.difference(&required).collect::<Vec<_>>());
         report["services"] = json!(visible.iter().map(|name| json!({
@@ -2477,20 +1141,9 @@ pub fn status(
         report["context"] = json!(context);
         let info = manager(&docker).map_err(status_configuration_error)?;
         report["daemonId"] = info.get("ID").cloned().unwrap_or(Value::Null);
-        let identity = state::read(&project.root, "identity")?;
-        let owner = read_owner(project, &context, false).context(crate::status::StatusConfiguration)?;
-        if recorded {
-            (|| -> Result<()> {
-                ensure!(identity.get("id").is_some(), "applied deployment has no ownership identity");
-                ensure!(applied.get("context").and_then(Value::as_str) == Some(context.as_str()),
-                    "Docker context differs from applied deployment");
-                ensure!(applied.get("owner").and_then(Value::as_str) == Some(owner.as_str()),
-                    "applied deployment ownership differs from environment identity");
-                Ok(())
-            })().context(crate::status::StatusConfiguration)?;
-        }
+        let owner = project.owner().context(crate::status::StatusConfiguration)?;
         if Instant::now() >= deadline { return Ok(()); }
-        check_resources(project, &rendered, &applied, &names, &docker, &owner).map_err(status_configuration_error)?;
+        runtime::validate_ownership(project, &docker).map_err(status_configuration_error)?;
         if Instant::now() >= deadline { return Ok(()); }
         let existing: BTreeSet<_> = owned_services(project, &docker, &owner)?.into_iter().collect();
         report["ownedServices"] = json!(existing);
@@ -2508,13 +1161,15 @@ pub fn status(
             let observation = (|| -> Result<()> {
                 let service = inspect(&docker, "service", &native)?;
                 (|| -> Result<()> {
-                    ensure!(service.pointer("/Spec/Labels").and_then(|v| v.get(OWNER)).and_then(Value::as_str) == Some(owner.as_str())
+                    ensure!(service.pointer("/Spec/Labels").and_then(|v| v.get(OWNER)).and_then(Value::as_str) == Some(owner)
                         && service.pointer("/Spec/Labels").and_then(|v| v.get(PROJECT)).and_then(Value::as_str) == Some(project.name()?),
                         "ownership changed for service {native}");
                     Ok(())
                 })().context(crate::status::StatusConfiguration)?;
                 report["services"][index]["serviceId"] = service.get("ID").cloned().unwrap_or(Value::Null);
-                let task_values = tasks(&docker, &native)?;
+                let service_id = service["ID"].as_str().context("service has no immutable ID")?;
+                let task_values = tasks(&docker, service_id)?;
+                validate_task_linkage(&service, task_values.as_deref())?;
                 let desired = service.pointer("/Spec/Mode/Replicated/Replicas").and_then(Value::as_u64)
                     .or_else(|| service.pointer("/ServiceStatus/DesiredTasks").and_then(Value::as_u64));
                 let desired = match desired {
@@ -2525,20 +1180,29 @@ pub fn status(
                             .and_then(|n| n.parse().ok()).context("cannot determine desired global-service tasks")?
                     }
                 };
-                let configured = rendered["services"][name].pointer("/deploy/replicas").and_then(Value::as_u64)
-                    .or_else(|| if service.pointer("/Spec/Mode/Replicated").is_some() { Some(1) } else { None });
+                let configured_mode = rendered["services"][name].pointer("/deploy/mode")
+                    .and_then(Value::as_str).unwrap_or("replicated");
+                let live_mode = if service.pointer("/Spec/Mode/Global").is_some() { "global" } else { "replicated" };
+                let configured = if configured_mode == "replicated" {
+                    Some(rendered["services"][name].pointer("/deploy/replicas").and_then(Value::as_u64).unwrap_or(1))
+                } else { None };
                 let expected = configured.unwrap_or(desired);
                 // Swarm never infers completion from Compose depends_on.
                 let oneshot = runtime::one_shot(project, name)?;
                 let (mut container_ready, successful, mut failure) = swarm_container_status(&service, task_values.as_deref(), expected, oneshot);
                 if desired != expected {
                     container_ready = false;
-                    failure = Some(format!("desired replicas {desired} differ from applied replicas {expected}"));
+                    failure = Some(format!("desired replicas {desired} differ from configured replicas {expected}"));
+                }
+                if configured_mode != live_mode {
+                    container_ready = false;
+                    failure = Some("live service mode differs from current configuration".into());
                 }
                 if let Some(expected_image) = rendered["services"][name].get("image").and_then(Value::as_str)
-                    && service.pointer("/Spec/TaskTemplate/ContainerSpec/Image").and_then(Value::as_str) != Some(expected_image) {
+                    && !service.pointer("/Spec/TaskTemplate/ContainerSpec/Image").and_then(Value::as_str)
+                        .is_some_and(|live| image_matches(expected_image, live)) {
                     container_ready = false;
-                    failure = Some("live service image differs from applied revision".into());
+                    failure = Some("live service image differs from the authored reference".into());
                 }
                 let row = &mut report["services"][index];
                 row["observed"] = json!(true);
@@ -2577,7 +1241,7 @@ pub fn status(
                 return Err(error);
             }
         }
-        report["ready"] = json!(recorded && report["services"].as_array().context("missing rows")?.iter()
+        report["ready"] = json!(report["services"].as_array().context("missing rows")?.iter()
             .filter(|row| row["required"] == true).all(|row| row["ready"] == true));
         Ok(())
     })();
@@ -2637,6 +1301,10 @@ fn verify_teardown_resource(
             "owned volume name was recreated before deletion; refusing to delete replacement data"
         );
     }
+    if argv[0] != "volume" {
+        ensure!(resource.get("ID").or_else(|| resource.get("Id")).and_then(Value::as_str) == Some(argv[2].as_str()),
+            "resource immutable ID changed before deletion; refusing to remove {}", argv[2]);
+    }
     Ok(true)
 }
 
@@ -2644,7 +1312,6 @@ fn remove_teardown_resource(
     project: &Project,
     docker: &Docker,
     owner: &str,
-    operation: &str,
     argv: &[String],
     volume_fingerprint: Option<&Value>,
     output: &Output,
@@ -2653,14 +1320,9 @@ fn remove_teardown_resource(
         return Ok(());
     }
     if argv[0] == "service" {
-        return operation_run(project, docker, operation, output, "remove-service", argv);
+        return operation_run(docker, output, "remove-service", argv);
     }
     // Service removal is asynchronous; wait before removing referenced resources.
-    journal(
-        project,
-        operation,
-        json!({"phase":"remove-resource","state":"started","docker":argv}),
-    )?;
     output.event("remove-resource", &format!("docker {}", argv.join(" ")))?;
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut reported_absence = None;
@@ -2676,11 +1338,6 @@ fn remove_teardown_resource(
             },
         };
         if Instant::now() >= deadline {
-            journal(
-                project,
-                operation,
-                json!({"state":"failed","error":format!("{error:#}"),"docker":argv}),
-            )?;
             return Err(error).context(
                 "teardown resource remains in use; nothing unrelated was removed",
             );
@@ -2693,11 +1350,6 @@ fn remove_teardown_resource(
         }
         thread::sleep(Duration::from_millis(500));
     }
-    journal(
-        project,
-        operation,
-        json!({"phase":"remove-resource","state":"completed","docker":argv}),
-    )?;
     Ok(())
 }
 
@@ -2721,14 +1373,21 @@ pub fn teardown(
     };
     let docker = Docker::new(&project.root, output.clone());
     let info = manager(&docker)?;
-    let owner = if plan_only {
-        read_owner(project, &docker.context()?, true)?
-    } else {
-        runtime::validate_ownership(project, &docker, false)?
-    };
-    let services = owned_services(project, &docker, &owner)?;
+    let owner = project.owner()?;
+    runtime::validate_ownership(project, &docker)?;
+    let services = owned_services(project, &docker, owner)?;
     let mut operations = Vec::<Vec<String>>::new();
     let mut volume_fingerprints = BTreeMap::new();
+    let mut external = BTreeSet::new();
+    for (kind, plural) in [("network", "networks"), ("volume", "volumes"), ("config", "configs")] {
+        if let Some(resources) = project.model.get(plural).and_then(Value::as_object) {
+            for (key, spec) in resources {
+                if spec.get("external").and_then(Value::as_bool) == Some(true) {
+                    external.insert((kind.to_owned(), resource_name(project.name()?, key, spec)));
+                }
+            }
+        }
+    }
     for name in &services {
         let service = inspect(&docker, "service", name)?;
         ensure!(
@@ -2736,7 +1395,8 @@ pub fn teardown(
                 .pointer("/Spec/Labels")
                 .and_then(|v| v.get(OWNER))
                 .and_then(Value::as_str)
-                == Some(owner.as_str()),
+                == Some(owner)
+                && service["Spec"]["Labels"][PROJECT].as_str() == Some(project.name()?),
             "ownership changed for service {name}"
         );
         operations.push(args(&[
@@ -2777,10 +1437,11 @@ pub fn teardown(
             None,
         )?;
         for name in resources.lines().filter(|s| !s.is_empty()) {
+            if external.contains(&(kind.to_owned(), name.to_owned())) { continue; }
             let item = inspect(&docker, kind, name)?;
             let labels = item.get("Labels").or_else(|| item.pointer("/Spec/Labels"));
             ensure!(
-                labels.and_then(|v| v.get(OWNER)).and_then(Value::as_str) == Some(owner.as_str())
+                labels.and_then(|v| v.get(OWNER)).and_then(Value::as_str) == Some(owner)
                     && labels.and_then(|v| v.get(PROJECT)).and_then(Value::as_str)
                         == Some(project.name()?),
                 "ownership changed for {kind} {name}"
@@ -2803,33 +1464,17 @@ pub fn teardown(
     if plan_only {
         return Ok(plan);
     }
-    let operation = format!("down-{}", state::random_id()?);
-    journal(project, &operation, json!({"state":"started","plan":plan}))?;
+    output.event("target", &format!("project={} backend=swarm checkout={owner} Docker target={}", project.name()?, docker.context()?))?;
     for argv in operations {
         remove_teardown_resource(
             project,
             &docker,
             &owner,
-            &operation,
             &argv,
             volume_fingerprints.get(&argv[2]),
             output,
         )?;
     }
-    let mut deployment = state::read(&project.root, "deployment")?;
-    if !deployment.is_object() {
-        deployment = json!({});
-    }
-    deployment["active"] = json!(false);
-    state::save(&project.root, "deployment", &deployment)?;
-    state::save(&project.root, "deployment-applied", &deployment)?;
-    // Preserved volumes/secrets still bind this environment to its identity/context.
-    state::mark_resources(&project.root, true)?;
-    journal(
-        project,
-        &operation,
-        json!({"state":"completed","secretsRetained":true,"dataRetained":!destroy}),
-    )?;
     Ok(
         json!({"removedServices":services,"dataRetained":!destroy,"secretsRetained":true,"context":docker.context()?}),
     )
@@ -2902,13 +1547,14 @@ esac
         let output = Output { json: true, quiet: true };
         let docker = Docker::new(&root, output.clone());
         let project = Project {
-            root: root.clone(),
+            root: root.canonicalize().unwrap(),
             env: json!({"project":"race","backend":"swarm"}),
             model: json!({}),
             metadata: json!({}),
             fields: Vec::new(),
+            swarm_secrets: BTreeMap::new(),
         };
-        let resource = json!({"ID":"captured-id","Labels":{OWNER:"owner",PROJECT:"race"},
+        let resource = json!({"ID":"captured-id","Labels":{OWNER:project.owner().unwrap(),PROJECT:"race"},
             "CreatedAt":"original","Driver":"local","Mountpoint":"/original"});
         let fingerprint = json!({"created":resource["CreatedAt"],"driver":resource["Driver"],
             "mountpoint":resource["Mountpoint"],"labels":resource["Labels"]});
@@ -2921,7 +1567,7 @@ esac
         let removals = || std::fs::read_to_string(root.join("removals")).unwrap().trim().parse::<u32>().unwrap();
         let network = args(&["network", "rm", "captured-id"]);
         let remove = |argv: &[String], fingerprint: Option<&Value>| {
-            remove_teardown_resource(&project, &docker, "owner", "down-race", argv, fingerprint, &output)
+            remove_teardown_resource(&project, &docker, project.owner().unwrap(), argv, fingerprint, &output)
         };
         for (mode, expected_removals) in [
             ("before-delete", 0), ("during-wait", 0), ("at-delete", 1),
@@ -3045,15 +1691,16 @@ esac
         let output = Output { json: true, quiet: true };
         let docker = Docker::new(&root, output.clone());
         let project = Project {
-            root: root.clone(),
+            root: root.canonicalize().unwrap(),
             env: json!({"project":"race","backend":"swarm"}),
             model: json!({"services":{"api":{"image":"image@sha256:abc"}}}),
             metadata: json!({}),
             fields: Vec::new(),
+            swarm_secrets: BTreeMap::new(),
         };
-        let mut service = json!({"Spec":{"Mode":{"Replicated":{"Replicas":1}},
+        let mut service = json!({"ID":"service-api","Spec":{"Labels":{OWNER:project.owner().unwrap(),PROJECT:"race"},"Mode":{"Replicated":{"Replicas":1}},
             "TaskTemplate":{"ContainerSpec":{"Image":"image@sha256:abc"}}}});
-        let current = json!({"ID":"current","Slot":1,"CreatedAt":"2026-10-05T01:00:00Z",
+        let current = json!({"ID":"current","ServiceID":"service-api","Slot":1,"CreatedAt":"2026-10-05T01:00:00Z",
             "DesiredState":"running","Spec":{"ContainerSpec":{"Image":"image@sha256:abc"}},
             "Status":{"State":"running"}});
         let mut obsolete = current.clone();
@@ -3133,33 +1780,6 @@ esac
     }
 
     #[test]
-    fn selected_update_does_not_touch_dependencies_or_force_restarts() {
-        let document = json!({"networks":{"default":{}},"services":{"api":{"image":"registry.test/api@sha256:abc","environment":{"MODE":"new"},"deploy":{"labels":{OWNER:"owner",PROJECT:"app"}}},"db":{"image":"postgres:17"}}});
-        let old=adapter("app",&json!({"image":"registry.test/api@sha256:old","environment":{"MODE":"old","REMOVED":"x"},"deploy":{"labels":{OWNER:"owner",PROJECT:"app"}}}),&document).unwrap();
-        let new = adapter("app", &document["services"]["api"], &document).unwrap();
-        let argv = selected_operation("app_api", &new, Some(&old)).unwrap();
-        assert_eq!(argv.last().unwrap(), "app_api");
-        assert!(
-            !argv
-                .iter()
-                .any(|s| s == "app_db" || s == "--force" || s == "--prune")
-        );
-        assert!(argv.windows(2).any(|s| s == ["--env-rm", "REMOVED"]));
-        assert!(argv.windows(2).any(|s| s == ["--env-add", "MODE=new"]));
-    }
-    #[test]
-    fn selected_scope_rejects_shared_network_change() {
-        let previous = json!({"active":true,"rendered":{"networks":{"default":{"driver":"overlay"}},"volumes":{}}});
-        let changed = json!({"networks":{"default":{"driver":"bridge"}},"volumes":{}});
-        assert!(
-            shared_scope(&changed, &previous, true)
-                .unwrap_err()
-                .to_string()
-                .contains("shared networks")
-        );
-        assert!(shared_scope(&previous["rendered"], &previous, true).is_ok());
-    }
-    #[test]
     fn failed_desired_revision_is_not_success_even_if_old_tasks_are_running() {
         let service = json!({"Spec":{"TaskTemplate":{}},"UpdateStatus":{"State":"rollback_completed","Message":"tasks failed"}});
         assert!(
@@ -3180,73 +1800,9 @@ esac
         assert!(rollout_failure(&json!({}), &[task], "new@sha256:abc").is_none());
     }
     #[test]
-    fn unsupported_selected_options_are_not_ignored() {
-        let result = adapter(
-            "app",
-            &json!({"image":"api:tag","privileged":true}),
-            &json!({}),
-        );
-        assert!(result.err().unwrap().to_string().contains("privileged"));
-    }
-    #[test]
-    fn removed_scalar_rejects_unsafe_partial_reset() {
-        let old = adapter("app", &json!({"image":"api:old","user":"1000"}), &json!({})).unwrap();
-        let new = adapter("app", &json!({"image":"api:new"}), &json!({})).unwrap();
-        assert!(
-            selected_operation("app_api", &new, Some(&old))
-                .unwrap_err()
-                .to_string()
-                .contains("removed option user")
-        );
-    }
-    #[test]
-    fn selected_secret_revision_preserves_other_consumers_and_old_reference() {
-        let old = json!({"services":{"api":{"image":"api:old","secrets":["key"]},"worker":{"image":"worker:old","secrets":["key"]}},"secrets":{"key":{"external":true,"name":"key-old"}}});
-        let new = json!({"services":{"api":{"image":"api:new","secrets":["key"]},"worker":{"image":"worker:unapplied","secrets":["key"]}},"secrets":{"key":{"external":true,"name":"key-new"}}});
-        let merged = merge_selected_snapshot(&old, &new, &["api".into()], "app").unwrap();
-        let api = adapter("app", &merged["services"]["api"], &merged).unwrap();
-        let worker = adapter("app", &merged["services"]["worker"], &merged).unwrap();
-        assert!(api.lists["secret"].contains_key("key-new"));
-        assert!(worker.lists["secret"].contains_key("key-old"));
-        assert_eq!(worker.image, "worker:old");
-        assert_eq!(merged["secrets"]["dks-retained-key-old"]["name"], "key-old");
-    }
-    #[test]
     fn old_failed_task_of_same_image_does_not_poison_a_later_rollout() {
         let service = json!({"UpdatedAt":"2026-10-04T08:00:00Z"});
         let task = json!({"UpdatedAt":"2026-10-04T07:00:00Z","Spec":{"ContainerSpec":{"Image":"same@sha256:abc"}},"Status":{"State":"failed"}});
         assert!(rollout_failure(&service, &[task], "same@sha256:abc").is_none());
-    }
-    #[test]
-    fn interrupted_selected_apply_reconciles_unrecorded_grants_from_live_spec() {
-        let recorded = adapter(
-            "app",
-            &json!({"image":"api:old","environment":{"KEEP":"old"}}),
-            &json!({}),
-        )
-        .unwrap();
-        let desired = adapter(
-            "app",
-            &json!({"image":"api:new","environment":{"KEEP":"new"}}),
-            &json!({}),
-        )
-        .unwrap();
-        let live = json!({"Spec":{"Mode":{"Replicated":{"Replicas":1}},"TaskTemplate":{"ContainerSpec":{"Image":"api:interrupted","Env":["KEEP=interrupted","UNRECORDED=password"],"Secrets":[{"SecretName":"secret-interrupted","File":{"Name":"credential","UID":"0","GID":"0","Mode":292}}],"Configs":[{"ConfigName":"config-interrupted","File":{"Name":"/config","UID":"0","GID":"0","Mode":292}}],"Mounts":[{"Type":"bind","Source":"/private","Target":"/leaked","ReadOnly":true}]}}}});
-        let old = live_options(&live, &BTreeMap::new(), &recorded, None).unwrap();
-        let operations = selected_operation("immutable-service-id", &desired, Some(&old)).unwrap();
-        for (flag, value) in [
-            ("--env-rm", "UNRECORDED"),
-            ("--secret-rm", "secret-interrupted"),
-            ("--config-rm", "config-interrupted"),
-            ("--mount-rm", "/leaked"),
-        ] {
-            assert!(
-                operations
-                    .windows(2)
-                    .any(|pair| pair[0] == flag && pair[1] == value),
-                "missing removal for {flag} {value}"
-            );
-        }
-        assert_eq!(operations.last().unwrap(), "immutable-service-id");
     }
 }

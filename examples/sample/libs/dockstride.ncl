@@ -47,7 +47,7 @@ let swarm = fun canonical =>
         checked.services,
   } in
 {
-  libraryVersion = "0.2.0",
+  libraryVersion = "0.3.0",
   evaluatorVersion = "0.19.0",
   Choice = choiceContract,
   Backend = backendContract,
@@ -57,7 +57,7 @@ let swarm = fun canonical =>
   GenerateSecret = fun policy =>
     (policy | {bytes | Number, encoding | choiceContract ["hex", "base64"], ..}) & {kind = "generate"},
   PromptSecret = {kind = "prompt"},
-  FileSecret = fun sourcePath => {kind = "file", path = sourcePath | String},
+  ReferenceSecret = {kind = "reference"},
   StdinSecret = {kind = "stdin"},
 
   forEnvironment = fun env => {

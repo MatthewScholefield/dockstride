@@ -23,7 +23,7 @@ use std::{fs, io::Write, path::Path};
 
 type Program = nickel_lang_core::program::Program<CacheImpl>;
 pub const EVALUATOR_VERSION: &str = "0.19.0";
-pub const LIBRARY_VERSION: &str = "0.2.0";
+pub const LIBRARY_VERSION: &str = "0.3.0";
 
 #[derive(Debug)]
 pub struct NickelError {
@@ -309,11 +309,14 @@ pub(crate) fn validate_field_values(root: &Path, path: &str, value: &Value, valu
 
 pub fn evaluate(root: &Path, candidate: Option<&Value>) -> Result<Project> {
     let snapshot = crate::sources::snapshot(root, candidate)?;
-    evaluate_values(root, &snapshot.values).with_context(|| format!("evaluating environment with shared sources {:?}", snapshot.sources))
+    evaluate_snapshot(root, &snapshot).with_context(|| format!("evaluating environment with shared sources {:?}", snapshot.sources))
 }
 
-pub(crate) fn evaluate_values(root: &Path, values: &Value) -> Result<Project> {
-    let env = export_values(root, values, "let p = import \"compose.ncl\" in let env | p.dockstride.Config = import \"env.yaml\" in env")
+pub fn evaluate_snapshot(root: &Path, snapshot: &crate::sources::EnvironmentSnapshot) -> Result<Project> {
+    let canonical_root = fs::canonicalize(root).context("canonicalize checkout root")?;
+    canonical_root.to_str().context("checkout path is not UTF-8; move the checkout to a UTF-8 path")?;
+    let root = canonical_root.as_path();
+    let env = export_values(root, &snapshot.values, "let p = import \"compose.ncl\" in let env | p.dockstride.Config = import \"env.yaml\" in env")
         .context("validating complete env.yaml; run dks setup for missing inputs")?;
     // The contract-expanded environment is already effective: never resolve it as a
     // local document, which would lose inherited provenance and source declarations.
@@ -326,11 +329,12 @@ pub(crate) fn evaluate_values(root: &Path, values: &Value) -> Result<Project> {
     )?;
     let fields = schema_values(root, &env)?;
     Ok(Project {
-        root: fs::canonicalize(root)?,
+        root: canonical_root,
         env,
         model,
         metadata,
         fields,
+        swarm_secrets: crate::sources::swarm_bindings(&snapshot.local)?,
     })
 }
 

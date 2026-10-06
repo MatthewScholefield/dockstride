@@ -16,8 +16,7 @@ if mode == 'inspect-error' and a[:2] == ['container', 'inspect'] and '--format' 
 s = json.loads((root / 'containers.json').read_text())
 services = json.loads((root / 'services.json').read_text())
 def labels(n):
-    identity = root / '.dockstride/identity.json'
-    owner = json.loads(identity.read_text())['id'] if identity.exists() else ''
+    owner = os.environ.get('RESOURCE_OWNER', str(root.resolve()))
     return {'io.dockstride.owner': 'foreign' if mode == 'foreign' else owner,
             'io.dockstride.project':'status-fixture', 'com.docker.compose.project':'status-fixture',
             'com.docker.compose.service':n, 'com.docker.compose.oneoff':'False'}
@@ -35,7 +34,14 @@ elif a[:1] == ['info']:
     elif '{{json .SecurityOptions}}' in a: print('[]')
     else: print(json.dumps({'ID':'status-fixture-daemon','SecurityOptions':[],'Swarm':{'LocalNodeState':'inactive'}}))
 elif a[:1] == ['ps']: print('\n'.join(n+'-id' for n in s))
-elif a[:2] in (['volume','ls'], ['network','ls'], ['service','ls'], ['secret','ls'], ['config','ls']): pass
+elif a[:2] in (['volume','ls'], ['network','ls']):
+    if a[0] == os.environ.get('FOREIGN_KIND'):
+        print('status-fixture_data' if a[0] == 'volume' else 'status-fixture_default')
+elif a[:2] in (['volume','inspect'], ['network','inspect']):
+    label = {'com.docker.compose.project':'status-fixture','io.dockstride.project':'status-fixture'}
+    if os.environ.get('FOREIGN_OWNER') != 'missing': label['io.dockstride.owner'] = 'legacy-uuid'
+    print(json.dumps(label))
+elif a[:2] in (['service','ls'], ['secret','ls'], ['config','ls']): pass
 elif a[:2] == ['container','inspect']:
     if '--format' in a: print(json.dumps(labels(a[2].removesuffix('-id'))))
     else: print(json.dumps([row(n,c) for n,c in s.items() if n+'-id' in a]))
@@ -74,13 +80,14 @@ impl Fixture {
 let contract = {project | String, backend | String | default = "compose"} in
 let env | contract = import "env.yaml" in
 { dockstride | not_exported = {Config = contract, readiness = import "readiness.json", oneshots = import "oneshots.json"},
-  name = env.project, services = import "services.json" }
+  name = env.project, services = import "services.json", volumes = import "volumes.json" }
 "#).unwrap();
         fs::write(f.root().join("env.yaml"), "project: status-fixture\nbackend: compose\n").unwrap();
         f.put("services.json", services);
         f.put("containers.json", json!({}));
         f.put("readiness.json", json!({}));
         f.put("oneshots.json", json!([]));
+        f.put("volumes.json", json!({}));
         f.mode("normal");
         f.success(&["setup"]);
         f
@@ -88,13 +95,14 @@ let env | contract = import "env.yaml" in
     fn root(&self) -> &Path { self.temp.path() }
     fn put(&self, name: &str, value: Value) { fs::write(self.root().join(name), serde_json::to_vec(&value).unwrap()).unwrap(); }
     fn mode(&self, value: &str) { fs::write(self.root().join("mode"), value).unwrap(); }
-    fn command(&self, args: &[&str]) -> Command {
+    fn command(&self, args: &[&str]) -> Command { self.command_at(self.root(), args) }
+    fn command_at(&self, checkout: &Path, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_dks"));
         c.current_dir(self.root()).env_clear()
             .env("PATH", format!("{}:{}", self.root().join("bin").display(), std::env::var("PATH").unwrap()))
             .env("HOME", self.root().join("home")).env("XDG_DATA_HOME", self.root().join("data"))
             .env("DOCKER_HOST", "unix:///status-fixture.sock").env("STATUS_FIXTURE", self.root())
-            .args(["--json", "--non-interactive", "--no-color", "-C"]).arg(self.root()).args(args)
+            .args(["--json", "--non-interactive", "--no-color", "-C"]).arg(checkout).args(args)
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         c
     }
@@ -163,40 +171,9 @@ fn profile_scope_flags_environment_explicit_roots_and_optional_dependencies_agre
     assert_eq!(service(report(&wildcard),"optional")["required"],true);
     let o = f.command(&["up","--profile","debug"]).env("COMPOSE_PROFILES","tools").output().unwrap();
     assert!(o.status.success(), "{}",String::from_utf8_lossy(&o.stdout));
-    assert_eq!(f.success(&["status"])["activeProfiles"],json!(["debug","tools"]));
-}
-
-#[test]
-fn applied_profiles_survive_teardown_and_unrelated_failed_startup_but_not_explicit_empty_environment() {
-    let f = Fixture::new(json!({"api":{"image":"fixture"},"debug":{"image":"fixture","profiles":["debug"]}}));
-    f.success(&["up","--profile","debug"]);
-    assert_eq!(f.success(&["status"])["requiredServices"],json!(["api","debug"]));
-    f.success(&["down"]);
-    let e = f.failure(&["status"],1);
-    assert_eq!(report(&e)["activeProfiles"],json!(["debug"]));
-    let o = f.run(&["up","no-such-service"]);
-    assert!(!o.status.success());
-    f.put("containers.json",json!({"api":{}}));
-    assert_eq!(report(&f.failure(&["status"],1))["activeProfiles"],json!(["debug"]));
-    let o = f.command(&["status"]).env("COMPOSE_PROFILES","").output().unwrap();
-    assert!(o.status.success());
-    assert_eq!(terminal(&o)["result"]["requiredServices"],json!(["api"]));
-    f.success(&["up"]);
     assert_eq!(f.success(&["status"])["activeProfiles"],json!([]));
 }
 
-#[test]
-fn applied_profile_scope_is_recorded_when_application_readiness_fails() {
-    let f = Fixture::new(json!({"api":{"image":"fixture"},"debug":{"image":"fixture","profiles":["debug"]}}));
-    f.put("readiness.json",json!({"debug":{"command":["false"]}}));
-    let o = f.command(&["up","--profile","debug","--timeout","4"]).output().unwrap();
-    assert!(!o.status.success());
-    let containers: Value = serde_json::from_slice(&fs::read(f.root().join("containers.json")).unwrap()).unwrap();
-    assert_eq!(containers["debug"]["status"],"running");
-    let e = f.failure(&["status"],1);
-    assert_eq!(report(&e)["activeProfiles"],json!(["debug"]));
-    assert_eq!(service(report(&e),"debug")["applicationReady"],false);
-}
 
 #[test]
 fn invalid_scope_cycles_profiles_and_empty_required_scope_are_configuration_errors() {
@@ -296,4 +273,51 @@ fn shared_deadline_bounds_probes_and_first_context_lookup_and_preserves_partial_
     assert_eq!(service(report(&e),"a")["observed"],false);
     f.mode("foreign");
     assert!(!f.run(&["status","--inspect-only"]).status.success());
+}
+
+#[test]
+fn canonical_checkout_labels_survive_disposable_state_and_block_other_checkouts() {
+    let f = Fixture::new(json!({"api":{"image":"fixture"}}));
+    f.put("containers.json", json!({"api":{}}));
+    let before = fs::read(f.root().join("containers.json")).unwrap();
+    fs::remove_dir_all(f.root().join(".dockstride")).unwrap();
+    assert_eq!(f.success(&["status"])["owner"], f.root().canonicalize().unwrap().to_str().unwrap());
+
+    let alias_parent = tempfile::tempdir().unwrap();
+    let alias = alias_parent.path().join("symlink = café");
+    std::os::unix::fs::symlink(f.root(), &alias).unwrap();
+    let observed = f.command_at(&alias, &["status"]).output().unwrap();
+    assert!(observed.status.success(), "{}", terminal(&observed));
+    assert_eq!(terminal(&observed)["result"]["owner"], f.root().canonicalize().unwrap().to_str().unwrap());
+
+    let other = alias_parent.path().join("other checkout = café");
+    fs::create_dir(&other).unwrap();
+    for file in ["compose.ncl", "env.yaml", "services.json", "readiness.json", "oneshots.json", "volumes.json"] {
+        fs::copy(f.root().join(file), other.join(file)).unwrap();
+    }
+    for args in [&["status"][..], &["up"][..], &["down"][..], &["destroy","--yes"][..]] {
+        let output = f.command_at(&other, args).output().unwrap();
+        assert!(!output.status.success(), "{args:?}: {}", terminal(&output));
+        assert_eq!(fs::read(f.root().join("containers.json")).unwrap(), before);
+    }
+    let switched = f.command(&["status"]).env("DOCKER_HOST", "unix:///different-target.sock").output().unwrap();
+    assert!(switched.status.success(), "{}", terminal(&switched));
+    f.success(&["down"]);
+    assert_eq!(serde_json::from_slice::<Value>(&fs::read(f.root().join("containers.json")).unwrap()).unwrap(), json!({}));
+}
+
+#[test]
+fn foreign_or_unlabeled_managed_resource_names_are_never_adopted_or_removed() {
+    let f = Fixture::new(json!({"api":{"image":"fixture"}}));
+    f.put("volumes.json", json!({"data":{}}));
+    let before = fs::read(f.root().join("containers.json")).unwrap();
+    for kind in ["volume", "network"] {
+        for owner in ["legacy", "missing"] {
+            for args in [&["status"][..], &["up"][..], &["destroy","--yes"][..]] {
+                let output = f.command(args).env("FOREIGN_KIND", kind).env("FOREIGN_OWNER", owner).output().unwrap();
+                assert!(!output.status.success(), "{kind} {owner} {args:?}: {}", terminal(&output));
+                assert_eq!(fs::read(f.root().join("containers.json")).unwrap(), before);
+            }
+        }
+    }
 }

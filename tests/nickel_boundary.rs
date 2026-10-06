@@ -64,8 +64,12 @@ dc.ComposeFile {
 }
 
 fn complete(backend: &str) -> Value {
-    json!({"project":"boundary", "backend":backend,
-        "secrets":{"authKey":{"file":"/private/key"}}})
+    let mut local = json!({"project":"boundary", "backend":backend,
+        "secrets":{"authKey":{"file":"/private/key"}}});
+    if backend == "swarm" {
+        local["_dockstride"] = json!({"swarmSecrets":{"authKey":"dks-boundary-current"}});
+    }
+    local
 }
 
 #[test]
@@ -164,9 +168,11 @@ fn normal_nickel_export_obeys_backend_without_exporting_operational_metadata() {
     };
     let root = fixture();
     for backend in ["compose", "swarm"] {
+        let mut effective = complete(backend);
+        effective.as_object_mut().unwrap().remove("_dockstride");
         fs::write(
             root.path().join("env.yaml"),
-            serde_yaml::to_string(&complete(backend)).unwrap(),
+            serde_yaml::to_string(&effective).unwrap(),
         )
         .unwrap();
         let mut program: Program<CacheImpl> = ProgramBuilder::new()
@@ -352,7 +358,6 @@ let env | configContract = import "env.yaml" in
   dockstride | not_exported = {
     Config = configContract,
     setup.secrets.authKey = lib.GenerateSecret {bytes = 32, encoding = "hex"},
-    setup.secrets.fromFile = lib.FileSecret "/private/source",
     actions = [{name = "announce", workflows = ["up"], kind = "command",
       argv = ["echo", env.project, env.secrets.authKey.file]}],
   },
@@ -365,10 +370,6 @@ let env | configContract = import "env.yaml" in
     let setup = nickel::setup_metadata(root.path(), None).unwrap();
     assert_eq!(setup["setup"]["secrets"]["authKey"]["bytes"], 32);
     assert_eq!(setup["setup"]["secrets"]["authKey"]["kind"], "generate");
-    assert_eq!(
-        setup["setup"]["secrets"]["fromFile"],
-        json!({"kind":"file","path":"/private/source"})
-    );
     assert!(nickel::metadata(root.path(), None).is_err());
     assert!(!root.path().join("env.yaml").exists());
 }
@@ -584,4 +585,33 @@ fn application_contract_cannot_claim_reserved_metadata_even_as_an_empty_record()
     fs::write(root.path().join("compose.ncl"),"let configContract = {_dockstride = {}} in {dockstride | not_exported = {Config = configContract}, services = {}}\n").unwrap();
     let error = format!("{:#}",nickel::schema(root.path(),None).unwrap_err());
     assert!(error.contains("reserved _dockstride"),"{error}");
+}
+
+#[test]
+fn snapshot_evaluation_preserves_local_bindings_and_canonical_symlink_owner() {
+    let root = fixture();
+    let mut local = complete("swarm");
+    local["_dockstride"] = json!({"swarmSecrets":{"authKey":"dks-current-binding"}});
+    let snapshot = dockstride::sources::snapshot(root.path(), Some(&local)).unwrap();
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("alias ü = checkout");
+    std::os::unix::fs::symlink(root.path(), &alias).unwrap();
+    let project = nickel::evaluate_snapshot(&alias, &snapshot).unwrap();
+    assert_eq!(project.owner().unwrap(), fs::canonicalize(root.path()).unwrap().to_str().unwrap());
+    assert_eq!(project.swarm_secrets["authKey"], "dks-current-binding");
+    assert_eq!(project.swarm().unwrap()["secrets"]["authKey"], json!({"external":true,"name":"dks-current-binding"}));
+    assert!(project.env.get("_dockstride").is_none());
+}
+
+#[test]
+fn non_utf8_checkout_root_is_rejected_before_project_evaluation() {
+    use std::os::unix::ffi::OsStringExt;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join(std::ffi::OsString::from_vec(b"checkout-\xff".to_vec()));
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("compose.ncl"), "invalid and must not be evaluated").unwrap();
+    let snapshot = dockstride::sources::snapshot(&root, None).unwrap();
+    let error = format!("{:#}", nickel::evaluate_snapshot(&root, &snapshot).unwrap_err());
+    assert!(error.contains("UTF-8"));
+    assert!(error.contains("move the checkout"));
 }
