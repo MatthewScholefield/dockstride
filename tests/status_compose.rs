@@ -15,6 +15,35 @@ if mode == 'inspect-error' and a[:2] == ['container', 'inspect'] and '--format' 
     print('inspection transport failed', file=sys.stderr); sys.exit(38)
 s = json.loads((root / 'containers.json').read_text())
 services = json.loads((root / 'services.json').read_text())
+volume_file = root / 'docker-volumes.json'
+volumes = json.loads(volume_file.read_text()) if volume_file.exists() else None
+if volumes is not None and (a[:1] == ['volume'] or a[:1] == ['run']):
+    with (root / 'volume-commands.jsonl').open('a') as log: log.write(json.dumps(a) + '\n')
+    if a[:2] == ['volume', 'ls']:
+        selected = volumes
+        if '--filter' in a:
+            key, value = a[a.index('--filter')+1].removeprefix('label=').split('=', 1)
+            selected = {n:v for n,v in volumes.items() if v['Labels'].get(key) == value}
+        print('\n'.join(selected))
+    elif a[:2] == ['volume', 'inspect']:
+        v = volumes[a[2]]
+        if '--format' in a:
+            print(a[2] if a[-1] == '{{.Name}}' else json.dumps(v['Labels']))
+        else: print(json.dumps([dict(v, Name=a[2])]))
+    elif a[:2] == ['volume', 'create']:
+        label = dict(a[i+1].split('=',1) for i in range(len(a)-1) if a[i] == '--label')
+        volumes[a[-1]] = {'Driver':'local','Options':{},'Labels':label,'data':None}
+        print(a[-1])
+    elif a[:2] == ['volume', 'rm']: del volumes[a[2]]
+    elif a[:1] == ['run']:
+        mounts = [dict(part.split('=',1) for part in a[i+1].split(',') if '=' in part) for i in range(len(a)-1) if a[i] == '--mount']
+        if os.environ.get('FAIL_VOLUME_RESTORE') and mounts[0]['src'].startswith('dks-volume-adoption-'):
+            print('restore failed', file=sys.stderr); sys.exit(42)
+        volumes[mounts[1]['src']]['data'] = volumes[mounts[0]['src']]['data']
+    else: sys.exit(39)
+    if a[:2] in (['volume', 'create'], ['volume', 'rm']) or a[:1] == ['run']:
+        volume_file.write_text(json.dumps(volumes))
+    sys.exit(0)
 def labels(n):
     owner = os.environ.get('RESOURCE_OWNER', str(root.resolve()))
     return {'io.dockstride.owner': 'foreign' if mode == 'foreign' else owner,
@@ -33,7 +62,10 @@ elif a[:1] == ['info']:
     if '{{.ID}}' in a: print('status-fixture-daemon')
     elif '{{json .SecurityOptions}}' in a: print('[]')
     else: print(json.dumps({'ID':'status-fixture-daemon','SecurityOptions':[],'Swarm':{'LocalNodeState':'inactive'}}))
-elif a[:1] == ['ps']: print('\n'.join(n+'-id' for n in s))
+elif a[:1] == ['ps']:
+    if '--filter' in a and a[a.index('--filter')+1].startswith('volume='):
+        print(os.environ.get('ATTACHED_VOLUME_CONTAINER', ''))
+    else: print('\n'.join(n+'-id' for n in s))
 elif a[:2] in (['volume','ls'], ['network','ls']):
     if a[0] == os.environ.get('FOREIGN_KIND'):
         print('status-fixture_data' if a[0] == 'volume' else 'status-fixture_default')
@@ -307,6 +339,58 @@ fn canonical_checkout_labels_survive_disposable_state_and_block_other_checkouts(
 }
 
 #[test]
+fn explicit_volume_adoption_preserves_data_and_external_volumes() {
+    let f = Fixture::new(json!({"api":{"image":"fixture"}}));
+    f.put("volumes.json", json!({"data":{"labels":{"custom":"new"}}, "shared":{"external":true,"name":"shared"}}));
+    f.put("docker-volumes.json", json!({
+        "status-fixture_data":{"Driver":"local","Options":{},"Labels":{"com.docker.compose.project":"status-fixture","io.dockstride.owner":"previous-checkout","custom":"old","keep":"yes"},"data":"database contents"},
+        "shared":{"Driver":"local","Options":{},"Labels":{},"data":"external contents"}
+    }));
+    let before = fs::read(f.root().join("docker-volumes.json")).unwrap();
+    let plan = f.success(&["--plan", "up", "--adopt-existing-volumes"]);
+    assert_eq!(plan["operations"][0]["kind"], "adopt-existing-volumes");
+    assert_eq!(fs::read(f.root().join("docker-volumes.json")).unwrap(), before);
+    f.success(&["up", "--adopt-existing-volumes"]);
+    let volumes: Value = serde_json::from_slice(&fs::read(f.root().join("docker-volumes.json")).unwrap()).unwrap();
+    assert_eq!(volumes.as_object().unwrap().len(), 2);
+    let data = &volumes["status-fixture_data"];
+    assert_eq!(data["data"], "database contents");
+    assert_eq!(data["Labels"]["io.dockstride.owner"], f.root().to_str().unwrap());
+    assert_eq!(data["Labels"]["io.dockstride.project"], "status-fixture");
+    assert_eq!(data["Labels"]["com.docker.compose.volume"], "data");
+    assert_eq!(data["Labels"]["custom"], "new");
+    assert_eq!(data["Labels"]["keep"], "yes");
+    assert_eq!(volumes["shared"]["data"], "external contents");
+    let log = fs::read_to_string(f.root().join("volume-commands.jsonl")).unwrap();
+    let copies = log.lines().filter(|line| line.starts_with("[\"run\"")).count();
+    assert_eq!(copies, 2);
+    f.success(&["up"]);
+    f.success(&["up", "--adopt-existing-volumes"]);
+    let log = fs::read_to_string(f.root().join("volume-commands.jsonl")).unwrap();
+    assert_eq!(log.lines().filter(|line| line.starts_with("[\"run\"")).count(), copies);
+}
+
+#[test]
+fn volume_adoption_refuses_attached_volumes_and_retains_backup_on_failure() {
+    let f = Fixture::new(json!({"api":{"image":"fixture"}}));
+    f.put("volumes.json", json!({"data":{}}));
+    f.put("docker-volumes.json", json!({
+        "status-fixture_data":{"Driver":"local","Options":{},"Labels":{"com.docker.compose.project":"status-fixture"},"data":"database contents"}
+    }));
+    let before = fs::read(f.root().join("docker-volumes.json")).unwrap();
+    let output = f.command(&["up", "--adopt-existing-volumes"]).env("ATTACHED_VOLUME_CONTAINER", "db-id").output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("remove attached containers first"));
+    assert_eq!(fs::read(f.root().join("docker-volumes.json")).unwrap(), before);
+    let output = f.command(&["up", "--adopt-existing-volumes"]).env("FAIL_VOLUME_RESTORE", "1").output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("retained for recovery"));
+    let volumes: Value = serde_json::from_slice(&fs::read(f.root().join("docker-volumes.json")).unwrap()).unwrap();
+    let backup = volumes.as_object().unwrap().iter().find(|(name, _)| name.starts_with("dks-volume-adoption-")).unwrap().1;
+    assert_eq!(backup["data"], "database contents");
+}
+
+#[test]
 fn foreign_or_unlabeled_managed_resource_names_are_never_adopted_or_removed() {
     let f = Fixture::new(json!({"api":{"image":"fixture"}}));
     f.put("volumes.json", json!({"data":{}}));
@@ -316,6 +400,9 @@ fn foreign_or_unlabeled_managed_resource_names_are_never_adopted_or_removed() {
             for args in [&["status"][..], &["up"][..], &["destroy","--yes"][..]] {
                 let output = f.command(args).env("FOREIGN_KIND", kind).env("FOREIGN_OWNER", owner).output().unwrap();
                 assert!(!output.status.success(), "{kind} {owner} {args:?}: {}", terminal(&output));
+                if kind == "volume" {
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("--adopt-existing-volumes"));
+                }
                 assert_eq!(fs::read(f.root().join("containers.json")).unwrap(), before);
             }
         }

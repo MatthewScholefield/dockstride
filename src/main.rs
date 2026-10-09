@@ -69,6 +69,8 @@ enum Commands {
     Up {
         #[arg(long = "profile", value_name = "NAME")]
         profiles: Vec<String>,
+        #[arg(long, help = "Copy and recreate existing managed volumes with this checkout's ownership labels")]
+        adopt_existing_volumes: bool,
         services: Vec<String>,
     },
     /// Start and verify, then enter the declared development loop.
@@ -483,6 +485,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                 Commands::Up { profiles, .. } | Commands::Dev { profiles, .. } => profiles.as_slice(),
                 _ => &[],
             };
+            let adopt_volumes = matches!(&cli.command, Commands::Up { adopt_existing_volumes: true, .. });
             let project = if cli.plan {
                 match nickel::evaluate(&root, None) {
                     Ok(project) => project,
@@ -494,6 +497,9 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                 }
             } else {
                 config::setup_with_context(&root, &[], non_interactive, cli.timeout, out, workflow)?;
+                if adopt_volumes {
+                    runtime::adopt_existing_volumes(&root, cli.timeout, out)?;
+                }
                 let provisioned = secrets::provision(&root, non_interactive, &secret_inputs, out)?;
                 if workflow != "deploy" {
                     let _lifecycle = state::lock(&root, "lifecycle")?;
@@ -521,7 +527,16 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
             if workflow == "deploy" {
                 deploy::deploy(&project, true, cli.timeout, out)?
             } else {
-                runtime::lifecycle(&project, workflow, services, profiles, true, false, cli.timeout, out)?
+                let mut plan = runtime::lifecycle(&project, workflow, services, profiles, true, false, cli.timeout, out)?;
+                if adopt_volumes {
+                    plan["operations"].as_array_mut().unwrap().insert(0, json!({
+                        "kind":"adopt-existing-volumes",
+                        "scope":"declared managed volumes with mismatched ownership",
+                        "requires":"unattached local volumes without driver options",
+                        "steps":["copy to temporary volume","remove original","recreate original with ownership labels","copy back","remove temporary volume"]
+                    }));
+                }
+                plan
             }
         }
         Commands::Status { services, profiles, inspect_only } => {

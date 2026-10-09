@@ -681,6 +681,9 @@ pub fn compose_args(project: &Project, file: &Path) -> Result<Vec<String>> {
 
 /// Check the selected Docker target against this checkout's canonical path.
 pub fn validate_ownership(project: &Project, docker: &Docker) -> Result<()> {
+    validate_ownership_except_volumes(project, docker, &BTreeSet::new())
+}
+fn validate_ownership_except_volumes(project: &Project, docker: &Docker, adopting: &BTreeSet<String>) -> Result<()> {
     let id = project.owner()?;
     let name = project.name()?;
     let swarm = project.backend()? == "swarm";
@@ -705,6 +708,9 @@ pub fn validate_ownership(project: &Project, docker: &Docker) -> Result<()> {
         };
         let found = namespace_resources(docker, &listing, name, filters)?;
         for resource in &found {
+            if kind == "volume" && adopting.contains(resource) {
+                continue;
+            }
             let field = if kind == "volume" { "volumes" } else { "networks" };
             if kind != "container"
                 && let Some(definitions) = model[field].as_object()
@@ -738,8 +744,8 @@ pub fn validate_ownership(project: &Project, docker: &Docker) -> Result<()> {
                 && labels[PROJECT].as_str() == Some(name);
             ensure!(
                 owned,
-                "Foreign {kind} {resource} occupies project {name}; observed owner {:?}, expected {id}",
-                labels[OWNER].as_str()
+                "Foreign {kind} {resource} occupies project {name}; observed owner {:?}, expected {id}{}",
+                labels[OWNER].as_str(), volume_adoption_hint(kind)
             );
         }
     }
@@ -758,6 +764,9 @@ pub fn validate_ownership(project: &Project, docker: &Docker) -> Result<()> {
                 .as_str()
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("{}_{}", project.name().unwrap(), logical));
+            if kind == "volume" && adopting.contains(&expected) {
+                continue;
+            }
             if existing.contains(expected.as_str()) {
                 let labels: Value = serde_json::from_str(&docker.capture(
                     &strings(&[kind, "inspect", &expected, "--format", "{{json .Labels}}"]),
@@ -765,7 +774,7 @@ pub fn validate_ownership(project: &Project, docker: &Docker) -> Result<()> {
                 )?)?;
                 ensure!(
                     labels[OWNER].as_str() == Some(id) && labels[PROJECT].as_str() == Some(name),
-                    "Foreign {kind} {expected} occupies a declared managed resource name; observed owner {:?}, expected {id}", labels[OWNER].as_str()
+                    "Foreign {kind} {expected} occupies a declared managed resource name; observed owner {:?}, expected {id}{}", labels[OWNER].as_str(), volume_adoption_hint(kind)
                 );
             }
         }
@@ -817,6 +826,87 @@ pub fn validate_ownership(project: &Project, docker: &Docker) -> Result<()> {
     }
     Ok(())
 }
+fn volume_adoption_hint(kind: &str) -> &'static str {
+    if kind == "volume" {
+        "; to transfer declared managed volumes to this checkout, remove attached containers first, then run dks up --adopt-existing-volumes (copies data and recreates volumes)"
+    } else {
+        ""
+    }
+}
+
+pub fn adopt_existing_volumes(root: &Path, timeout: u64, output: &Output) -> Result<()> {
+    let _lock = state::lock(root, "lifecycle")?;
+    let project = crate::nickel::evaluate(root, None)?;
+    ensure!(project.backend()? == "compose", "--adopt-existing-volumes requires the Compose backend");
+    let docker = Docker::new(root, output.clone()).with_deadline(Instant::now() + Duration::from_secs(timeout.max(1)));
+    docker.check()?;
+    let model = render_document(&project, "compose")?;
+    let existing = docker.capture(&strings(&["volume", "ls", "--format", "{{.Name}}"]), None)?;
+    let existing: HashSet<&str> = existing.lines().collect();
+    let mut candidates = Vec::new();
+    for (logical, definition) in model["volumes"].as_object().into_iter().flat_map(|volumes| volumes.iter()) {
+        if definition["external"] == true {
+            continue;
+        }
+        let name = definition["name"].as_str().map(str::to_owned)
+            .unwrap_or_else(|| format!("{}_{}", project.name().unwrap(), logical));
+        if !existing.contains(name.as_str()) {
+            continue;
+        }
+        let inspected: Vec<Value> = serde_json::from_str(&docker.capture(&strings(&["volume", "inspect", &name]), None)?)?;
+        let volume = inspected.first().context("Volume inspection returned no volume")?;
+        if volume["Labels"][OWNER].as_str() == Some(project.owner()?)
+            && volume["Labels"][PROJECT].as_str() == Some(project.name()?) {
+            continue;
+        }
+        ensure!(volume["Driver"] == "local"
+            && volume["Options"].as_object().is_none_or(Map::is_empty)
+            && definition["driver"].as_str().is_none_or(|driver| driver == "local")
+            && definition["driver_opts"].as_object().is_none_or(Map::is_empty),
+            "Cannot adopt volume {name}: only local volumes without driver options are supported");
+        let attached = docker.capture(&strings(&["ps", "-aq", "--filter", &format!("volume={name}")]), None)?;
+        ensure!(attached.trim().is_empty(),
+            "Cannot adopt volume {name}: remove attached containers first (stop alone is insufficient); do not remove their volumes");
+        let mut labels = volume["Labels"].as_object().cloned().unwrap_or_default();
+        labels.extend(definition["labels"].as_object().context("Missing managed volume labels")?.clone());
+        labels.insert("com.docker.compose.project".into(), json!(project.name()?));
+        labels.insert("com.docker.compose.volume".into(), json!(logical));
+        candidates.push((name, labels));
+    }
+    let adopting = candidates.iter().map(|(name, _)| name.clone()).collect();
+    validate_ownership_except_volumes(&project, &docker, &adopting)?;
+    for (name, labels) in candidates {
+        let backup = format!("dks-volume-adoption-{}", state::random_id()?);
+        output.event("volumes", &format!("Adopting {name}; temporary backup {backup}"))?;
+        docker.run(&strings(&["volume", "create", &backup]), None)?;
+        let migration = (|| -> Result<()> {
+            copy_volume(&docker, &name, &backup)?;
+            docker.run(&strings(&["volume", "rm", &name]), None)?;
+            let mut create = strings(&["volume", "create", "--driver", "local"]);
+            for (key, value) in labels {
+                create.extend(strings(&["--label", &format!("{key}={}", value.as_str().context("Volume label must be a string")?)]));
+            }
+            create.push(name.clone());
+            docker.run(&create, None)?;
+            copy_volume(&docker, &backup, &name)?;
+            docker.run(&strings(&["volume", "rm", &backup]), None)?;
+            Ok(())
+        })();
+        migration.with_context(|| format!("Volume adoption failed for {name}; temporary volume {backup} retained for recovery (backup may be incomplete if the first copy failed)"))?;
+        output.event("volumes", &format!("Adopted {name}; dks destroy can now remove this managed volume"))?;
+    }
+    validate_ownership(&project, &docker)
+}
+
+fn copy_volume(docker: &Docker, source: &str, destination: &str) -> Result<()> {
+    docker.run(&strings(&[
+        "run", "--rm", "--network", "none", "--user", "0:0",
+        "--mount", &format!("type=volume,src={source},dst=/from,readonly,volume-nocopy"),
+        "--mount", &format!("type=volume,src={destination},dst=/to,volume-nocopy"),
+        "--entrypoint", "cp", "alpine:3.23", "-a", "/from/.", "/to/",
+    ]), None)
+}
+
 pub fn doctor(project: &Project, output: &Output) -> Result<Value> {
     let docker = Docker::new(&project.root, output.clone());
     validate_ownership(project, &docker)?;
