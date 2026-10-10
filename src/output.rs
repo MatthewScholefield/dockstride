@@ -228,12 +228,19 @@ impl Output {
                             let cell = comfy_table::Cell::new(clean(text));
                             if !self.no_color && headers.is_empty() && column == 1 {
                                 cell.fg(comfy_table::Color::AnsiValue(152))
+                            } else if !self.no_color && headers.is_empty() && column == 2 {
+                                cell.fg(comfy_table::Color::AnsiValue(245))
                             } else {
                                 cell
                             }
                         })
                         .collect::<Vec<_>>(),
                 );
+            }
+            if headers.is_empty() && columns == 3 {
+                for column in table.column_iter_mut() {
+                    column.set_constraint(comfy_table::ColumnConstraint::ContentWidth);
+                }
             }
             let border = self.style().color256(245);
             for line in table.to_string().lines() {
@@ -316,6 +323,32 @@ impl Output {
             vec!["Field", "Value"]
         };
         if compact && self.mode == OutputMode::Interactive {
+            let width = usize::from(
+                self.width
+                    .unwrap_or_else(|| console::Term::stdout().size().1),
+            );
+            let content_width = |column: usize| {
+                rows.iter()
+                    .flat_map(|row| row[column].lines())
+                    .map(console::measure_text_width)
+                    .max()
+                    .unwrap_or(0)
+            };
+            let available = width.saturating_sub(content_width(0) + content_width(1) + 10);
+            if available > 0
+                && width >= 13
+                && fields.iter().any(|field| {
+                    field["doc"]
+                        .as_str()
+                        .is_some_and(|doc| !doc.trim().is_empty())
+                })
+            {
+                for (row, field) in rows.iter_mut().zip(fields) {
+                    let doc = console::strip_ansi_codes(field["doc"].as_str().unwrap_or(""));
+                    let doc = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+                    row.push(console::truncate_str(&doc, available, "…").into_owned());
+                }
+            }
             self.table(out, &[], rows)
         } else {
             self.table(out, &headers, rows)
@@ -930,10 +963,10 @@ mod tests {
             ] {
                 assert!(text.contains(label), "{text}");
             }
-            assert!(
-                !text.contains("/private/")
-                    && !text.contains("private-docker-name")
-                    && !text.contains("long description")
+            assert!(!text.contains("/private/") && !text.contains("private-docker-name"));
+            assert_eq!(
+                text.contains("long description"),
+                output.mode == OutputMode::Interactive
             );
             assert!(text.contains("Environment ready") && text.contains("Next: dks up"));
             if output.mode == OutputMode::Interactive {
@@ -1022,6 +1055,61 @@ mod tests {
             plain,
             "Environment ready!\nField\tValue\nbackend\tcompose\nsecrets.token\t*** (file)\nEdit env.yaml to override configuration.\nNext: dks up\nNo containers started. Existing secrets are preserved on rerun.\n"
         );
+    }
+
+    #[test]
+    fn setup_descriptions_fit_available_width_without_wrapping() {
+        let value = json!({"configured":true,"configuration":{"fields":[
+            {"path":"port","value":8080,"doc":"Listening port"},
+            {"path":"mode","value":"dev","doc":"界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"},
+            {"path":"empty","value":null,"doc":null},
+            {"path":"note","value":"ok","doc":"\x1b[31mFirst\nsecond\tthird\x1b[0m"}
+        ]}});
+        for width in [12, 17, 18, 20, 24, 40, 80] {
+            let text = render(&interactive(true, width), value.clone());
+            let table = text
+                .lines()
+                .skip_while(|line| !line.starts_with('╭'))
+                .take_while(|line| !line.is_empty())
+                .collect::<Vec<_>>();
+            for line in &table {
+                assert!(
+                    console::measure_text_width(line) <= usize::from(width),
+                    "{width}: {line}"
+                );
+            }
+            if width >= 20 {
+                assert_eq!(table.len(), 6, "{text}");
+                assert!(text.contains('…'), "{text}");
+                assert!(!text.contains("First\nsecond") && !text.contains('\x1b'));
+            } else {
+                assert!(!text.contains("Listening") && !text.contains('界'));
+            }
+            if width >= 40 {
+                assert!(text.contains("Listening port") && text.contains("First second third"));
+            }
+        }
+        let colored = render(&interactive(false, 40), value.clone());
+        let uncolored = render(&interactive(true, 40), value.clone());
+        assert_eq!(console::strip_ansi_codes(&colored), uncolored);
+        let description_line = colored
+            .lines()
+            .find(|line| line.contains("Listening port"))
+            .unwrap();
+        assert!(
+            description_line.contains("\x1b[38;5;245m Listening port"),
+            "{description_line:?}"
+        );
+        assert!(!render(&Output::default(), value.clone()).contains("Listening port"));
+        let record: Value = serde_json::from_str(&render(
+            &Output {
+                json: true,
+                ..Output::default()
+            },
+            value.clone(),
+        ))
+        .unwrap();
+        assert_eq!(record["result"], value);
     }
 
     #[test]

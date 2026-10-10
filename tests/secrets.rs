@@ -408,10 +408,13 @@ fn existing_legacy_marker_and_credentials_are_neither_required_nor_deleted() {
 #[test]
 fn setup_presentation_reports_generated_existing_and_supplied_files_truthfully() {
     let f = Fixture::new("compose", "lib.GenerateSecret {bytes=32,encoding=\"hex\"}", "0", false);
+    let source = fs::read_to_string(f.root().join("compose.ncl")).unwrap();
+    fs::write(f.root().join("compose.ncl"), source.replace("project|String", "project|String|doc \"Project name\"")).unwrap();
     let first = f.command_mode(&["--interactive", "--no-color", "setup"], None, false);
     assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
     let text = String::from_utf8(first.stdout).unwrap();
     assert!(text.contains("✨ Environment ready!") && text.contains("*** (generated file)"));
+    assert!(text.contains("Project name"));
     assert!(text.contains("Generated configuration:\n╭") && !text.contains('\x1b'));
     assert!(text.contains("\ni Edit env.yaml to override configuration.\n  No containers started.\n"));
     assert!(!text.contains("ℹ"));

@@ -402,7 +402,8 @@ fn entries(text: &str) -> Result<Vec<Entry>> {
         let comment = delimiter(value_part, '#').unwrap_or(value_part.len());
         let value_end = value_start + value_part[..comment].trim_end().len();
         let raw = &text[value_start..value_end];
-        let block = raw.is_empty() || raw.starts_with('|') || raw.starts_with('>');
+        let mapping = raw.is_empty() || raw.split_whitespace().all(|token| token.starts_with('&') || token.starts_with('!'));
+        let block = mapping || raw.starts_with('|') || raw.starts_with('>');
         if raw.starts_with('|') || raw.starts_with('>') {
             scalar_indent = Some(indent);
         }
@@ -416,7 +417,7 @@ fn entries(text: &str) -> Result<Vec<Entry>> {
             indent,
             block,
         });
-        if raw.is_empty() {
+        if mapping {
             parents.push((indent, path));
         }
         offset += line.len();
@@ -459,8 +460,13 @@ fn document_end(text: &str) -> usize {
     text.len()
 }
 
-fn secrets_last(text: String, candidate: &Value) -> String {
-    if candidate.get("secrets").is_none() {
+fn internal_last(text: String, candidate: &Value) -> String {
+    let text = section_last(text, candidate, "_dockstride");
+    section_last(text, candidate, "secrets")
+}
+
+fn section_last(text: String, candidate: &Value, path: &str) -> String {
+    if candidate.get(path).is_none() {
         return text;
     }
     let Ok(nodes) = entries(&text) else {
@@ -469,15 +475,20 @@ fn secrets_last(text: String, candidate: &Value) -> String {
     let Some(indent) = nodes.iter().map(|node| node.indent).min() else {
         return text;
     };
-    let Some(secret) = nodes.iter().find(|node| node.indent == indent && node.path == "secrets") else {
+    let Some(section) = nodes.iter().find(|node| node.indent == indent && node.path == path) else {
         return text;
     };
-    if !nodes.iter().any(|node| node.indent == indent && node.start > secret.start) {
+    let insertion = if path == "secrets" {
+        nodes.iter().find(|node| node.indent == indent && node.path == "_dockstride")
+            .map_or_else(|| document_end(&text), |node| node.start)
+    } else {
+        document_end(&text)
+    };
+    if !nodes.iter().any(|node| node.indent == indent && node.start > section.start && node.start < insertion) {
         return text;
     }
-    let insertion = document_end(&text);
-    let mut end = secret.end.min(insertion);
-    for line in text[secret.line_end..end].split_inclusive('\n').rev() {
+    let mut end = section.end.min(insertion);
+    for line in text[section.line_end..end].split_inclusive('\n').rev() {
         let body = line.trim();
         let line_indent = line.len() - line.trim_start_matches(' ').len();
         if body.is_empty() || (body.starts_with('#') && line_indent <= indent) {
@@ -486,12 +497,12 @@ fn secrets_last(text: String, candidate: &Value) -> String {
             break;
         }
     }
-    let mut reordered = text[..secret.start].to_owned();
+    let mut reordered = text[..section.start].to_owned();
     reordered.push_str(&text[end..insertion]);
     if !reordered.is_empty() && !reordered.ends_with('\n') {
         reordered.push('\n');
     }
-    reordered.push_str(&text[secret.start..end]);
+    reordered.push_str(&text[section.start..end]);
     if !reordered.ends_with('\n') {
         reordered.push('\n');
     }
@@ -538,9 +549,9 @@ fn edit_document(
             parse_document(&edited)? == *candidate,
             "root mapping edit could not represent {path}; use dks config edit"
         );
-        return Ok(secrets_last(edited, candidate));
+        return Ok(internal_last(edited, candidate));
     }
-    let normalized = secrets_last(text.to_owned(), before);
+    let normalized = internal_last(text.to_owned(), before);
     let text = normalized.as_str();
     let nodes = entries(text)?;
     let keys = parts(path)?;
@@ -652,7 +663,7 @@ fn edit_document(
         parse_document(&edited)? == *candidate,
         "document-preserving edit could not represent {path}; use dks config edit"
     );
-    Ok(secrets_last(edited, candidate))
+    Ok(internal_last(edited, candidate))
 }
 
 fn mutate(root: &Path, path: &str, replacement: Option<Value>, secret: bool) -> Result<Value> {
@@ -730,7 +741,7 @@ pub(crate) fn prepare_sets_locked(root: &Path, updates: &[(String, Value)]) -> R
         ensure!(fields.iter().any(|field| field.path == *path || field.path.starts_with(&format!("{path}."))), "unknown configuration field {path}");
     }
     snapshot.verify()?;
-    Ok(edited)
+    Ok(internal_last(edited, &candidate))
 }
 
 /// Publish a checkout-local secret reference under caller-owned lifecycle/config/source guards.
@@ -801,6 +812,7 @@ pub fn edit(root: &Path) -> Result<Value> {
         );
         let edited = fs::read_to_string(temporary.path())?;
         let candidate = parse_document(&edited)?;
+        let edited = internal_last(edited, &candidate);
         let after = sources::snapshot(root, Some(&candidate))?;
         let _lifecycle = state::lock(root, "lifecycle")?;
         let _config = state::lock(root, "config")?;
@@ -1004,6 +1016,7 @@ pub fn setup_with_context(root: &Path, inputs: &[String], non_interactive: bool,
     for path in &creations {
         create_source(path)?;
     }
+    let edited = if edited != original { internal_last(edited, &candidate) } else { edited };
     if edited != original {
         verify_after_creations(&refreshed, &creations)?;
         verify_after_creations(&final_snapshot, &creations)?;
@@ -1262,6 +1275,7 @@ pub fn edit_shared(root: &Path, source: Option<&Path>) -> Result<Value> {
         ensure!(status.success(),"editor exited with {status}; shared source was not changed");
         let edited = fs::read_to_string(temporary.path())?;
         let candidate = sources::parse(&edited,&target)?;
+        let edited = internal_last(edited, &candidate);
         let after = sources::snapshot_with_overrides(root,Some(&before.local),&BTreeMap::from([(target.clone(),candidate.clone())]))?;
         let _lifecycle = state::lock(root, "lifecycle")?;
         let _config = state::lock(root, "config")?;

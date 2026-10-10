@@ -126,11 +126,11 @@ fn edits_keep_secrets_before_the_document_end_marker() {
 fn flow_root_edits_serialize_secrets_last() {
     let directory = secrets_fixture();
     let root = directory.path();
-    fs::write(root.join("env.yaml"), "# environment\n{secrets: {key: {file: '/private/token'}}, project: app, apiPort: 8080} # root\n... # end\n").unwrap();
+    fs::write(root.join("env.yaml"), "# environment\n{_dockstride: {sources: []}, secrets: {key: {file: '/private/token'}}, project: app, apiPort: 8080} # root\n... # end\n").unwrap();
     config::set(root, "apiPort", json!(8081)).unwrap();
     let text = fs::read_to_string(root.join("env.yaml")).unwrap();
     assert!(text.starts_with("# environment\n# root\n"));
-    assert!(text.ends_with("secrets:\n  key:\n    file: /private/token\n... # end\n"));
+    assert!(text.ends_with("secrets:\n  key:\n    file: /private/token\n_dockstride:\n  sources: []\n... # end\n"));
     assert_eq!(config::read_env(root).unwrap()["apiPort"], 8081);
     config::set(root, "apiPort", json!(8081)).unwrap();
     assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), text);
@@ -145,6 +145,184 @@ fn secret_reordering_that_would_break_aliases_preserves_valid_edits() {
     config::set(root, "apiPort", json!(8081)).unwrap();
     assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), source.replace("8080", "8081"));
     assert_eq!(config::read_env(root).unwrap()["oauth"]["issuer"], "/private/token");
+}
+
+fn metadata_fixture() -> TempDir {
+    let directory = secrets_fixture();
+    let model = fs::read_to_string(directory.path().join("compose.ncl")).unwrap();
+    fs::write(directory.path().join("compose.ncl"), model.replace("  secrets | Dyn,", "  secrets | Dyn,\n  notes | String," )).unwrap();
+    directory
+}
+
+fn metadata_document() -> String {
+    "# environment\n---\n'_dockstride': &internal # managed settings\n  # selected sources\n  sources: []\n\n# deployment identity\nproject: &identity 'app' # identity\napiPort: 8080 # host port\noauth:\n  enabled: false # switch\n  issuer: *identity # shared value\nnotes: |\n  _dockstride: is ordinary text here\n  secrets: too\n\n# credential locations\nsecrets: &references # references\n  key: {file: '/private/token'} # retained\n... # end\n".to_owned()
+}
+
+fn normalized_metadata_document(source: &str) -> String {
+    let start = source.find("'_dockstride':").unwrap();
+    let end = source.find("\n\n# deployment identity").unwrap() + 1;
+    let mut expected = source[..start].to_owned();
+    expected.push_str(&source[end..source.find("... # end").unwrap()]);
+    expected.push_str(&source[start..end]);
+    expected.push_str("... # end\n");
+    expected
+}
+
+#[test]
+fn setters_and_setup_keep_metadata_after_secrets_with_comments_and_anchors() {
+    let directory = metadata_fixture();
+    let root = directory.path();
+    use std::os::unix::fs::PermissionsExt;
+    let external = tempfile::tempdir().unwrap();
+    let token = external.path().join("token");
+    fs::write(&token, b"fixture-input").unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let source = metadata_document().replace("/private/token", token.to_str().unwrap());
+    let expected = normalized_metadata_document(&source);
+    for operation in ["set", "unset", "setup", "setup-no-inputs", "secret-reference"] {
+        fs::write(root.join("env.yaml"), &source).unwrap();
+        let mut candidate = config::read_env(root).unwrap();
+        let expected = match operation {
+            "set" => {
+                config::set(root, "apiPort", json!(8081)).unwrap();
+                candidate["apiPort"] = json!(8081);
+                expected.replace("8080", "8081")
+            }
+            "unset" => {
+                config::unset(root, "apiPort").unwrap();
+                candidate.as_object_mut().unwrap().remove("apiPort");
+                expected.replace("apiPort: 8080 # host port\n", "")
+            }
+            "setup" => {
+                config::setup(root, &["apiPort=8081".into()], true).unwrap();
+                candidate["apiPort"] = json!(8081);
+                expected.replace("8080", "8081")
+            }
+            "secret-reference" => {
+                config::set(root, "secrets.key", json!({"file":token})).unwrap();
+                candidate["secrets"]["key"] = json!({"file":token});
+                expected.replace(&format!("  key: {{file: '{}'}} # retained\n", token.display()), &format!("  key:  # retained\n    file: {}\n", token.display()))
+            }
+            _ => {
+                assert_eq!(config::setup(root, &[], true).unwrap()["changed"], false);
+                source.clone()
+            }
+        };
+        assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), expected, "{operation}");
+        assert_eq!(config::read_env(root).unwrap(), candidate, "{operation}");
+        config::set(root, "apiPort", json!(candidate["apiPort"].as_u64().unwrap_or(8080))).unwrap();
+        assert!(fs::read_to_string(root.join("env.yaml")).unwrap().ends_with("  sources: []\n... # end\n"));
+    }
+}
+
+#[test]
+fn shared_setters_normalize_allowed_metadata_without_changing_other_values() {
+    let directory = metadata_fixture();
+    let root = directory.path();
+    let source = metadata_document();
+    fs::write(root.join("shared.yaml"), &source).unwrap();
+    fs::write(root.join("env.yaml"), "_dockstride: {sources: [{path: shared.yaml}]}\n").unwrap();
+    config::set_shared(root, "apiPort", json!(8081), None).unwrap();
+    let expected = normalized_metadata_document(&source).replace("8080", "8081");
+    assert_eq!(fs::read_to_string(root.join("shared.yaml")).unwrap(), expected);
+    let mut candidate: Value = serde_yaml::from_str(&source).unwrap();
+    candidate["apiPort"] = json!(8081);
+    assert_eq!(dockstride::sources::parse(&expected, &root.join("shared.yaml")).unwrap(), candidate);
+    config::unset_shared(root, "apiPort", None).unwrap();
+    assert_eq!(fs::read_to_string(root.join("shared.yaml")).unwrap(), expected.replace("apiPort: 8081 # host port\n", ""));
+}
+
+#[test]
+fn editors_normalize_local_and_shared_metadata_without_reformatting() {
+    let directory = metadata_fixture();
+    let root = directory.path();
+    let source = metadata_document();
+    fs::write(root.join("env.yaml"), &source).unwrap();
+    fs::write(root.join("shared.yaml"), &source).unwrap();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "metadata_editors_subprocess_worker", "--nocapture"])
+        .env("DKS_METADATA_FIXTURE", root)
+        .env("EDITOR", "true")
+        .env("DOCKER_HOST", "unix:///metadata-fixture.sock")
+        .env_remove("DOCKER_CONTEXT")
+        .output().unwrap();
+    assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+    let expected = normalized_metadata_document(&source);
+    assert_eq!(fs::read_to_string(root.join("shared.yaml")).unwrap(), expected);
+    let local = fs::read_to_string(root.join("env.yaml")).unwrap();
+    assert_eq!(local, expected.replace("  sources: []", "  sources: \n    - path: shared.yaml"));
+}
+
+#[test]
+fn metadata_editors_subprocess_worker() {
+    let Some(root) = std::env::var_os("DKS_METADATA_FIXTURE") else { return; };
+    let root = std::path::Path::new(&root);
+    config::edit(root).unwrap();
+    assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), normalized_metadata_document(&metadata_document()));
+    config::sources_add(root, std::path::Path::new("shared.yaml"), false).unwrap();
+    config::edit_shared(root, None).unwrap();
+}
+
+#[test]
+fn managed_swarm_binding_normalizes_metadata_and_preserves_anchored_environment() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = metadata_fixture();
+    let root = directory.path();
+    let external = tempfile::tempdir().unwrap();
+    let token = external.path().join("token");
+    fs::write(&token, b"fixture-input").unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let source = metadata_document().replace("/private/token", token.to_str().unwrap())
+        .replace("apiPort: 8080", "backend: swarm\napiPort: 8080");
+    fs::write(root.join("env.yaml"), &source).unwrap();
+    let model = fs::read_to_string(root.join("compose.ncl")).unwrap();
+    fs::write(root.join("compose.ncl"), model.replace("  services.api.image", "  secrets = env.secrets,\n  services.api.image")).unwrap();
+    fs::create_dir(root.join("bin")).unwrap();
+    let docker = root.join("bin/docker");
+    fs::write(&docker, r#"#!/usr/bin/env python3
+import json,os,pathlib,sys
+a=sys.argv[1:]
+r=pathlib.Path(os.environ['DKS_METADATA_FIXTURE'])
+if a[:1]==['--context']: a=a[2:]
+if a[:2]==['context','show']: print('fixture')
+elif a[:2]==['context','inspect']: print(json.dumps([{'Endpoints':{'docker':{'Host':'unix:///metadata-fixture.sock'}}}]))
+elif a[:1]==['info']:
+ if a[-1]=='{{json .Swarm}}': print(json.dumps({'LocalNodeState':'active','ControlAvailable':True,'Cluster':{'ID':'fixture'}}))
+ elif a[-1]=='{{json .ID}}': print(json.dumps('fixture'))
+ elif a[-1]=='{{.ID}}': print('fixture')
+ elif a[-1]=='{{.Swarm.LocalNodeState}}': print('active')
+ else: raise SystemExit(9)
+elif a[:2]==['secret','create']:
+ sys.stdin.buffer.read()
+ labels={}
+ for i,x in enumerate(a):
+  if x=='--label':
+   k,v=a[i+1].split('=',1)
+   labels[k]=v
+ (r/'object.json').write_text(json.dumps({'Spec':{'Name':a[-2],'Labels':labels}}))
+ print('id')
+elif a[:2]==['secret','inspect']: print('['+(r/'object.json').read_text()+']')
+elif a[:1]==['ps'] or a[:2] in (['volume','ls'],['network','ls'],['service','ls'],['secret','ls'],['config','ls']): print('')
+else: raise SystemExit(9)
+"#).unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_dks"))
+        .args(["--json", "--non-interactive", "-C"]).arg(root)
+        .args(["secrets", "sync", "key", "--yes"])
+        .env("DKS_METADATA_FIXTURE", root)
+        .env("HOME", root.join("home"))
+        .env("PATH", format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap()))
+        .env_remove("DOCKER_HOST").env_remove("DOCKER_CONTEXT")
+        .output().unwrap();
+    assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+    let mut candidate: Value = serde_yaml::from_str(&source).unwrap();
+    let actual = config::read_env(root).unwrap();
+    let binding = actual["_dockstride"]["swarmSecrets"]["key"].as_str().unwrap();
+    assert!(binding.starts_with("dks-"));
+    candidate["_dockstride"]["swarmSecrets"] = json!({"key":binding});
+    assert_eq!(actual, candidate);
+    let expected = normalized_metadata_document(&source).replace("  sources: []\n", &format!("  sources: []\n  swarmSecrets:\n    key: {binding}\n"));
+    assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), expected);
 }
 
 #[test]
@@ -574,6 +752,17 @@ print(json.dumps({'schemaVersion':1,'values':{'project':'generated'},'sources':[
     assert_eq!(config::get(root,"project").unwrap()["value"],"inherited");
     config::setup(root,&[],true).unwrap();
     assert_eq!(fs::read_to_string(root.join("calls")).unwrap(),"run\n");
+}
+
+#[test]
+fn setup_proposals_leave_internal_metadata_below_generated_values() {
+    let directory = defaults_fixture("import json,sys\njson.load(sys.stdin)\nprint(json.dumps({'schemaVersion':1,'values':{'project':'generated'},'sources':[]}))\n");
+    let root = directory.path();
+    let source = "# environment\n_dockstride: # managed\n  swarmSecrets: {}\n\n# preferences\napiPort: &port 8080 # endpoint\noauth: {issuer: 'example'}\n";
+    fs::write(root.join("env.yaml"), source).unwrap();
+    config::setup(root, &[], true).unwrap();
+    assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), "# environment\n\n# preferences\napiPort: &port 8080 # endpoint\noauth: {issuer: 'example'}\nproject: generated\n_dockstride: # managed\n  swarmSecrets: {}\n  sources: []\n");
+    assert_eq!(config::read_env(root).unwrap()["_dockstride"], json!({"swarmSecrets":{},"sources":[]}));
 }
 
 #[test]
