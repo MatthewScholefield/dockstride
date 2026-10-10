@@ -1,4 +1,4 @@
-# Dockstride library 0.2.0 — embedded evaluator nickel-lang-core 0.19.0.
+# Dockstride library 0.3.0 — embedded evaluator nickel-lang-core 0.19.0.
 # This file is checked in with the application; evaluation never downloads code.
 # Config annotations are the schema. Advanced contracts stay Nickel's responsibility.
 let choiceContract = fun choices => std.contract.from_predicate (fun value =>
