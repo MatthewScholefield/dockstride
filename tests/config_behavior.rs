@@ -403,6 +403,8 @@ fn recursive_live_layers_replace_units_and_record_winning_and_overridden_origins
     fs::write(root.join("env.yaml"),"_dockstride:\n  sources: [{path: shared/layer.yaml}]\nproject: local\noauth: {enabled: false}\n").unwrap();
     let snapshot = dockstride::sources::snapshot(root,None).unwrap();
     assert_eq!(snapshot.values,json!({"project":"local","oauth":{"enabled":false,"issuer":"inherited"},"items":["three"],"nullable":null}));
+    assert_eq!(snapshot.local["_dockstride"]["sources"], json!([{"path":"shared/layer.yaml"}]));
+    assert_eq!(dockstride::sources::descriptors(&dockstride::sources::parse(&fs::read_to_string(root.join("shared/layer.yaml")).unwrap(), &root.join("shared/layer.yaml")).unwrap()).unwrap().unwrap(), vec![std::path::PathBuf::from("../base.yaml")]);
     let issuer = &snapshot.provenance["oauth.issuer"];
     assert_eq!(issuer.file,fs::canonicalize(root.join("shared/layer.yaml")).unwrap());
     assert_eq!(issuer.overridden[0].file,fs::canonicalize(root.join("base.yaml")).unwrap());
@@ -452,6 +454,77 @@ fn shared_changes_are_live_local_unset_reveals_inheritance_and_comments_survive(
     assert_eq!(fs::read_to_string(&source).unwrap(),before);
     assert!(config::read_env(second.path()).unwrap().get("apiPort").is_none());
     assert_eq!(dockstride::nickel::evaluate(second.path(),None).unwrap().env["apiPort"],8282);
+}
+
+#[test]
+fn absolute_source_additions_are_relative_without_rewriting_existing_absolute_refs() {
+    let directory = fixture();
+    let root = directory.path();
+    let sibling = tempfile::tempdir_in(root.parent().unwrap()).unwrap();
+    let existing = root.join("existing.yaml");
+    fs::write(&existing, "{}\n").unwrap();
+    fs::write(root.join("env.yaml"), format!("project: paths\noauth: {{issuer: example}}\n_dockstride:\n  sources: [{{path: '{}'}}]\n", existing.display())).unwrap();
+    fs::write(root.join("local.yaml"), "{}\n").unwrap();
+    let source = sibling.path().join("settings.yaml");
+    fs::write(&source, "apiPort: 8181\n").unwrap();
+    let alias = sibling.path().join("checkout");
+    std::os::unix::fs::symlink(root, &alias).unwrap();
+    config::sources_add(&alias, &root.join("local.yaml"), false).unwrap();
+    let listed = config::sources_add(&alias, &source, false).unwrap();
+    let relative = format!("../{}/settings.yaml", sibling.path().file_name().unwrap().to_str().unwrap());
+    assert_eq!(config::read_env(root).unwrap()["_dockstride"]["sources"], json!([
+        {"path":existing}, {"path":"local.yaml"}, {"path":relative}
+    ]));
+    assert_eq!(listed["sources"][2]["path"], relative);
+    assert_eq!(listed["sources"][2]["resolved"], json!(source));
+    assert_eq!(config::get(root, "apiPort").unwrap()["value"], 8181);
+    config::sources_remove(&alias, &source).unwrap();
+    assert_eq!(config::read_env(root).unwrap()["_dockstride"]["sources"], json!([{ "path":existing }, {"path":"local.yaml"}]));
+}
+
+#[test]
+fn compact_paths_survive_set_edit_and_shared_mutations() {
+    let directory = fixture();
+    let root = directory.path();
+    let home = root.join("home");
+    fs::create_dir(&home).unwrap();
+    fs::write(root.join("base.yaml"), "oauth: {issuer: '$HOME/unexpanded'}\n").unwrap();
+    fs::write(home.join("settings.yaml"), "_dockstride:\n  sources: [{path: ../base.yaml}]\napiPort: 8080\n").unwrap();
+    fs::write(root.join("env.yaml"), "project: compact\n_dockstride:\n  sources: [{path: '~/settings.yaml'}]\noauth: {issuer: '~/issuer'}\n").unwrap();
+    let editor = root.join("compact-editor.py");
+    fs::write(&editor, "import pathlib,sys\np = pathlib.Path(sys.argv[1])\np.write_text(p.read_text().replace('compact', 'edited').replace('8282', '8383'))\n").unwrap();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "compact_paths_subprocess_worker", "--nocapture"])
+        .env("DKS_COMPACT_FIXTURE", root)
+        .env("HOME", &home)
+        .env("DOCKER_HOST", "unix:///compact-fixture.sock")
+        .env_remove("DOCKER_CONTEXT")
+        .env("EDITOR", format!("python3 {}", editor.display()))
+        .output().unwrap();
+    assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+}
+
+#[test]
+fn compact_paths_subprocess_worker() {
+    let Some(root) = std::env::var_os("DKS_COMPACT_FIXTURE") else { return; };
+    let root = std::path::Path::new(&root);
+    let expected_sources = json!([{"path":"~/settings.yaml"}]);
+    assert_eq!(config::sources_list(root).unwrap()["sources"][0]["resolved"], json!(root.join("home/settings.yaml")));
+    config::set(root, "oauth.enabled", json!(true)).unwrap();
+    config::edit(root).unwrap();
+    config::set_shared(root, "apiPort", json!(8282), None).unwrap();
+    config::edit_shared(root, None).unwrap();
+    let local = config::read_env(root).unwrap();
+    assert_eq!(local["_dockstride"]["sources"], expected_sources);
+    assert_eq!(local["oauth"]["issuer"], "~/issuer");
+    assert_eq!(local["project"], "edited");
+    let shared = dockstride::sources::parse(&fs::read_to_string(root.join("home/settings.yaml")).unwrap(), &root.join("home/settings.yaml")).unwrap();
+    assert_eq!(shared["_dockstride"]["sources"], json!([{"path":"../base.yaml"}]));
+    assert_eq!(shared["apiPort"], 8383);
+    assert_eq!(config::get(root, "oauth.issuer").unwrap()["value"], "~/issuer");
+    config::unset(root, "oauth.issuer").unwrap();
+    assert_eq!(config::get(root, "oauth.issuer").unwrap()["value"], "$HOME/unexpanded");
+    assert_eq!(config::sources_list(root).unwrap()["sources"][0]["path"], "~/settings.yaml");
 }
 
 #[test]

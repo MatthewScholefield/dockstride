@@ -106,6 +106,20 @@ secrets=env.secrets,services.api={{image="alpine",user="{user}",secrets=["authKe
     fn root(&self) -> &Path {
         &self.root
     }
+    fn home_storage(&self) {
+        let path = self.root().join("compose.ncl");
+        let source = fs::read_to_string(&path).unwrap();
+        let directory = serde_json::to_string(&self.temp.path().join("private")).unwrap();
+        fs::write(path, source.replace(&directory, "\"~/private\"")).unwrap();
+        fs::create_dir(self.temp.path().join("home")).unwrap();
+    }
+    fn reference_path(&self, reference: &Value) -> PathBuf {
+        let path = reference["file"].as_str().unwrap();
+        match path.strip_prefix("~/") {
+            Some(path) => self.temp.path().join("home").join(path),
+            None => PathBuf::from(path),
+        }
+    }
     fn command(&self, args: &[&str], stdin: Option<&[u8]>) -> Output {
         self.command_mode(args, stdin, true)
     }
@@ -354,6 +368,7 @@ fn external_boundary_rejects_checkout_repository_linked_worktree_and_symlinks() 
     let safe = temp.path().join("safe");
     fs::create_dir(&safe).unwrap();
     assert!(dockstride::secrets::ensure_external_path(&root,&safe.join("future/secret")).is_ok());
+    assert!(dockstride::secrets::ensure_external_path(&root,Path::new("~/secret")).is_err());
     let link = temp.path().join("link");
     symlink(&safe,&link).unwrap();
     assert!(dockstride::secrets::ensure_external_path(&root,&link.join("secret")).is_err());
@@ -465,4 +480,93 @@ fn setup_json_preserves_results_and_adds_real_timing_events_and_generation() {
     assert_eq!(result["result"]["secretProvisioning"]["secrets"][0]["generated"], true);
     assert!(records.iter().any(|record| record["phase"] == "secrets"));
     assert!(!String::from_utf8_lossy(&output.stdout).contains('╭'));
+}
+
+#[test]
+fn home_generated_references_survive_setup_replace_and_swarm_sync() {
+    for backend in ["compose", "swarm"] {
+        let f = Fixture::new(backend, "lib.GenerateSecret {bytes=32,encoding=\"hex\"}", "0", false);
+        f.home_storage();
+        f.success(&["setup"], None);
+        let original = f.env()["secrets"]["authKey"].clone();
+        assert!(original["file"].as_str().unwrap().starts_with("~/private/"));
+        let original_path = f.reference_path(&original);
+        let bytes = fs::read(&original_path).unwrap();
+        assert_eq!(bytes.len(), 64);
+        let env_before = fs::read(f.root().join("env.yaml")).unwrap();
+        fs::remove_dir_all(f.root().join(".dockstride")).unwrap();
+        f.success(&["setup"], None);
+        assert_eq!(fs::read(f.root().join("env.yaml")).unwrap(), env_before);
+        assert_eq!(fs::read(&original_path).unwrap(), bytes);
+        assert_eq!(f.success(&["secrets", "list"], None)["result"]["secrets"][0]["reference"], original);
+        let rendered = f.command_mode(&["render", "--target", backend], None, false);
+        assert!(rendered.status.success(), "{}", String::from_utf8_lossy(&rendered.stderr));
+        let rendered: Value = serde_yaml::from_slice(&rendered.stdout).unwrap();
+        if backend == "compose" {
+            assert_eq!(rendered["secrets"]["authKey"]["file"], json!(original_path));
+        } else {
+            assert_eq!(rendered["secrets"]["authKey"]["external"], true);
+            assert!(rendered["secrets"]["authKey"].get("file").is_none());
+        }
+        assert_eq!(fs::read(f.root().join("env.yaml")).unwrap(), env_before);
+        let project = f.env()["project"].as_str().unwrap().to_owned();
+        f.success(&["config", "set", "project", &project], None);
+        assert_eq!(f.env()["secrets"]["authKey"], original);
+        f.success(&["secrets", "sync", "authKey", "--yes"], None);
+        assert_eq!(f.env()["secrets"]["authKey"], original);
+        f.success(&["secrets", "replace", "authKey", "--stdin"], Some(b"replacement-material"));
+        let replacement = f.env()["secrets"]["authKey"].clone();
+        assert_ne!(replacement, original);
+        assert!(replacement["file"].as_str().unwrap().starts_with("~/private/"));
+        assert_eq!(fs::read(f.reference_path(&replacement)).unwrap(), b"replacement-material");
+        assert_eq!(fs::read(original_path).unwrap(), bytes);
+        f.success(&["setup"], None);
+        assert_eq!(f.env()["secrets"]["authKey"], replacement);
+        if backend == "swarm" {
+            assert_eq!(fs::read(f.root().join("last-secret-stdin")).unwrap(), b"replacement-material");
+        }
+    }
+}
+
+#[test]
+fn default_secret_storage_under_home_persists_tilde_paths() {
+    let f = Fixture::new("compose", "lib.GenerateSecret {bytes=32,encoding=\"hex\"}", "0", false);
+    f.home_storage();
+    let source = fs::read_to_string(f.root().join("compose.ncl")).unwrap();
+    fs::write(f.root().join("compose.ncl"), source.replace("setup.secretDirectory=\"~/private\",", "")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_dks"))
+        .current_dir(f.root())
+        .args(["--json", "--non-interactive", "setup"])
+        .env("HOME", f.temp.path().join("home"))
+        .env("XDG_DATA_HOME", f.temp.path().join("home/.local/share"))
+        .env("PATH", format!("{}:{}", f.root().join("bin").display(), std::env::var("PATH").unwrap()))
+        .env("FIXTURE", f.root())
+        .env("ROOTLESS", "0")
+        .env_remove("DOCKER_HOST")
+        .env_remove("DOCKER_CONTEXT")
+        .stdin(Stdio::null())
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let reference = f.env()["secrets"]["authKey"].clone();
+    assert!(reference["file"].as_str().unwrap().starts_with("~/.local/share/dockstride/secrets/"));
+    assert_eq!(fs::read(f.reference_path(&reference)).unwrap().len(), 64);
+    f.success(&["setup"], None);
+    assert_eq!(f.env()["secrets"]["authKey"], reference);
+}
+
+#[test]
+fn home_storage_rejects_traversal_and_symlink_ancestors() {
+    for directory in ["~/../private", "~/./private", "~/private/../other", "~/private/./other", "~/linked/private"] {
+        let f = Fixture::new("compose", "lib.GenerateSecret {bytes=32,encoding=\"hex\"}", "0", false);
+        f.home_storage();
+        let home = f.temp.path().join("home");
+        symlink(f.temp.path(), home.join("linked")).unwrap();
+        let path = f.root().join("compose.ncl");
+        let source = fs::read_to_string(&path).unwrap().replace("~/private", directory);
+        fs::write(path, source).unwrap();
+        let before = fs::read(f.root().join("env.yaml")).unwrap();
+        assert!(!f.command(&["setup"], None).status.success(), "accepted {directory}");
+        assert_eq!(fs::read(f.root().join("env.yaml")).unwrap(), before);
+        assert!(!home.join("private").exists());
+    }
 }

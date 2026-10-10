@@ -405,9 +405,9 @@ fn obtain_source(session:&Session, name:&str, policy:&Value, input:Option<&Secre
         Some(SecretInput::File(_)) => unreachable!(), None => obtain(policy,non_interactive,stdin_used)? };
     if session.backend == "compose" { local_scope(session)?; }
     let directory = private_directory(session,true)?;
-    let reference = json!({"file":directory.join(format!("{name}--{}",state::random_id()?))});
-    write_private(&reference,&bytes,session,name)?;
-    Ok(reference)
+    let path = directory.join(format!("{name}--{}",state::random_id()?));
+    write_private(&json!({"file":path}),&bytes,session,name)?;
+    Ok(json!({"file":sources::portable_home(&path)}))
 }
 
 fn validate_candidate_consumers(root:&Path, session:&Session, snapshot:&sources::EnvironmentSnapshot) -> Result<()> {
@@ -487,9 +487,9 @@ fn policy_kind(policy:&Value) -> &str {
 
 fn reference_file(root:&Path, reference:&Value) -> Result<(File,PathBuf)> {
     validate_reference_shape(reference)?;
-    let path = Path::new(reference["file"].as_str().context("file reference required")?);
-    ensure_external_path(root,path)?;
-    let file = open_secure_file(path,libc::O_RDONLY|libc::O_NOATIME,0)
+    let path = sources::expand_home(Path::new(reference["file"].as_str().context("file reference required")?))?;
+    ensure_external_path(root,&path)?;
+    let file = open_secure_file(&path,libc::O_RDONLY|libc::O_NOATIME,0)
         .context("referenced secret is absent or unreadable; restore this file or explicitly replace")?;
     let metadata = file.metadata()?;
     ensure!(metadata.is_file() && metadata.uid() == unsafe {libc::geteuid()}
@@ -512,7 +512,10 @@ pub fn preflight_inputs(root:&Path, inputs:&BTreeMap<String,SecretInput>, candid
         // Reused references ignore replacement inputs, including unreadable files.
         if snapshot.values.pointer(&format!("/secrets/{name}")).is_none_or(Value::is_null) {
             if let SecretInput::File(path) = input {
-                let path = if path.is_absolute() {path.clone()} else {std::env::current_dir()?.join(path)};
+                ensure!(!path.as_os_str().as_bytes().split(|byte| *byte == b'/').any(|part| part == b".." || part == b"."),
+                    "secret paths must not contain traversal components");
+                let path = sources::expand_home(path)?;
+                let path = if path.is_absolute() {path} else {std::env::current_dir()?.join(path)};
                 reference_file(root,&json!({"file":path}))?;
             }
         }
@@ -529,9 +532,12 @@ fn obtain_reference(root:&Path,input:Option<&SecretInput>, non_interactive:bool)
             PathBuf::from(rpassword::prompt_password("Private secret FILE PATH (hidden): ")?)
         }
     };
+    ensure!(!path.as_os_str().as_bytes().split(|byte| *byte == b'/').any(|part| part == b".." || part == b"."),
+        "secret paths must not contain traversal components");
+    let path = sources::expand_home(&path)?;
     let path = if path.is_absolute() {path} else {std::env::current_dir()?.join(path)};
     let (_,path) = reference_file(root,&json!({"file":path}))?;
-    Ok(json!({"file":path}))
+    Ok(json!({"file":sources::portable_home(&path)}))
 }
 
 fn obtain(policy:&Value,non_interactive:bool,stdin_used:&mut bool) -> Result<Vec<u8>> {
@@ -560,7 +566,10 @@ fn obtain(policy:&Value,non_interactive:bool,stdin_used:&mut bool) -> Result<Vec
 fn private_directory(session:&Session,create:bool) -> Result<PathBuf> {
     let uid = unsafe {libc::geteuid()};
     let parent = match session.metadata.pointer("/setup/secretDirectory").and_then(Value::as_str) {
-        Some(path) => PathBuf::from(path),
+        Some(path) => {
+            validate_reference_shape(&json!({"file":path}))?;
+            sources::expand_home(Path::new(path))?
+        }
         None => {
             let data = match std::env::var_os("XDG_DATA_HOME").filter(|path| !path.is_empty()) {
                 Some(path) => PathBuf::from(path),
@@ -611,16 +620,28 @@ fn references(env: &Value) -> impl Iterator<Item = (&String, &Value)> {
         .flat_map(|record| record.iter())
 }
 
+pub(crate) fn resolve_file_paths(value: &mut Value) -> Result<()> {
+    if let Some(secrets) = value.get_mut("secrets").and_then(Value::as_object_mut) {
+        for reference in secrets.values_mut() {
+            if let Some(path) = reference.get("file").and_then(Value::as_str) {
+                let path = sources::expand_home(Path::new(path))?;
+                reference["file"] = json!(path);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_reference_shape(reference: &Value) -> Result<()> {
     let record = reference.as_object().context("secret reference must be a record, never plaintext")?;
     if let Some(path) = record.get("file").and_then(Value::as_str) {
-        ensure!(record.len() == 1 && Path::new(path).is_absolute(),
-            "file secret reference requires exactly {{file: absolute-path}}");
-        ensure!(!Path::new(path).components().any(|part| matches!(part, Component::ParentDir | Component::CurDir)),
+        ensure!(record.len() == 1 && (Path::new(path).is_absolute() || path.starts_with("~/")),
+            "file secret reference requires exactly {{file: absolute-path or ~/path}}");
+        ensure!(!path.split('/').any(|part| matches!(part, ".." | ".")),
             "secret paths must not contain traversal components");
     } else {
         ensure!(record.len() == 2 && record.get("external").and_then(Value::as_bool) == Some(true),
-            "secret reference requires {{file: absolute-path}} or {{external: true, name: object}}");
+            "secret reference requires {{file: absolute-path or ~/path}} or {{external: true, name: object}}");
         valid_name(record.get("name").and_then(Value::as_str).context("external secret name missing")?)?;
     }
     Ok(())
@@ -804,6 +825,8 @@ fn docker_rootless(session: &Session) -> Result<bool> {
     Ok(rootless)
 }
 fn reject_symlinks(path: &Path) -> Result<()> {
+    ensure!(!path.as_os_str().as_bytes().split(|byte| *byte == b'/').any(|part| part == b".." || part == b"."),
+        "secret paths must not contain traversal components");
     let mut current = PathBuf::new();
     for part in path.components() {
         ensure!(

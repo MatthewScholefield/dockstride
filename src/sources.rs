@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::{BTreeMap, BTreeSet}, fs, io, path::{Path, PathBuf}};
+use std::{collections::{BTreeMap, BTreeSet}, fs, io, path::{Component, Path, PathBuf}};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Origin { pub file: PathBuf, pub path: String }
@@ -39,6 +39,48 @@ impl EnvironmentSnapshot {
         ensure!(matches, "configuration or shared sources changed; rerun with current settings");
         Ok(())
     }
+}
+
+pub fn expand_home(path: &Path) -> Result<PathBuf> {
+    expand_home_with(path, std::env::var_os("HOME").as_deref().map(Path::new))
+}
+
+fn expand_home_with(path: &Path, home: Option<&Path>) -> Result<PathBuf> {
+    if !path.as_os_str().as_encoded_bytes().starts_with(b"~/") { return Ok(path.to_owned()); }
+    let home = home.filter(|home| !home.as_os_str().is_empty() && home.is_absolute())
+        .context("expanding ~/ requires HOME to be a nonempty absolute path")?;
+    Ok(home.join(path.strip_prefix("~")?))
+}
+
+pub fn portable_home(path: &Path) -> PathBuf {
+    portable_home_with(path, std::env::var_os("HOME").as_deref().map(Path::new))
+}
+
+fn portable_home_with(path: &Path, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home.filter(|home| home.is_absolute()) else { return path.to_owned(); };
+    if !path.is_absolute() || path.components().chain(home.components()).any(|part| part == Component::ParentDir) {
+        return path.to_owned();
+    }
+    match path.strip_prefix(home) {
+        Ok(suffix) => PathBuf::from("~/").join(suffix),
+        Err(_) => path.to_owned(),
+    }
+}
+
+pub fn relative_path(base: &Path, target: &Path) -> PathBuf {
+    if !base.is_absolute() || !target.is_absolute()
+        || base.components().chain(target.components()).any(|part| part == Component::ParentDir) {
+        return target.to_owned();
+    }
+    let base = base.components().collect::<Vec<_>>();
+    let target_parts = target.components().collect::<Vec<_>>();
+    let common = base.iter().zip(&target_parts).take_while(|(left, right)| left == right).count();
+    if common == 0 { return target.to_owned(); }
+    let mut relative = PathBuf::new();
+    for _ in &base[common..] { relative.push(".."); }
+    for part in &target_parts[common..] { relative.push(part.as_os_str()); }
+    if relative.as_os_str().is_empty() { relative.push("."); }
+    relative
 }
 
 pub(crate) fn identity(path: &Path) -> Result<PathBuf> {
@@ -154,6 +196,7 @@ fn resolve(snapshot: &mut EnvironmentSnapshot, file: &Path, value: Value, stack:
     }
     stack.push(file.to_owned());
     for source in descriptors(&value)?.unwrap_or_default() {
+        let source = expand_home(&source)?;
         let source = if source.is_absolute() { source } else { file.parent().unwrap().join(source) };
         let canonical = identity(&source).with_context(|| format!("resolving shared source {} declared by {}", source.display(), file.display()))?;
         let (child, fingerprint) = if let Some(value) = overrides.get(&canonical) {
@@ -227,4 +270,52 @@ pub(crate) fn lock_paths(paths: impl IntoIterator<Item=PathBuf>) -> Result<Vec<c
         let name = format!("source-{}", hex::encode(Sha256::digest(path.as_os_str().as_encoded_bytes())));
         crate::state::lock(path.parent().unwrap(), &name)
     }).collect()
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{expand_home_with, portable_home_with, relative_path};
+    use std::path::Path;
+
+    #[test]
+    fn home_expansion_is_explicit_and_requires_an_absolute_home() {
+        let home = Some(Path::new("/home/test"));
+        assert_eq!(expand_home_with(Path::new("~/settings.yaml"), home).unwrap(), Path::new("/home/test/settings.yaml"));
+        assert_eq!(expand_home_with(Path::new("~/"), home).unwrap(), Path::new("/home/test"));
+        for path in ["~", "~user/settings.yaml", "$HOME/settings.yaml", "relative.yaml", "/absolute.yaml"] {
+            assert_eq!(expand_home_with(Path::new(path), None).unwrap(), Path::new(path));
+        }
+        for home in [None, Some(Path::new("")), Some(Path::new("relative/home"))] {
+            assert!(expand_home_with(Path::new("~/settings.yaml"), home).is_err());
+        }
+    }
+
+    #[test]
+    fn home_compaction_respects_components_and_preserves_traversal() {
+        let home = Some(Path::new("/home/test"));
+        assert_eq!(portable_home_with(Path::new("/home/test/settings.yaml"), home), Path::new("~/settings.yaml"));
+        assert_eq!(portable_home_with(Path::new("/home/test"), home), Path::new("~/"));
+        for path in ["/outside/settings.yaml", "/home/test-sibling/settings.yaml", "/home/test/../outside.yaml", "relative.yaml", "~/settings.yaml"] {
+            assert_eq!(portable_home_with(Path::new(path), home), Path::new(path));
+        }
+        for home in [None, Some(Path::new("")), Some(Path::new("home/test")), Some(Path::new("/home/test/../test"))] {
+            assert_eq!(portable_home_with(Path::new("/home/test/settings.yaml"), home), Path::new("/home/test/settings.yaml"));
+        }
+    }
+
+    #[test]
+    fn lexical_relative_paths_support_descendants_siblings_and_fallbacks() {
+        for (base, target, expected) in [
+            ("/checkout", "/checkout/shared/settings.yaml", "shared/settings.yaml"),
+            ("/checkout", "/sibling/settings.yaml", "../sibling/settings.yaml"),
+            ("/checkout/nested", "/checkout", ".."),
+            ("/checkout", "/checkout", "."),
+            ("relative", "/target", "/target"),
+            ("/checkout", "relative", "relative"),
+            ("/checkout/../other", "/target", "/target"),
+            ("/checkout", "/target/../other", "/target/../other"),
+        ] {
+            assert_eq!(relative_path(Path::new(base), Path::new(target)), Path::new(expected));
+        }
+    }
 }

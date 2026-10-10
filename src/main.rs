@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use dockstride::{config, deploy, model::Project, nickel, output::{Output, OutputMode}, runtime, secrets, state};
+use dockstride::{config, deploy, model::Project, nickel, output::{Output, OutputMode}, runtime, secrets, sources, state};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -479,8 +479,12 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
             } => {
                 prohibit_plan_mutation(cli)?;
                 let input = if let Some(file) = file {
-                    let path = if file.is_absolute() { file.clone() }
-                        else { std::env::current_dir()?.join(file) };
+                    if file.as_os_str().as_encoded_bytes().split(|byte| *byte == b'/').any(|part| part == b".." || part == b".") {
+                        bail!("secret paths must not contain traversal components");
+                    }
+                    let path = sources::expand_home(file)?;
+                    let path = if path.is_absolute() { path }
+                        else { std::env::current_dir()?.join(path) };
                     Some(secrets::SecretInput::File(path))
                 } else if *stdin {
                     Some(secrets::SecretInput::Stdin)
@@ -850,7 +854,10 @@ fn initial_secret_inputs(cli: &Cli) -> Result<BTreeMap<String, secrets::SecretIn
         if name.is_empty() || file.is_empty() {
             bail!("--secret-file requires a nonempty NAME=PATH");
         }
-        let path = PathBuf::from(file);
+        if file.split('/').any(|part| matches!(part, ".." | ".")) {
+            bail!("secret paths must not contain traversal components");
+        }
+        let path = sources::expand_home(Path::new(file))?;
         let path = if path.is_absolute() {
             path
         } else {

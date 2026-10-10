@@ -95,6 +95,15 @@ secrets = env.secrets, services.api = {{image = "alpine", user = "0", secrets = 
         Self { temp, root }
     }
 
+    fn home_file(&self, name: &str, bytes: &[u8]) -> PathBuf {
+        let home = self.temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let path = home.join(name);
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
     fn private_file(&self, name: &str, bytes: &[u8]) -> PathBuf {
         let path = self.temp.path().join(name);
         fs::write(&path, bytes).unwrap();
@@ -541,4 +550,123 @@ fn declared_swarm_defaults_publish_and_retire_references_without_yaml_backend_co
     assert_eq!(metadata(&original), original_metadata);
     assert_eq!(fs::read(&original).unwrap(), b"declared-default-provider");
     f.assert_no_host_copy();
+}
+
+#[test]
+fn home_cli_inputs_are_portable_and_survive_replace_diagnostics_and_sync() {
+    for backend in ["compose", "swarm"] {
+        for absolute_input in [false, true] {
+            let f = Fixture::new(backend, "lib.ReferenceSecret");
+            let first = f.home_file("first-provider", b"first-home-provider");
+            let second = f.home_file("second-provider", b"second-home-provider");
+            let first_metadata = metadata(&first);
+            let second_metadata = metadata(&second);
+            let input = if absolute_input { format!("token={}", first.display()) }
+                else { "token=~/first-provider".to_owned() };
+            let reference = json!({"file":"~/first-provider"});
+            f.success(&["setup", "--secret-file", &input]);
+            assert_eq!(f.env()["secrets"]["token"], reference);
+            let before = fs::read(f.root.join("env.yaml")).unwrap();
+            f.success(&["setup", "--secret-file", "token=~/absent"]);
+            assert_eq!(fs::read(f.root.join("env.yaml")).unwrap(), before);
+            assert_eq!(f.current(), reference);
+            let list = f.success(&["secrets", "list"]);
+            assert_eq!(list["secrets"][0]["reference"], reference);
+            assert_eq!(list["secrets"][0]["present"], true);
+            assert_eq!(f.success(&["doctor"])["secrets"]["ok"], true);
+            let plan = f.success(&["--plan", "secrets", "sync", "token"]);
+            assert_eq!(plan["secrets"][0]["reference"], reference);
+            assert_eq!(plan["secrets"][0]["source"]["canonicalPath"], json!(first.canonicalize().unwrap()));
+            f.success(&["secrets", "sync", "token", "--yes"]);
+            assert_eq!(f.current(), reference);
+            f.success(&["secrets", "replace", "token", "--file", "~/second-provider"]);
+            let replacement = json!({"file":"~/second-provider"});
+            assert_eq!(f.env()["secrets"]["token"], replacement);
+            f.success(&["setup"]);
+            f.success(&["secrets", "sync", "token", "--yes"]);
+            assert_eq!(f.current(), replacement);
+            assert_eq!(metadata(&first), first_metadata);
+            assert_eq!(metadata(&second), second_metadata);
+            assert_eq!(fs::read(&first).unwrap(), b"first-home-provider");
+            assert_eq!(fs::read(&second).unwrap(), b"second-home-provider");
+            if backend == "swarm" {
+                assert_eq!(fs::read(f.temp.path().join("docker-secret-bytes")).unwrap(), b"second-home-provider");
+                assert!(f.env()["_dockstride"]["swarmSecrets"]["token"].is_string());
+            }
+            fs::remove_file(&second).unwrap();
+            assert_eq!(f.success(&["secrets", "list"])["secrets"][0]["present"], false);
+            assert_eq!(f.success(&["doctor"])["secrets"]["ok"], false);
+            assert!(!f.command(&["setup"], None).status.success());
+            assert_eq!(f.current(), replacement);
+            f.assert_no_host_copy();
+        }
+    }
+}
+
+#[test]
+fn home_shared_config_updates_preserve_raw_references_and_existing_absolute_paths() {
+    for backend in ["compose", "swarm"] {
+        let f = Fixture::new(backend, "lib.ReferenceSecret");
+        let first = f.home_file("first-provider", b"shared-home-first");
+        let second = f.home_file("second-provider", b"shared-home-second");
+        let source = f.shared(json!({"file":first}));
+        f.success(&["setup"]);
+        assert_eq!(f.current(), json!({"file":first}));
+        let reference = json!({"file":"~/second-provider"});
+        f.success(&["config", "set", "secrets.token", &reference.to_string(), "--shared"]);
+        assert_eq!(f.current(), reference);
+        let shared: Value = serde_yaml::from_slice(&fs::read(&source).unwrap()).unwrap();
+        assert_eq!(shared["secrets"]["token"], reference);
+        let source_before = fs::read(&source).unwrap();
+        let config = f.success(&["config", "list"]);
+        assert!(config.to_string().contains("~/second-provider"));
+        f.success(&["setup"]);
+        f.success(&["secrets", "sync", "token", "--yes"]);
+        assert_eq!(f.current(), reference);
+        assert_eq!(fs::read(&source).unwrap(), source_before);
+        assert!(f.env().get("secrets").is_none());
+        f.success(&["config", "set", "secrets.token", &json!({"file":"~/first-provider"}).to_string()]);
+        assert_eq!(f.current(), json!({"file":"~/first-provider"}));
+        f.success(&["config", "set", "secrets.token.file", "\"~/first-provider\"", "--shared"]);
+        f.success(&["config", "unset", "secrets.token"]);
+        assert_eq!(f.current(), json!({"file":"~/first-provider"}));
+        assert_eq!(fs::read(&first).unwrap(), b"shared-home-first");
+        assert_eq!(fs::read(&second).unwrap(), b"shared-home-second");
+        f.assert_no_host_copy();
+    }
+}
+
+#[test]
+fn home_reference_security_failures_leave_configuration_and_swarm_untouched() {
+    for invalid in ["~/missing", "~/../provider", "~/./provider", "~/directory/../provider", "~/directory/./provider", "~/link", "~/parent/provider", "~", "~someone/provider", "provider"] {
+        let f = Fixture::new("swarm", "lib.ReferenceSecret");
+        let file = f.home_file("provider", b"never-published-home-provider");
+        let home = f.temp.path().join("home");
+        fs::create_dir(home.join("directory")).unwrap();
+        symlink(&file, home.join("link")).unwrap();
+        symlink(&home, home.join("parent")).unwrap();
+        let reference = json!({"file":invalid});
+        let source = f.shared(reference.clone());
+        let before = fs::read(f.root.join("env.yaml")).unwrap();
+        let source_before = fs::read(&source).unwrap();
+        assert!(!f.command(&["setup"], None).status.success(), "accepted {invalid}");
+        assert!(!f.command(&["config", "set", "secrets.token", &reference.to_string()], None).status.success());
+        assert_eq!(fs::read(f.root.join("env.yaml")).unwrap(), before);
+        assert_eq!(fs::read(&source).unwrap(), source_before);
+        assert!(!f.temp.path().join("docker-publications").exists());
+        f.assert_no_host_copy();
+    }
+    for invalid in ["~/missing", "~/../provider", "~/./provider", "~/link"] {
+        let f = Fixture::new("compose", "lib.ReferenceSecret");
+        let file = f.home_file("provider", b"never-imported-provider");
+        symlink(&file, f.temp.path().join("home/link")).unwrap();
+        let before = fs::read(f.root.join("env.yaml")).unwrap();
+        let input = format!("token={invalid}");
+        assert!(!f.command(&["setup", "--secret-file", &input], None).status.success());
+        assert_eq!(fs::read(f.root.join("env.yaml")).unwrap(), before);
+        f.success(&["setup", "--secret-file", "token=~/provider"]);
+        let before = fs::read(f.root.join("env.yaml")).unwrap();
+        assert!(!f.command(&["secrets", "replace", "token", "--file", invalid], None).status.success());
+        assert_eq!(fs::read(f.root.join("env.yaml")).unwrap(), before);
+    }
 }

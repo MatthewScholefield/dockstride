@@ -62,6 +62,7 @@ impl Project {
 
     pub fn compose(&self) -> Result<Value> {
         let mut model = self.model.clone();
+        crate::secrets::resolve_file_paths(&mut model)?;
         let record = model
             .as_object_mut()
             .context("compose.ncl must evaluate to a record")?;

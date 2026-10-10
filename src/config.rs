@@ -873,15 +873,17 @@ pub fn setup_with_context(root: &Path, inputs: &[String], non_interactive: bool,
     if sources::descriptors(&candidate)?.is_none() {
         if let Some(descriptors) = &proposal.sources {
             let mut selected = Vec::new();
+            let declaring_directory = fs::canonicalize(root)?;
             for descriptor in descriptors {
-                let path = if descriptor.path.is_absolute() { descriptor.path.clone() } else { root.join(&descriptor.path) };
+                let path = sources::expand_home(&descriptor.path)?;
+                let path = if path.is_absolute() { path } else { declaring_directory.join(path) };
                 let path = sources::identity(&path)?;
                 if !path.exists() {
                     ensure!(descriptor.create_if_missing, "proposed source {} does not exist", path.display());
                     overrides.insert(path.clone(), json!({}));
                     creations.push(path.clone());
                 }
-                selected.push(json!({"path":path}));
+                selected.push(json!({"path":sources::relative_path(&declaring_directory, &path)}));
             }
             let previous = candidate.clone();
             let selected = Value::Array(selected);
@@ -1089,7 +1091,13 @@ fn apply_proposals(root: &Path, candidate: &mut Value, edited: &mut String, valu
 pub fn sources_list(root: &Path) -> Result<Value> {
     let snapshot = sources::snapshot(root, None)?;
     let direct = sources::descriptors(&snapshot.local)?.unwrap_or_default();
-    Ok(json!({"declared":sources::descriptors(&snapshot.local)?.is_some(),"sources":direct.iter().map(|path| json!({"path":path,"resolved":sources::identity(&if path.is_absolute(){path.clone()}else{root.join(path)}).ok()})).collect::<Vec<_>>(),"resolved":snapshot.sources}))
+    let directory = snapshot.local_file.parent().unwrap();
+    let sources = direct.iter().map(|path| {
+        let expanded = sources::expand_home(path)?;
+        let resolved = sources::identity(&if expanded.is_absolute() { expanded } else { directory.join(expanded) }).ok();
+        Ok(json!({"path":path,"resolved":resolved}))
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(json!({"declared":sources::descriptors(&snapshot.local)?.is_some(),"sources":sources,"resolved":snapshot.sources}))
 }
 
 pub fn sources_add(root: &Path, path: &Path, create: bool) -> Result<Value> {
@@ -1107,9 +1115,14 @@ fn change_sources(root: &Path, path: &Path, add: Option<bool>) -> Result<Value> 
     let before = parse_document(&text)?;
     let previous = sources::snapshot(root,Some(&before))?;
     previous.verify_text(&previous.local_file, &text)?;
-    let target = sources::identity(&if path.is_absolute(){path.to_owned()}else{root.join(path)})?;
+    let directory = previous.local_file.parent().unwrap();
+    let path = sources::expand_home(path)?;
+    let target = sources::identity(&if path.is_absolute(){path}else{directory.join(path)})?;
     let mut selected = sources::descriptors(&before)?.unwrap_or_default();
-    let matches = |path: &PathBuf| sources::identity(&if path.is_absolute(){path.clone()}else{root.join(path)}).map(|path| path == target);
+    let matches = |path: &PathBuf| {
+        let path = sources::expand_home(path)?;
+        sources::identity(&if path.is_absolute(){path}else{directory.join(path)}).map(|path| path == target)
+    };
     let mut overrides = BTreeMap::new();
     let mut create = false;
     if let Some(allow_create) = add {
@@ -1119,7 +1132,7 @@ fn change_sources(root: &Path, path: &Path, add: Option<bool>) -> Result<Value> 
             overrides.insert(target.clone(),json!({}));
             create = true;
         }
-        selected.push(target.clone());
+        selected.push(sources::relative_path(directory, &target));
     } else {
         let mut retained = Vec::new();
         let mut removed = false;
@@ -1158,9 +1171,14 @@ fn change_sources(root: &Path, path: &Path, add: Option<bool>) -> Result<Value> 
 }
 
 fn shared_target(root: &Path, local: &Value, source: Option<&Path>) -> Result<PathBuf> {
-    let direct = sources::descriptors(local)?.unwrap_or_default().into_iter().map(|path| sources::identity(&if path.is_absolute(){path}else{root.join(path)})).collect::<Result<Vec<_>>>()?;
+    let root = fs::canonicalize(root)?;
+    let direct = sources::descriptors(local)?.unwrap_or_default().into_iter().map(|path| {
+        let path = sources::expand_home(&path)?;
+        sources::identity(&if path.is_absolute(){path}else{root.join(path)})
+    }).collect::<Result<Vec<_>>>()?;
     if let Some(source) = source {
-        let source = sources::identity(&if source.is_absolute(){source.to_owned()}else{root.join(source)})?;
+        let source = sources::expand_home(source)?;
+        let source = sources::identity(&if source.is_absolute(){source}else{root.join(source)})?;
         ensure!(direct.contains(&source),"{} is not a directly selected source; transitive sources are not edit targets",source.display());
         Ok(source)
     } else {

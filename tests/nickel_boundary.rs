@@ -416,6 +416,37 @@ let env | configContract = import "env.yaml" in
 }
 
 #[test]
+fn home_secret_paths_stay_raw_in_config_and_resolve_for_operational_nickel_and_render() {
+    let root = fixture();
+    let source = fs::read_to_string(root.path().join("compose.ncl")).unwrap();
+    fs::write(root.path().join("compose.ncl"), source.replace(
+        "endpoints.api =",
+        "actions = [{name = \"path\", workflows = [\"up\"], kind = \"command\", argv = [\"cat\", env.secrets.authKey.file]}], endpoints.api ="
+    )).unwrap();
+    let expected = dockstride::sources::expand_home(std::path::Path::new("~/private/key")).unwrap();
+    for backend in ["compose", "swarm"] {
+        let mut candidate = complete(backend);
+        candidate["secrets"]["authKey"]["file"] = json!("~/private/key");
+        let raw = serde_yaml::to_string(&candidate).unwrap();
+        fs::write(root.path().join("env.yaml"), &raw).unwrap();
+        nickel::validate_field(root.path(), "secrets.authKey", &candidate["secrets"]["authKey"], &candidate).unwrap();
+        let project = nickel::evaluate(root.path(), None).unwrap();
+        assert_eq!(project.env["secrets"]["authKey"]["file"], "~/private/key");
+        assert_eq!(project.metadata["actions"][0]["argv"][1], json!(expected));
+        assert_eq!(nickel::metadata(root.path(), None).unwrap()["actions"][0]["argv"][1], json!(expected));
+        assert_eq!(project.compose().unwrap()["secrets"]["authKey"]["file"], json!(expected));
+        if backend == "swarm" {
+            assert_eq!(project.swarm().unwrap()["secrets"]["authKey"]["name"], "dks-boundary-current");
+        }
+        assert_eq!(fs::read_to_string(root.path().join("env.yaml")).unwrap(), raw);
+        let mut direct = project.clone();
+        direct.model["secrets"]["authKey"]["file"] = json!("~/private/direct");
+        assert_eq!(direct.compose().unwrap()["secrets"]["authKey"]["file"],
+            json!(dockstride::sources::expand_home(std::path::Path::new("~/private/direct")).unwrap()));
+    }
+}
+
+#[test]
 fn init_refuses_existing_project_files() {
     let root = fixture();
     let before = fs::read(root.path().join("compose.ncl")).unwrap();

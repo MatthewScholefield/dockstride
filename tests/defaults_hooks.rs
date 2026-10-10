@@ -1,4 +1,4 @@
-use dockstride::{commands, defaults, output::Output};
+use dockstride::{commands, config, defaults, output::Output};
 use serde_json::{Value, json};
 use std::{fs, path::Path, process::Command};
 
@@ -156,6 +156,33 @@ fn defaults_subprocess_worker() {
     assert_eq!(manual["missingFields"], json!(["project"]));
     assert_eq!(manual["sourcesDeclared"], true);
     assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), original);
+}
+
+#[test]
+fn setup_hook_persists_relative_sources_from_absolute_proposals() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("checkout");
+    let sibling = directory.path().join("sibling");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&sibling).unwrap();
+    fixture(&root);
+    let source = sibling.join("settings.yaml");
+    fs::write(&source, "oauth: {enabled: true}\n").unwrap();
+    response(&root, json!({"schemaVersion":1,"values":{"project":"proposed"},"sources":[
+        {"path":source}, {"path":root.join("created.yaml"),"createIfMissing":true}
+    ]}));
+    let alias = directory.path().join("alias");
+    std::os::unix::fs::symlink(&root, &alias).unwrap();
+    config::setup(&alias, &["requiredRuntimeInput=runtime".into()], true).unwrap();
+    let expected = json!([{"path":"../sibling/settings.yaml"},{"path":"created.yaml"}]);
+    assert_eq!(config::read_env(&root).unwrap()["_dockstride"]["sources"], expected);
+    assert_eq!(fs::read_to_string(root.join("created.yaml")).unwrap(), "{}\n");
+    assert_eq!(config::get(&root, "oauth.enabled").unwrap()["value"], true);
+    config::set(&root, "project", json!("chosen")).unwrap();
+    config::set_shared(&root, "oauth.enabled", json!(false), Some(&source)).unwrap();
+    config::setup(&root, &[], true).unwrap();
+    assert_eq!(config::read_env(&root).unwrap()["_dockstride"]["sources"], expected);
+    assert_eq!(count(&root), 1);
 }
 
 #[test]

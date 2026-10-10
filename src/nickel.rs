@@ -125,6 +125,14 @@ fn export(root: &Path, candidate: Option<&Value>, expression: &str) -> Result<Va
         environment_error(error, &snapshot, &format!("evaluating environment with shared sources {:?}", snapshot.sources)))
 }
 
+fn export_operational(root: &Path, candidate: Option<&Value>, expression: &str) -> Result<Value> {
+    let snapshot = crate::sources::snapshot(root, candidate)?;
+    let mut values = snapshot.values.clone();
+    crate::secrets::resolve_file_paths(&mut values)?;
+    export_values(root, &values, expression).map_err(|error|
+        environment_error(error, &snapshot, &format!("evaluating environment with shared sources {:?}", snapshot.sources)))
+}
+
 fn export_values(root: &Path, values: &Value, expression: &str) -> Result<Value> {
     export_values_with_environment(root, values, expression, false)
 }
@@ -316,7 +324,7 @@ pub(crate) fn allocation_fields_values(root: &Path, values: &Value) -> Result<Ve
 
 /// Discover commands/defaults without forcing operational metadata or service inputs.
 pub fn bootstrap_metadata(root: &Path, candidate: Option<&Value>) -> Result<Value> {
-    export(root, candidate,
+    export_operational(root, candidate,
         "let p = import \"compose.ncl\" in let m = p.dockstride in {commands = if std.record.has_field \"commands\" m then m.commands else {}, setup = {defaults = if std.record.has_field \"setup\" m && std.record.has_field \"defaults\" m.setup then m.setup.defaults else null}}")
 }
 
@@ -324,7 +332,7 @@ pub fn metadata(root: &Path, candidate: Option<&Value>) -> Result<Value> {
     // Operational metadata is evaluated only after complete input validation. Setup
     // callers use setup_metadata so missing action/readiness inputs stay unforced.
     let expression = "let p = import \"compose.ncl\" in let m = p.dockstride in let remove = fun k r => if std.record.has_field k r then std.record.remove k r else r in m |> remove \"Config\" |> remove \"canonical\"";
-    export(root, candidate, expression)
+    export_operational(root, candidate, expression)
 }
 
 pub fn validate_field(root: &Path, path: &str, value: &Value, candidate: &Value) -> Result<()> {
@@ -367,11 +375,13 @@ pub fn evaluate_snapshot(root: &Path, snapshot: &crate::sources::EnvironmentSnap
         .map_err(|error| environment_error(error, snapshot, "validating complete env.yaml; run dks setup for missing inputs"))?;
     // The contract-expanded environment is already effective: never resolve it as a
     // local document, which would lose inherited provenance and source declarations.
-    let metadata = export_values(root, &env, "let p = import \"compose.ncl\" in let m = p.dockstride in let remove = fun k r => if std.record.has_field k r then std.record.remove k r else r in m |> remove \"Config\" |> remove \"canonical\"")?;
+    let mut operational = env.clone();
+    crate::secrets::resolve_file_paths(&mut operational)?;
+    let metadata = export_values(root, &operational, "let p = import \"compose.ncl\" in let m = p.dockstride in let remove = fun k r => if std.record.has_field k r then std.record.remove k r else r in m |> remove \"Config\" |> remove \"canonical\"")?;
     if !metadata.is_object() {
         bail!("dockstride metadata must be a record");
     }
-    let model = export_values(root, &env,
+    let model = export_values(root, &operational,
         "let p = import \"compose.ncl\" in if std.record.has_field \"canonical\" p.dockstride then p.dockstride.canonical else p",
     )?;
     let fields = schema_values(root, &env)?;
