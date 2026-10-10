@@ -87,6 +87,66 @@ fn scalar_edits_preserve_comments_order_quotes_and_invalid_candidates() {
     assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), expected);
 }
 
+fn secrets_fixture() -> TempDir {
+    let directory = fixture();
+    let source = fs::read_to_string(directory.path().join("compose.ncl")).unwrap();
+    fs::write(directory.path().join("compose.ncl"), source.replace("  project | String", "  secrets | Dyn,\n  project | String")).unwrap();
+    directory
+}
+
+#[test]
+fn ordinary_edits_move_secrets_last_without_reformatting_other_fields() {
+    let directory = secrets_fixture();
+    let root = directory.path();
+    let secrets = "'secrets': # references\n  # token location\n  'key': {file: '/private/token'} # retained\n";
+    let siblings = "\n# deployment identity\nproject: 'app' # identity\noauth:\n  enabled: false\n  issuer: 'example'\napiPort: 8080 # host port\n";
+    fs::write(root.join("env.yaml"), format!("# environment\n{secrets}{siblings}")).unwrap();
+    config::set(root, "apiPort", json!(8081)).unwrap();
+    let expected = format!("# environment\n{}{secrets}", siblings.replace("8080", "8081"));
+    assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), expected);
+    config::set(root, "apiPort", json!(8081)).unwrap();
+    assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), expected);
+    config::unset(root, "apiPort").unwrap();
+    assert!(fs::read_to_string(root.join("env.yaml")).unwrap().ends_with(secrets));
+}
+
+#[test]
+fn edits_keep_secrets_before_the_document_end_marker() {
+    let directory = secrets_fixture();
+    let root = directory.path();
+    let secrets = "secrets:\n  key: {file: '/private/token'}\n";
+    fs::write(root.join("env.yaml"), format!("---\n{secrets}project: app\n... # end\n")).unwrap();
+    config::set(root, "apiPort", json!(8081)).unwrap();
+    assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), format!("---\nproject: app\napiPort: 8081\n{secrets}... # end\n"));
+    config::set(root, "oauth.enabled", json!(true)).unwrap();
+    assert!(fs::read_to_string(root.join("env.yaml")).unwrap().ends_with(&format!("{secrets}... # end\n")));
+}
+
+#[test]
+fn flow_root_edits_serialize_secrets_last() {
+    let directory = secrets_fixture();
+    let root = directory.path();
+    fs::write(root.join("env.yaml"), "# environment\n{secrets: {key: {file: '/private/token'}}, project: app, apiPort: 8080} # root\n... # end\n").unwrap();
+    config::set(root, "apiPort", json!(8081)).unwrap();
+    let text = fs::read_to_string(root.join("env.yaml")).unwrap();
+    assert!(text.starts_with("# environment\n# root\n"));
+    assert!(text.ends_with("secrets:\n  key:\n    file: /private/token\n... # end\n"));
+    assert_eq!(config::read_env(root).unwrap()["apiPort"], 8081);
+    config::set(root, "apiPort", json!(8081)).unwrap();
+    assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), text);
+}
+
+#[test]
+fn secret_reordering_that_would_break_aliases_preserves_valid_edits() {
+    let directory = secrets_fixture();
+    let root = directory.path();
+    let source = "secrets:\n  key:\n    file: &issuer '/private/token'\nproject: app\noauth:\n  enabled: false\n  issuer: *issuer\napiPort: 8080\n";
+    fs::write(root.join("env.yaml"), source).unwrap();
+    config::set(root, "apiPort", json!(8081)).unwrap();
+    assert_eq!(fs::read_to_string(root.join("env.yaml")).unwrap(), source.replace("8080", "8081"));
+    assert_eq!(config::read_env(root).unwrap()["oauth"]["issuer"], "/private/token");
+}
+
 #[test]
 fn insertion_keeps_sibling_and_header_comments() {
     let directory = fixture();

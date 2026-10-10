@@ -188,6 +188,40 @@ fn generated_reference_and_bytes_survive_repeated_setup_and_disposable_state_rem
 }
 
 #[test]
+fn setup_keeps_new_secrets_last_after_autoallocating_ports() {
+    let f = Fixture::new("compose", "lib.GenerateSecret {bytes=32,encoding=\"hex\"}", "0", false);
+    let socket = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    drop(socket);
+    let source = fs::read_to_string(f.root().join("compose.ncl")).unwrap()
+        .replace("project|String,", "project|String,apiPort|Number,")
+        .replace("Config=configContract,", &format!("Config=configContract,setup.ports.apiPort={{service=\"api\",target=8000,from={port},to={port}}},"));
+    fs::write(f.root().join("compose.ncl"), source).unwrap();
+    f.success(&["setup"], None);
+    assert_eq!(f.env()["apiPort"], port);
+    let text = fs::read_to_string(f.root().join("env.yaml")).unwrap();
+    assert!(text.find("apiPort:").unwrap() < text.find("secrets:\n").unwrap());
+    assert!(text[text.find("secrets:\n").unwrap()..].lines().skip(1).all(|line| line.starts_with(' ')));
+    f.success(&["setup"], None);
+    assert_eq!(fs::read_to_string(f.root().join("env.yaml")).unwrap(), text);
+}
+
+#[test]
+fn secret_updates_move_existing_block_after_ordinary_fields() {
+    let f = Fixture::new("compose", "lib.GenerateSecret {bytes=32,encoding=\"hex\"}", "0", false);
+    f.success(&["setup"], None);
+    let text = fs::read_to_string(f.root().join("env.yaml")).unwrap();
+    let start = text.find("secrets:\n").unwrap();
+    let secret = text[start..].replace("secrets:\n", "'secrets': # references\n  # credential\n");
+    let fields = "# deployment identity\nproject: 'secret-fixture' # retained\nbackend: compose\n";
+    fs::write(f.root().join("env.yaml"), format!("{secret}\n{fields}")).unwrap();
+    f.success(&["secrets", "replace", "authKey", "--stdin"], Some(b"new-material"));
+    let edited = fs::read_to_string(f.root().join("env.yaml")).unwrap();
+    assert!(edited.starts_with(&format!("\n{fields}'secrets': # references\n  # credential\n")));
+    assert_eq!(fs::read(f.env()["secrets"]["authKey"]["file"].as_str().unwrap()).unwrap(), b"new-material");
+}
+
+#[test]
 fn replacement_keeps_old_material_and_never_discloses_new_bytes() {
     let f = Fixture::new("compose", "lib.GenerateSecret {bytes=32,encoding=\"hex\"}", "0", false);
     f.success(&["setup"],None);

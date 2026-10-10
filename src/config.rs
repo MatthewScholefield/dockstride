@@ -446,6 +446,63 @@ fn mapping_fragment(keys: &[&str], value: Value, indent: usize) -> Result<String
         .collect())
 }
 
+fn document_end(text: &str) -> usize {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.strip_prefix("...").is_some_and(|suffix| {
+            suffix.is_empty() || suffix.starts_with(char::is_whitespace)
+        }) {
+            return offset;
+        }
+        offset += line.len();
+    }
+    text.len()
+}
+
+fn secrets_last(text: String, candidate: &Value) -> String {
+    if candidate.get("secrets").is_none() {
+        return text;
+    }
+    let Ok(nodes) = entries(&text) else {
+        return text;
+    };
+    let Some(indent) = nodes.iter().map(|node| node.indent).min() else {
+        return text;
+    };
+    let Some(secret) = nodes.iter().find(|node| node.indent == indent && node.path == "secrets") else {
+        return text;
+    };
+    if !nodes.iter().any(|node| node.indent == indent && node.start > secret.start) {
+        return text;
+    }
+    let insertion = document_end(&text);
+    let mut end = secret.end.min(insertion);
+    for line in text[secret.line_end..end].split_inclusive('\n').rev() {
+        let body = line.trim();
+        let line_indent = line.len() - line.trim_start_matches(' ').len();
+        if body.is_empty() || (body.starts_with('#') && line_indent <= indent) {
+            end -= line.len();
+        } else {
+            break;
+        }
+    }
+    let mut reordered = text[..secret.start].to_owned();
+    reordered.push_str(&text[end..insertion]);
+    if !reordered.is_empty() && !reordered.ends_with('\n') {
+        reordered.push('\n');
+    }
+    reordered.push_str(&text[secret.start..end]);
+    if !reordered.ends_with('\n') {
+        reordered.push('\n');
+    }
+    reordered.push_str(&text[insertion..]);
+    if parse_document(&reordered).is_ok_and(|value| value == *candidate) {
+        reordered
+    } else {
+        text
+    }
+}
+
 fn edit_document(
     text: &str,
     before: &Value,
@@ -468,19 +525,23 @@ fn edit_document(
         .is_some_and(|line| line.starts_with('{'))
     {
         let mut edited = String::new();
-        for line in text.lines() {
+        let end = document_end(text);
+        for line in text[..end].lines() {
             if let Some(comment) = delimiter(line, '#') {
                 edited.push_str(&line[comment..]);
                 edited.push('\n');
             }
         }
         edited.push_str(&serde_yaml::to_string(candidate)?);
+        edited.push_str(&text[end..]);
         ensure!(
             parse_document(&edited)? == *candidate,
             "root mapping edit could not represent {path}; use dks config edit"
         );
-        return Ok(edited);
+        return Ok(secrets_last(edited, candidate));
     }
+    let normalized = secrets_last(text.to_owned(), before);
+    let text = normalized.as_str();
     let nodes = entries(text)?;
     let keys = parts(path)?;
     let mut edited = text.to_owned();
@@ -541,10 +602,12 @@ fn edit_document(
             }
             edited.insert_str(parent.end, &fragment);
         } else if keys.len() == 1 || at(before, keys[0]).is_none() {
-            if !edited.is_empty() && !edited.ends_with('\n') {
-                edited.push('\n');
+            let end = document_end(&edited);
+            let mut fragment = mapping_fragment(&keys, value.clone(), 0)?;
+            if end > 0 && !edited[..end].ends_with('\n') {
+                fragment.insert(0, '\n');
             }
-            edited.push_str(&mapping_fragment(&keys, value.clone(), 0)?);
+            edited.insert_str(end, &fragment);
         } else {
             // Flow collections, aliases, and advanced YAML remain valid; replace only their nearest root record.
             let root = keys[0];
@@ -589,7 +652,7 @@ fn edit_document(
         parse_document(&edited)? == *candidate,
         "document-preserving edit could not represent {path}; use dks config edit"
     );
-    Ok(edited)
+    Ok(secrets_last(edited, candidate))
 }
 
 fn mutate(root: &Path, path: &str, replacement: Option<Value>, secret: bool) -> Result<Value> {
