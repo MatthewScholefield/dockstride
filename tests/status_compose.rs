@@ -371,6 +371,28 @@ fn explicit_volume_adoption_preserves_data_and_external_volumes() {
 }
 
 #[test]
+fn setup_can_adopt_volumes_without_starting_services() {
+    let f = Fixture::new(json!({"api":{"image":"fixture"}}));
+    f.put("volumes.json", json!({"data":{}}));
+    f.put("docker-volumes.json", json!({
+        "status-fixture_data":{"Driver":"local","Options":{},"Labels":{"com.docker.compose.project":"status-fixture"},"data":"database contents"}
+    }));
+    let before = fs::read(f.root().join("docker-volumes.json")).unwrap();
+    let plan = f.success(&["--plan", "setup", "--adopt-existing-volumes"]);
+    assert_eq!(plan["operations"][0]["kind"], "adopt-existing-volumes");
+    assert_eq!(fs::read(f.root().join("docker-volumes.json")).unwrap(), before);
+    let result = f.success(&["setup", "--adopt-existing-volumes"]);
+    assert_eq!(result["started"], false);
+    let containers: Value = serde_json::from_slice(&fs::read(f.root().join("containers.json")).unwrap()).unwrap();
+    assert_eq!(containers, json!({}));
+    let volumes: Value = serde_json::from_slice(&fs::read(f.root().join("docker-volumes.json")).unwrap()).unwrap();
+    assert_eq!(volumes.as_object().unwrap().len(), 1);
+    assert_eq!(volumes["status-fixture_data"]["data"], "database contents");
+    assert_eq!(volumes["status-fixture_data"]["Labels"]["io.dockstride.owner"], f.root().to_str().unwrap());
+    f.success(&["setup"]);
+}
+
+#[test]
 fn volume_adoption_refuses_attached_volumes_and_retains_backup_on_failure() {
     let f = Fixture::new(json!({"api":{"image":"fixture"}}));
     f.put("volumes.json", json!({"data":{}}));

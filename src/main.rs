@@ -60,6 +60,8 @@ enum Commands {
         /// Disable automatic shared-source discovery for this checkout.
         #[arg(long)]
         no_shared_sources: bool,
+        #[arg(long, help = "Copy and recreate existing managed volumes with this checkout's ownership labels")]
+        adopt_existing_volumes: bool,
     },
     Config {
         #[command(subcommand)]
@@ -363,7 +365,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
             dockstride::commands::run(&root, name, cli.timeout, out)?
         }
         Commands::Env { command: EnvironmentCommand::List } => dockstride::environment::list(&root)?,
-        Commands::Setup { inputs, no_shared_sources } => {
+        Commands::Setup { inputs, no_shared_sources, adopt_existing_volumes } => {
             let mut inputs = inputs.clone();
             if *no_shared_sources { inputs.push("_dockstride.sources=[]".to_owned()); }
             if !secret_inputs.is_empty() {
@@ -372,9 +374,16 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
             }
             if cli.plan {
                 let candidate = config::setup_plan_candidate(&root, &inputs)?;
-                configuration_plan(&root, "setup", &secret_inputs, Some(&candidate))?
+                let mut plan = configuration_plan(&root, "setup", &secret_inputs, Some(&candidate))?;
+                if *adopt_existing_volumes {
+                    plan["operations"] = json!([volume_adoption_plan()]);
+                }
+                plan
             } else {
                 config::setup_with_context(&root, &inputs, non_interactive, cli.timeout, out, "setup")?;
+                if *adopt_existing_volumes {
+                    runtime::adopt_existing_volumes(&root, cli.timeout, out)?;
+                }
                 let provisioned = secrets::provision(&root, non_interactive, &secret_inputs, out)?;
                 {
                     let _lifecycle = state::lock(&root, "lifecycle")?;
@@ -529,12 +538,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
             } else {
                 let mut plan = runtime::lifecycle(&project, workflow, services, profiles, true, false, cli.timeout, out)?;
                 if adopt_volumes {
-                    plan["operations"].as_array_mut().unwrap().insert(0, json!({
-                        "kind":"adopt-existing-volumes",
-                        "scope":"declared managed volumes with mismatched ownership",
-                        "requires":"unattached local volumes without driver options",
-                        "steps":["copy to temporary volume","remove original","recreate original with ownership labels","copy back","remove temporary volume"]
-                    }));
+                    plan["operations"].as_array_mut().unwrap().insert(0, volume_adoption_plan());
                 }
                 plan
             }
@@ -720,6 +724,15 @@ fn header(project: &Project, out: &Output) -> Result<()> {
         &format!("{} · {}", project.name()?, project.backend()?),
     )
 }
+fn volume_adoption_plan() -> Value {
+    json!({
+        "kind":"adopt-existing-volumes",
+        "scope":"declared managed volumes with mismatched ownership",
+        "requires":"unattached local volumes without driver options",
+        "steps":["copy to temporary volume","remove original","recreate original with ownership labels","copy back","remove temporary volume"]
+    })
+}
+
 fn configuration_plan(
     root: &Path,
     workflow: &str,

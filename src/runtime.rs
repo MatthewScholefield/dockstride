@@ -828,7 +828,7 @@ fn validate_ownership_except_volumes(project: &Project, docker: &Docker, adoptin
 }
 fn volume_adoption_hint(kind: &str) -> &'static str {
     if kind == "volume" {
-        "; to transfer declared managed volumes to this checkout, remove attached containers first, then run dks up --adopt-existing-volumes (copies data and recreates volumes)"
+        "; to transfer declared managed volumes to this checkout, remove attached containers first, then run dks setup --adopt-existing-volumes or dks up --adopt-existing-volumes (copies data and recreates volumes)"
     } else {
         ""
     }

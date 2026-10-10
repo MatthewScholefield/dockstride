@@ -73,6 +73,24 @@ fn complete(backend: &str) -> Value {
 }
 
 #[test]
+fn missing_environment_fields_focus_on_local_file_and_contract_location() {
+    let root = fixture();
+    let candidate = json!({"project":"boundary"});
+    let error = format!("{:#}", nickel::evaluate(root.path(), Some(&candidate)).unwrap_err());
+    assert!(error.starts_with("Missing field `authKey` in env.yaml"), "{error}");
+    assert!(error.contains("compose.ncl"), "{error}");
+    assert!(error.contains("required here"), "{error}");
+    assert!(!error.contains("in this record"), "{error}");
+    assert!(!error.contains("evaluating environment"), "{error}");
+    fs::write(root.path().join("env.shared.yaml"), "project: inherited\n").unwrap();
+    let candidate = json!({"_dockstride":{"sources":[{"path":"env.shared.yaml"}]}});
+    let error = format!("{:#}", nickel::evaluate(root.path(), Some(&candidate)).unwrap_err());
+    assert!(error.starts_with("Missing field `authKey` in env.yaml (even after combining with env.shared.yaml)"), "{error}");
+    assert!(error.contains("required here"), "{error}");
+    assert!(!error.contains("in this record"), "{error}");
+}
+
+#[test]
 fn discovery_and_policies_do_not_force_absent_environment_or_services() {
     let root = fixture();
     let fields = nickel::schema(root.path(), None).unwrap();
@@ -129,6 +147,29 @@ fn candidates_shadow_disk_without_mutation_and_incremental_validation_is_nickel(
         fs::read_to_string(root.path().join("env.yaml")).unwrap(),
         original
     );
+}
+
+#[test]
+fn named_secret_handles_render_grants_and_paths_without_forcing_setup() {
+    let root = fixture();
+    let path = root.path().join("compose.ncl");
+    let source = fs::read_to_string(&path).unwrap()
+        .replace("dc.grantSecrets [\"authKey\"]", "dc.grantSecrets [dc.secrets.authKey]")
+        .replace("dc.secretPath \"authKey\"", "dc.secretPath dc.secrets.authKey");
+    fs::write(&path, &source).unwrap();
+    assert!(nickel::schema(root.path(), None).unwrap().iter().any(|field| field.path == "secrets.authKey"));
+    assert_eq!(nickel::setup_metadata(root.path(), None).unwrap()["setup"]["secrets"]["authKey"]["kind"], "generate");
+    for backend in ["compose", "swarm"] {
+        let project = nickel::evaluate(root.path(), Some(&complete(backend))).unwrap();
+        assert_eq!(project.model["services"]["api"]["secrets"], json!([{ "source":"authKey", "target":"authKey" }]));
+        assert_eq!(project.model["services"]["api"]["environment"]["AUTH_KEY_FILE"], "/run/secrets/authKey");
+    }
+    fs::write(&path, source.replace("dc.grantSecrets [dc.secrets.authKey]", "dc.grantSecrets [dc.secrets.auhtKey]")).unwrap();
+    let error = format!("{:#}", nickel::evaluate(root.path(), Some(&complete("compose"))).unwrap_err());
+    assert!(error.contains("auhtKey"), "{error}");
+    assert!(error.contains("compose.ncl"), "{error}");
+    assert!(error.contains("lacks the field `auhtKey`"), "{error}");
+    assert!(error.contains("Did you mean `authKey`?"), "{error}");
 }
 
 #[test]

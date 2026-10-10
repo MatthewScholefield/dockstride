@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use nickel_lang_core::{
     cache::InputFormat,
     error::{
-        Error,
+        Error, EvalErrorKind, IntoDiagnostics,
         report::{ColorOpt, report_as_str},
     },
     eval::{
@@ -28,6 +28,7 @@ pub const LIBRARY_VERSION: &str = "0.3.0";
 #[derive(Debug)]
 pub struct NickelError {
     pub report: String,
+    missing_env_field: Option<String>,
 }
 impl std::fmt::Display for NickelError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -37,10 +38,50 @@ impl std::fmt::Display for NickelError {
 impl std::error::Error for NickelError {}
 
 fn diagnostic(program: &Program, error: Error) -> anyhow::Error {
-    NickelError {
-        report: report_as_str(&mut program.files(), error, ColorOpt::Never),
+    diagnostic_with_environment(program, error, false)
+}
+
+fn diagnostic_with_environment(program: &Program, error: Error, environment: bool) -> anyhow::Error {
+    let mut files = program.files();
+    let missing_env_field = match &error {
+        Error::EvalError(data) => match &data.error {
+            EvalErrorKind::MissingFieldDef { id, pos_record, .. }
+                if environment || data.ctxt.pos_table.get(*pos_record).into_opt().is_some_and(|span|
+                    Path::new(files.name(span.src_id)).file_name().is_some_and(|name| name == "env.yaml")) => Some(id.to_string()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let report = if let Some(field) = &missing_env_field {
+        let mut diagnostics = error.into_diagnostics(&mut files);
+        let diagnostic = &mut diagnostics[0];
+        diagnostic.message = format!("Missing field `{field}` in env.yaml");
+        diagnostic.labels.retain(|label| label.message == "required here");
+        report_as_str(&mut files, diagnostics.remove(0), ColorOpt::Never)
+    } else {
+        report_as_str(&mut files, error, ColorOpt::Never)
+    };
+    NickelError { report, missing_env_field }.into()
+}
+
+fn environment_error(error: anyhow::Error, snapshot: &crate::sources::EnvironmentSnapshot, context: &str) -> anyhow::Error {
+    if let Some(nickel) = error.downcast_ref::<NickelError>()
+        && let Some(field) = &nickel.missing_env_field {
+        let shared = if snapshot.sources.is_empty() {
+            String::new()
+        } else {
+            let sources = snapshot.sources.iter().map(|path|
+                path.strip_prefix(snapshot.local_file.parent().unwrap()).unwrap_or(path).display().to_string()
+            ).collect::<Vec<_>>().join(", ");
+            format!(" (even after combining with {sources})")
+        };
+        let location = nickel.report.split_once('\n').map(|(_, location)| location).unwrap_or("");
+        return NickelError {
+            report: format!("Missing field `{field}` in env.yaml{shared}\n{location}"),
+            missing_env_field: Some(field.clone()),
+        }.into();
     }
-    .into()
+    error.context(context.to_owned())
 }
 
 fn env_data(root: &Path, candidate: Option<&Value>) -> Result<Value> {
@@ -80,14 +121,19 @@ fn program_values(root: &Path, env: &Value, expression: Option<&str>) -> Result<
 
 fn export(root: &Path, candidate: Option<&Value>, expression: &str) -> Result<Value> {
     let snapshot = crate::sources::snapshot(root, candidate)?;
-    export_values(root, &snapshot.values, expression).with_context(|| format!("evaluating environment with shared sources {:?}", snapshot.sources))
+    export_values(root, &snapshot.values, expression).map_err(|error|
+        environment_error(error, &snapshot, &format!("evaluating environment with shared sources {:?}", snapshot.sources)))
 }
 
 fn export_values(root: &Path, values: &Value, expression: &str) -> Result<Value> {
+    export_values_with_environment(root, values, expression, false)
+}
+
+fn export_values_with_environment(root: &Path, values: &Value, expression: &str, environment: bool) -> Result<Value> {
     let mut program = program_values(root, values, Some(expression))?;
     let value = program
         .eval_full_for_export()
-        .map_err(|error| diagnostic(&program, error))?;
+        .map_err(|error| diagnostic_with_environment(&program, error, environment))?;
     serde_json::to_value(value).context("serializing Nickel result")
 }
 
@@ -309,15 +355,16 @@ pub(crate) fn validate_field_values(root: &Path, path: &str, value: &Value, valu
 
 pub fn evaluate(root: &Path, candidate: Option<&Value>) -> Result<Project> {
     let snapshot = crate::sources::snapshot(root, candidate)?;
-    evaluate_snapshot(root, &snapshot).with_context(|| format!("evaluating environment with shared sources {:?}", snapshot.sources))
+    evaluate_snapshot(root, &snapshot).map_err(|error|
+        environment_error(error, &snapshot, &format!("evaluating environment with shared sources {:?}", snapshot.sources)))
 }
 
 pub fn evaluate_snapshot(root: &Path, snapshot: &crate::sources::EnvironmentSnapshot) -> Result<Project> {
     let canonical_root = fs::canonicalize(root).context("canonicalize checkout root")?;
     canonical_root.to_str().context("checkout path is not UTF-8; move the checkout to a UTF-8 path")?;
     let root = canonical_root.as_path();
-    let env = export_values(root, &snapshot.values, "let p = import \"compose.ncl\" in let env | p.dockstride.Config = import \"env.yaml\" in env")
-        .context("validating complete env.yaml; run dks setup for missing inputs")?;
+    let env = export_values_with_environment(root, &snapshot.values, "let p = import \"compose.ncl\" in let env | p.dockstride.Config = import \"env.yaml\" in env", true)
+        .map_err(|error| environment_error(error, snapshot, "validating complete env.yaml; run dks setup for missing inputs"))?;
     // The contract-expanded environment is already effective: never resolve it as a
     // local document, which would lose inherited provenance and source declarations.
     let metadata = export_values(root, &env, "let p = import \"compose.ncl\" in let m = p.dockstride in let remove = fun k r => if std.record.has_field k r then std.record.remove k r else r in m |> remove \"Config\" |> remove \"canonical\"")?;

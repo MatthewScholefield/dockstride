@@ -63,8 +63,14 @@ let swarm = fun canonical =>
   forEnvironment = fun env => {
     # Names, paths, Docker-native fields and backend choices remain visible.
     image = fun name => "%{env.imagePrefix}/%{name}:latest",
-    secretPath = fun name => "/run/secrets/%{name}",
-    grantSecrets = fun names => std.array.map (fun name => {source = name, target = name}) names,
+    secrets = std.record.map (fun name reference => {source = name, target = name})
+      (if std.record.has_field "secrets" env then env.secrets else {}),
+    secretPath = fun secret =>
+      let name = if std.is_string secret then secret else secret.target in
+      "/run/secrets/%{name}",
+    grantSecrets = fun secrets => std.array.map (fun secret =>
+      if std.is_string secret then {source = secret, target = secret}
+      else secret | {source | String, target | String}) secrets,
     Env = fun values => std.record.map (fun name value => std.string.from value) values,
     Service = fun service => service | {
       image | String | optional,
