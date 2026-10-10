@@ -88,6 +88,23 @@ fn initialized() -> TempDir {
 }
 
 #[test]
+fn version_matches_package_without_initializing_a_project() {
+    let dir = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_dks"))
+        .current_dir(dir.path())
+        .arg("--version")
+        .output()
+        .expect("start dks");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("dks {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn schema_and_plan_work_with_empty_environment_without_publishing_configuration() {
     let dir = initialized();
     let schema = success(dir.path(), &["config", "schema"]);

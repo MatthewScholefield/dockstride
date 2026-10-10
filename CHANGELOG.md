@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - Cut over to YAML/source files, referenced credential bytes and live Docker as durable authorities. `.dockstride` holds disposable locks/editor/render scratch only; remove registry, ownership UUIDs, saved targets, reservations, journals, deployment snapshots and secret histories/HMAC/GC.
 - Own managed resources by canonical UTF-8 checkout path plus effective project labels. Preserve sanitized folder proposals and explicit/inherited project names; reject foreign/missing/legacy UUID labels without adoption. Capture Docker connection per invocation, not across invocations.
