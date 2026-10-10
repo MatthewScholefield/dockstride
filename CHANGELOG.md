@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Validate deploy service fields against the adapted Swarm manifest instead of rejecting legitimate Compose-only `restart`/`container_name` settings retained in the canonical model. Preserve canonical build validation before publication.
+- Accept native legacy stack `expose` alongside `init`; retain these fields and explicit `deploy.restart_policy` in Swarm rendering. Add regression coverage for CLI rendering/read-only deployment plans, adapter parity, and unsupported-field/build preflight safety.
+
 ## 0.2.0
 
 - Cut over to YAML/source files, referenced credential bytes and live Docker as durable authorities. `.dockstride` holds disposable locks/editor/render scratch only; remove registry, ownership UUIDs, saved targets, reservations, journals, deployment snapshots and secret histories/HMAC/GC.

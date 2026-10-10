@@ -208,6 +208,12 @@ fn normal_nickel_export_obeys_backend_without_exporting_operational_metadata() {
         program::{Program, ProgramBuilder},
     };
     let root = fixture();
+    let path = root.path().join("compose.ncl");
+    let source = fs::read_to_string(&path).unwrap().replace(
+        "build.context = \"./app\",",
+        "build.context = \"./app\", restart = \"unless-stopped\", container_name = \"local-api\", init = true, expose = [\"8000\"],",
+    );
+    fs::write(&path, source).unwrap();
     for backend in ["compose", "swarm"] {
         let mut effective = complete(backend);
         effective.as_object_mut().unwrap().remove("_dockstride");
@@ -232,6 +238,17 @@ fn normal_nickel_export_obeys_backend_without_exporting_operational_metadata() {
             backend == "compose"
         );
         assert_eq!(rendered["secrets"]["authKey"]["file"], "/private/key");
+        let project = nickel::evaluate(root.path(), Some(&complete(backend))).unwrap();
+        assert_eq!(project.model["services"]["api"]["restart"], "unless-stopped");
+        assert_eq!(project.model["services"]["api"]["container_name"], "local-api");
+        let expected = if backend == "swarm" { project.swarm().unwrap() } else { project.compose().unwrap() };
+        assert_eq!(rendered["services"], expected["services"]);
+        for field in ["restart", "container_name"] {
+            assert_eq!(rendered["services"]["api"].get(field).is_some(), backend == "compose");
+        }
+        assert_eq!(rendered["services"]["api"]["init"], true);
+        assert_eq!(rendered["services"]["api"]["expose"], json!(["8000"]));
+        assert_eq!(rendered["services"]["api"]["deploy"]["restart_policy"]["condition"], "on-failure");
         if backend == "swarm" {
             assert_eq!(rendered["version"], "3.8");
         }

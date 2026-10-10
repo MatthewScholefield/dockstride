@@ -75,11 +75,12 @@ fn selection(project: &Project, selected: &[String]) -> Result<Vec<String>> {
     Ok(names)
 }
 fn validate_model(project: &Project) -> Result<()> {
-    for (name, service) in project.services()? {
+    let rendered = project.swarm()?;
+    let services = object(&rendered["services"], "Swarm services")?;
+    for (name, service) in services {
         let fields = object(service, &format!("service {name}"))?;
         for incompatible in [
             "privileged",
-            "container_name",
             "network_mode",
             "links",
             "external_links",
@@ -87,7 +88,6 @@ fn validate_model(project: &Project) -> Result<()> {
             "pid",
             "ipc",
             "volumes_from",
-            "restart",
         ] {
             ensure!(
                 !fields.contains_key(incompatible),
@@ -99,10 +99,6 @@ fn validate_model(project: &Project) -> Result<()> {
                 key.starts_with("x-")
                     || [
                         "image",
-                        "build",
-                        "develop",
-                        "depends_on",
-                        "profiles",
                         "environment",
                         "env_file",
                         "command",
@@ -119,6 +115,7 @@ fn validate_model(project: &Project) -> Result<()> {
                         "networks",
                         "volumes",
                         "ports",
+                        "expose",
                         "secrets",
                         "configs",
                         "healthcheck",
@@ -145,7 +142,9 @@ fn validate_model(project: &Project) -> Result<()> {
                 "service {name}: job modes require an explicitly declared one-shot deploy prerequisite, not a long-running stack rollout"
             );
         }
-        if let Some(build) = fields.get("build") {
+    }
+    for (name, service) in project.services()? {
+        if let Some(build) = service.get("build") {
             if let Some(build) = build.as_object() {
                 for key in build.keys() {
                     ensure!(
@@ -172,7 +171,6 @@ fn validate_model(project: &Project) -> Result<()> {
             }
         }
     }
-    let rendered = project.swarm()?;
     if let Some(secrets) = rendered.get("secrets").and_then(Value::as_object) {
         for (name, spec) in secrets {
             ensure!(
