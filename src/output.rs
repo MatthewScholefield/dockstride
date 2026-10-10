@@ -617,9 +617,9 @@ fn render_human(output: &Output, out: &mut impl Write, value: &Value) -> Result<
             writeln!(
                 out,
                 "{} Edit env.yaml to override configuration.",
-                output.style().cyan().apply_to("ℹ️")
+                output.style().blue().apply_to("i")
             )?;
-            writeln!(out, "   No containers started.")?;
+            writeln!(out, "  No containers started.")?;
             writeln!(out)?;
             writeln!(
                 out,
@@ -1009,9 +1009,11 @@ mod tests {
         ]}});
         let pretty = render(&interactive(true, 80), value.clone());
         assert!(pretty.starts_with("\n✨ Environment ready!\nGenerated configuration:\n╭"));
-        assert!(pretty.contains(
-            "\nℹ️ Edit env.yaml to override configuration.\n   No containers started.\n"
-        ));
+        assert!(
+            pretty.contains(
+                "\ni Edit env.yaml to override configuration.\n  No containers started.\n"
+            )
+        );
         assert!(pretty.contains("\n💡 Tip: Re-run 'dks setup' anytime to sync configuration.\n   Existing secrets are preserved on rerun.\n   Next: dks up\n"));
         assert!(!pretty.contains("/private/token") && !pretty.contains('\x1b'));
 
@@ -1032,6 +1034,8 @@ mod tests {
             let colored = render(&interactive(false, width), value.clone());
             let uncolored = render(&interactive(true, width), value.clone());
             assert_eq!(console::strip_ansi_codes(&colored), uncolored);
+            assert!(colored.contains("\x1b[34mi\x1b[0m Edit env.yaml"));
+            assert!(!colored.contains("ℹ"));
             for line in colored
                 .lines()
                 .filter(|line| console::strip_ansi_codes(line).starts_with(['╭', '│', '╰']))

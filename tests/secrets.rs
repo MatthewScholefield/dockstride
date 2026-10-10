@@ -398,7 +398,8 @@ fn setup_presentation_reports_generated_existing_and_supplied_files_truthfully()
     let text = String::from_utf8(first.stdout).unwrap();
     assert!(text.contains("✨ Environment ready!") && text.contains("*** (generated file)"));
     assert!(text.contains("Generated configuration:\n╭") && !text.contains('\x1b'));
-    assert!(text.contains("ℹ️ Edit env.yaml to override configuration."));
+    assert!(text.contains("\ni Edit env.yaml to override configuration.\n  No containers started.\n"));
+    assert!(!text.contains("ℹ"));
     assert!(text.contains("💡 Tip: Re-run 'dks setup' anytime to sync configuration."));
     assert!(text.contains("Existing secrets are preserved on rerun.") && text.contains("Next: dks up"));
     let events = String::from_utf8(first.stderr).unwrap();
