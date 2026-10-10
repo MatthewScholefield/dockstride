@@ -108,12 +108,22 @@ impl Output {
                     format!("({:.2}s)", elapsed.as_secs_f64())
                 };
                 let padding = if self.mode == OutputMode::Interactive {
-                    let width = self.width.unwrap_or_else(|| console::Term::stderr().size().1).min(100);
-                    usize::from(width).saturating_sub(console::measure_text_width(&label) + timing.len()).max(1)
+                    let width = self
+                        .width
+                        .unwrap_or_else(|| console::Term::stderr().size().1)
+                        .min(100);
+                    usize::from(width)
+                        .saturating_sub(console::measure_text_width(&label) + timing.len())
+                        .max(1)
                 } else {
                     1
                 };
-                writeln!(io::stderr().lock(), "{label}{:padding$}{}", "", self.style().dim().apply_to(timing))?;
+                writeln!(
+                    io::stderr().lock(),
+                    "{label}{:padding$}{}",
+                    "",
+                    self.style().dim().apply_to(timing)
+                )?;
             }
         }
         result
@@ -206,10 +216,43 @@ impl Output {
             if !headers.is_empty() {
                 table.set_header(headers.iter().map(|text| clean(text)).collect::<Vec<_>>());
             }
-            for row in rows {
-                table.add_row(row.iter().map(|text| clean(text)).collect::<Vec<_>>());
+            table.force_no_tty();
+            if !self.no_color {
+                table.enforce_styling();
             }
-            writeln!(out, "{table}")?;
+            for row in rows {
+                table.add_row(
+                    row.iter()
+                        .enumerate()
+                        .map(|(column, text)| {
+                            let cell = comfy_table::Cell::new(clean(text));
+                            if !self.no_color && headers.is_empty() && column == 1 {
+                                cell.fg(comfy_table::Color::AnsiValue(152))
+                            } else {
+                                cell
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            let border = self.style().color256(245);
+            for line in table.to_string().lines() {
+                if line.starts_with('╭') || line.starts_with('╰') {
+                    writeln!(out, "{}", border.apply_to(line))?;
+                } else if let Some(content) = line
+                    .strip_prefix('│')
+                    .and_then(|line| line.strip_suffix('│'))
+                {
+                    writeln!(
+                        out,
+                        "{}{content}{}",
+                        border.apply_to("│"),
+                        border.apply_to("│")
+                    )?;
+                } else {
+                    writeln!(out, "{line}")?;
+                }
+            }
         }
         Ok(())
     }
@@ -545,9 +588,16 @@ fn render_human(output: &Output, out: &mut impl Write, value: &Value) -> Result<
         if output.mode == OutputMode::Interactive {
             writeln!(out)?;
         }
-        writeln!(out, "{}", output.heading("Environment ready"))?;
         if output.mode == OutputMode::Interactive {
-            writeln!(out, "Configuration:")?;
+            writeln!(
+                out,
+                "{} {}",
+                output.style().yellow().apply_to("✨"),
+                output.heading("Environment ready!")
+            )?;
+            writeln!(out, "Generated configuration:")?;
+        } else {
+            writeln!(out, "Environment ready!")?;
         }
         if let Some(fields) = value["configuration"]["fields"].as_array() {
             let mut fields = fields.clone();
@@ -563,12 +613,28 @@ fn render_human(output: &Output, out: &mut impl Write, value: &Value) -> Result<
         if output.mode == OutputMode::Interactive {
             writeln!(out)?;
         }
-        writeln!(out, "Edit env.yaml to override configuration.")?;
-        writeln!(out, "Next: dks up")?;
-        writeln!(
-            out,
-            "No containers started. Existing secrets are preserved on rerun."
-        )?;
+        if output.mode == OutputMode::Interactive {
+            writeln!(
+                out,
+                "{} Edit env.yaml to override configuration.",
+                output.style().cyan().apply_to("ℹ️")
+            )?;
+            writeln!(out, "   No containers started.")?;
+            writeln!(out)?;
+            writeln!(
+                out,
+                "💡 Tip: Re-run 'dks setup' anytime to sync configuration."
+            )?;
+            writeln!(out, "   Existing secrets are preserved on rerun.")?;
+            writeln!(out, "   Next: dks up")?;
+        } else {
+            writeln!(out, "Edit env.yaml to override configuration.")?;
+            writeln!(out, "Next: dks up")?;
+            writeln!(
+                out,
+                "No containers started. Existing secrets are preserved on rerun."
+            )?;
+        }
         return Ok(true);
     }
     if let Some(deployed) = value.get("deployed") {
@@ -871,7 +937,7 @@ mod tests {
             );
             assert!(text.contains("Environment ready") && text.contains("Next: dks up"));
             if output.mode == OutputMode::Interactive {
-                assert!(text.contains("Configuration:\n╭") && !text.contains('╞'));
+                assert!(text.contains("Generated configuration:\n╭") && !text.contains('╞'));
             }
             let verbose = render(
                 &Output {
@@ -933,6 +999,51 @@ mod tests {
         assert!(interactive(false, 80).step_label(true).contains("\x1b[32m"));
         assert_eq!(Output::default().step_label(true), "Completed:");
         assert_eq!(interactive(true, 80).step_label(false), "Failed:");
+    }
+
+    #[test]
+    fn setup_presentation_matches_mock_without_changing_plain_output() {
+        let value = json!({"configured":true,"configuration":{"fields":[
+            {"path":"backend","value":"compose"},
+            {"path":"secrets.token","value":{"file":"/private/token"},"secret":true}
+        ]}});
+        let pretty = render(&interactive(true, 80), value.clone());
+        assert!(pretty.starts_with("\n✨ Environment ready!\nGenerated configuration:\n╭"));
+        assert!(pretty.contains(
+            "\nℹ️ Edit env.yaml to override configuration.\n   No containers started.\n"
+        ));
+        assert!(pretty.contains("\n💡 Tip: Re-run 'dks setup' anytime to sync configuration.\n   Existing secrets are preserved on rerun.\n   Next: dks up\n"));
+        assert!(!pretty.contains("/private/token") && !pretty.contains('\x1b'));
+
+        let plain = render(&Output::default(), value);
+        assert_eq!(
+            plain,
+            "Environment ready!\nField\tValue\nbackend\tcompose\nsecrets.token\t*** (file)\nEdit env.yaml to override configuration.\nNext: dks up\nNo containers started. Existing secrets are preserved on rerun.\n"
+        );
+    }
+
+    #[test]
+    fn setup_frame_and_values_use_distinct_colors_even_when_captured() {
+        let value = json!({"configured":true,"configuration":{"fields":[
+            {"path":"backend","value":"compose"},
+            {"path":"deep.configuration.field","value":"averylongunbrokentextvalue"}
+        ]}});
+        for width in [12, 32, 80] {
+            let colored = render(&interactive(false, width), value.clone());
+            let uncolored = render(&interactive(true, width), value.clone());
+            assert_eq!(console::strip_ansi_codes(&colored), uncolored);
+            for line in colored
+                .lines()
+                .filter(|line| console::strip_ansi_codes(line).starts_with(['╭', '│', '╰']))
+            {
+                assert!(console::measure_text_width(line) <= usize::from(width));
+                assert!(line.contains("\x1b[38;5;245m"), "{line:?}");
+                if console::strip_ansi_codes(line).starts_with('│') {
+                    assert!(line.contains("\x1b[38;5;152m"), "{line:?}");
+                }
+            }
+            assert!(colored.contains("\x1b[38;5;152m"));
+        }
     }
 
     #[test]
