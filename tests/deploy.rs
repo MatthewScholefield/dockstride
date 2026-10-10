@@ -15,6 +15,7 @@ fn output() -> Output {
     Output {
         json: true,
         quiet: true,
+        ..Output::default()
     }
 }
 

@@ -47,7 +47,7 @@ fn session(root: &Path, output: &Output) -> Result<Session> {
         .context("project name is required before provisioning")?.to_owned();
     crate::model::validate_project_name(&project)?;
     let bindings = sources::swarm_bindings(&snapshot.local)?;
-    let docker = Docker::new(&root, Output { json: output.json, quiet: output.quiet });
+    let docker = Docker::new(&root, output.clone());
     let context = docker.context()?;
     if backend == "swarm" {
         let info: Value = serde_json::from_str(&docker.capture(&["info".into(), "--format".into(), "{{json .Swarm}}".into()], None)?)?;
@@ -67,7 +67,7 @@ fn validate_namespace(session: &Session) -> Result<()> {
 }
 
 fn announce(session: &Session, output: &Output) -> Result<()> {
-    output.event("secrets", &format!("{} / {}; checkout {}; Docker target {}",
+    output.verbose_event("secrets", &format!("{} / {}; checkout {}; Docker target {}",
         session.project, session.backend, session.owner, session.context))
 }
 
@@ -136,7 +136,7 @@ pub fn provision(root: &Path, non_interactive: bool, inputs: &BTreeMap<String, S
                 status = "provisioned";
             }
         }
-        results.push(json!({"name":name,"status":status,"reference":reference,"binding":binding(&session,&name)}));
+        results.push(json!({"name":name,"status":status,"generated":false,"origin":"existing","reference":reference,"binding":binding(&session,&name)}));
     }
     let mut stdin_used = false;
     for name in missing {
@@ -149,13 +149,16 @@ pub fn provision(root: &Path, non_interactive: bool, inputs: &BTreeMap<String, S
             let (file, _) = reference_file(&session.root, &reference)?;
             publish_binding(&mut session, &name, &read_bounded(file)?, None)?;
         }
-        results.push(json!({"name":name,"status":"provisioned","reference":reference,"binding":binding(&session,&name)}));
+        let generated = policy_kind(&policies[&name]) == "generate" && !inputs.contains_key(&name);
+        results.push(json!({"name":name,"status":"provisioned","generated":generated,
+            "origin":if generated {"generated"} else {"input"},"reference":reference,"binding":binding(&session,&name)}));
     }
     let eligible = crate::allocations::eligible_fields(root, &session.snapshot.values, &session.fields)?;
     let deferred = eligible.iter().any(|path|
         path.split('.').try_fold(&session.snapshot.values, |value, part| value.get(part)).is_none_or(Value::is_null));
     if !deferred { validate_consumers_with_session(root, &session)?; }
-    Ok(json!({"secrets":results,"consumerValidation":if deferred {"deferred"} else {"validated"}}))
+    Ok(json!({"secrets":results,"project":session.project,"backend":session.backend,
+        "consumerValidation":if deferred {"deferred"} else {"validated"}}))
 }
 
 fn binding<'a>(session: &'a Session, name: &str) -> Option<&'a String> {
@@ -165,7 +168,7 @@ fn binding<'a>(session: &'a Session, name: &str) -> Option<&'a String> {
 }
 
 pub fn list(root: &Path) -> Result<Value> {
-    let session = session(root, &Output { json:false, quiet:true })?;
+    let session = session(root, &Output { quiet:true, ..Output::default() })?;
     let consumers = consumers(root)?;
     let mut rows = Vec::new();
     for (name, reference) in references(&session.snapshot.values) {
@@ -179,7 +182,7 @@ pub fn list(root: &Path) -> Result<Value> {
 }
 
 pub fn doctor(root: &Path) -> Result<Value> {
-    let session = session(root, &Output { json:false, quiet:true })?;
+    let session = session(root, &Output { quiet:true, ..Output::default() })?;
     let mut issues = Vec::new();
     for (name, reference) in references(&session.snapshot.values) {
         let result = validate_source(&session,reference).and_then(|_| {
@@ -409,7 +412,7 @@ fn obtain_source(session:&Session, name:&str, policy:&Value, input:Option<&Secre
 
 fn validate_candidate_consumers(root:&Path, session:&Session, snapshot:&sources::EnvironmentSnapshot) -> Result<()> {
     let candidate = Session { root:session.root.clone(), snapshot:snapshot.clone(), metadata:session.metadata.clone(),
-        fields:session.fields.clone(), docker:Docker::new(root,Output {json:false,quiet:true}), owner:session.owner.clone(),
+        fields:session.fields.clone(), docker:Docker::new(root,Output {quiet:true, ..Output::default()}), owner:session.owner.clone(),
         context:session.context.clone(), backend:session.backend.clone(), project:session.project.clone(),bindings:session.bindings.clone() };
     validate_consumers_with_session(root,&candidate)
 }
@@ -655,7 +658,7 @@ pub(crate) fn validate_config_transition(root: &Path, before: &Value, candidate:
             ensure!(backend == "swarm",
                 "external named secrets require the Swarm backend");
             if !managed {
-                let docker = Docker::new(root, Output { json: false, quiet: true });
+                let docker = Docker::new(root, Output { quiet: true, ..Output::default() });
                 let info: Value = serde_json::from_str(&docker.capture(&["secret".into(), "inspect".into(),
                     reference["name"].as_str().unwrap().into()], None)?)?;
                 ensure!(info.get(0).and_then(|item| item.pointer("/Spec/Name")) == Some(&reference["name"]),
@@ -669,7 +672,7 @@ pub(crate) fn validate_config_transition(root: &Path, before: &Value, candidate:
         let complete = fields.iter().filter(|field| field.required).all(|field|
             field.path.split('.').try_fold(&values, |value, part| value.get(part)).is_some());
         if complete && values.get("backend").and_then(Value::as_str).unwrap_or("compose") == "compose" {
-            let mut session = session(root, &Output { json: false, quiet: true })?;
+            let mut session = session(root, &Output { quiet: true, ..Output::default() })?;
             session.snapshot.values = effective.clone();
             session.metadata = nickel::setup_metadata_values(root, effective)?;
             validate_consumers_with_session(root, &session)?;

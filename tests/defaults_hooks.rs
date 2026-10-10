@@ -60,7 +60,7 @@ fn defaults_commands_are_isolated_and_fail_closed() {
 fn defaults_subprocess_worker() {
     let Some(root) = std::env::var_os("DKS_DEFAULTS_FIXTURE") else { return; };
     let root = Path::new(&root);
-    let output = Output { quiet: true, json: false };
+    let output = Output { quiet: true, ..Output::default() };
     let local = json!({"_dockstride":{"sources":[]},"secrets":{"api":{"file":"/private/do-not-forward"}}});
     let original = "# preserve this local document\n_dockstride:\n  sources: []\nsecrets:\n  api:\n    file: /private/do-not-forward\n";
     fs::write(root.join("env.yaml"), original).unwrap();

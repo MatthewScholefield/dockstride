@@ -94,7 +94,7 @@ fn diagnostics_subprocess_worker() {
     let root = Path::new(&root);
     fs::write(root.join("env.yaml"), "project: diagnostic-fixture\nbackend: compose\nsecrets:\n  password:\n    file: /private/mounted-password\n").unwrap();
     let mut project = project(root);
-    let output = Output { quiet:true, json:false };
+    let output = Output { quiet:true, ..Output::default() };
     let docker = Docker::new(root, output.clone());
     let selected = vec!["postgres".into(),"migrate".into()];
     let primary: anyhow::Error = PrerequisiteFailed(json!({"service":"migrate","exitCode":12})).into();

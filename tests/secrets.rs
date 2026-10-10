@@ -107,10 +107,14 @@ secrets=env.secrets,services.api={{image="alpine",user="{user}",secrets=["authKe
         &self.root
     }
     fn command(&self, args: &[&str], stdin: Option<&[u8]>) -> Output {
+        self.command_mode(args, stdin, true)
+    }
+    fn command_mode(&self, args: &[&str], stdin: Option<&[u8]>, json: bool) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_dks"));
         command.current_dir(self.root());
+        if json { command.args(["--json", "--non-interactive"]); }
         command
-            .args(["--json", "--non-interactive", "-C"])
+            .args(["-C"])
             .arg(self.root())
             .args(args)
             .env(
@@ -384,4 +388,77 @@ fn existing_legacy_marker_and_credentials_are_neither_required_nor_deleted() {
     f.success(&["setup"],None);
     assert_eq!(fs::read(marker).unwrap(),b"old-marker-not-authority");
     assert_eq!(fs::read(old).unwrap(),b"retained-private-material");
+}
+
+#[test]
+fn setup_presentation_reports_generated_existing_and_supplied_files_truthfully() {
+    let f = Fixture::new("compose", "lib.GenerateSecret {bytes=32,encoding=\"hex\"}", "0", false);
+    let first = f.command_mode(&["--interactive", "--no-color", "setup"], None, false);
+    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    let text = String::from_utf8(first.stdout).unwrap();
+    assert!(text.contains("Environment ready") && text.contains("*** (generated file)"));
+    assert!(text.contains('╭') && !text.contains('\x1b'));
+    let events = String::from_utf8(first.stderr).unwrap();
+    for step in ["Reading/provisioning environment", "Preparing secrets", "Allocating ports", "Validating configuration"] {
+        let line = events.lines().find(|line| line.starts_with(&format!("✓ {step}"))).unwrap();
+        assert!(line.contains('(') && line.ends_with(')'), "{events}");
+    }
+    assert!(!events.contains("checkout") && !events.contains("Docker target"));
+    let reference = f.env()["secrets"]["authKey"].clone();
+    let path = reference["file"].as_str().unwrap();
+    let bytes = fs::read(path).unwrap();
+    assert!(!text.contains(path) && !text.contains(std::str::from_utf8(&bytes).unwrap()));
+    let rerun = f.command_mode(&["--non-interactive", "setup"], None, false);
+    assert!(rerun.status.success());
+    let text = String::from_utf8(rerun.stdout).unwrap();
+    assert!(text.contains("*** (existing file)") && !text.contains("generated file"));
+    assert!(!text.contains('╭') && !text.contains('\x1b') && !text.contains(path));
+    assert!(!String::from_utf8_lossy(&rerun.stderr).contains('✓'));
+    assert_eq!(fs::read(path).unwrap(), bytes);
+    let json = f.success(&["setup"], None);
+    assert_eq!(json["result"]["secretProvisioning"]["secrets"][0]["generated"], false);
+    assert_eq!(json["result"]["secretProvisioning"]["secrets"][0]["origin"], "existing");
+    fs::remove_file(path).unwrap();
+    let failed = f.command_mode(&["--interactive", "--no-color", "setup"], None, false);
+    assert!(!failed.status.success());
+    assert!(!String::from_utf8_lossy(&failed.stdout).contains("Environment ready"));
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("Failed: Preparing secrets"));
+
+    let supplied = Fixture::new("compose", "lib.GenerateSecret {bytes=32,encoding=\"hex\"}", "0", false);
+    let private = supplied.temp.path().join("input-token");
+    fs::write(&private, b"supplied-private-bytes").unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+    let specification = format!("authKey={}", private.display());
+    let output = supplied.command_mode(&["setup", "--secret-file", &specification], None, false);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("*** (file)") && !text.contains("generated file"));
+    assert!(!text.contains("supplied-private-bytes") && !text.contains(private.to_str().unwrap()));
+}
+
+#[test]
+fn setup_json_preserves_results_and_adds_real_timing_events_and_generation() {
+    let f = Fixture::new("compose", "lib.GenerateSecret {bytes=32,encoding=\"hex\"}", "0", false);
+    let output = f.command(&["setup"], None);
+    assert!(output.status.success());
+    let records: Vec<Value> = std::str::from_utf8(&output.stdout).unwrap().lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    let steps: Vec<_> = records.iter().filter(|record| record.get("elapsedMs").is_some()).collect();
+    assert_eq!(steps.len(), 4);
+    for step in steps {
+        assert_eq!(step["type"], "event");
+        assert_eq!(step["schemaVersion"], 1);
+        assert_eq!(step["phase"], "setup");
+        assert_eq!(step["status"], "completed");
+        assert!(step["elapsedMs"].as_f64().unwrap() >= 0.0);
+        assert!(step["message"].is_string());
+    }
+    let result = records.last().unwrap();
+    assert_eq!(result["type"], "result");
+    assert_eq!(result["result"]["configured"], true);
+    assert_eq!(result["result"]["started"], false);
+    assert!(result["result"].get("configuration").is_some());
+    assert_eq!(result["result"]["secretProvisioning"]["secrets"][0]["generated"], true);
+    assert!(records.iter().any(|record| record["phase"] == "secrets"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains('╭'));
 }

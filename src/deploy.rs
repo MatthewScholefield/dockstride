@@ -1544,7 +1544,7 @@ esac
     #[ignore = "isolated helper invoked by captured_network_disappearance_completes_teardown_without_hiding_failures"]
     fn network_disappearance_child() {
         let root = std::path::PathBuf::from(std::env::var_os("DKS_NETWORK_RACE_ROOT").unwrap());
-        let output = Output { json: true, quiet: true };
+        let output = Output { json: true, quiet: true, ..Output::default() };
         let docker = Docker::new(&root, output.clone());
         let project = Project {
             root: root.canonicalize().unwrap(),
@@ -1688,7 +1688,7 @@ esac
     #[ignore = "isolated helper invoked by disappearing_tasks_are_reobserved_without_stale_or_zero_replica_success"]
     fn task_disappearance_child() {
         let root = std::path::PathBuf::from(std::env::var_os("DKS_TASK_RACE_ROOT").unwrap());
-        let output = Output { json: true, quiet: true };
+        let output = Output { json: true, quiet: true, ..Output::default() };
         let docker = Docker::new(&root, output.clone());
         let project = Project {
             root: root.canonicalize().unwrap(),

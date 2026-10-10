@@ -7,6 +7,10 @@ use std::{
 use tempfile::TempDir;
 
 fn cli(root: &Path, args: &[&str]) -> Output {
+    cli_mode(root, args, true)
+}
+
+fn cli_mode(root: &Path, args: &[&str], json: bool) -> Output {
     use std::os::unix::fs::PermissionsExt;
     let bin = root.join("test-bin");
     fs::create_dir_all(&bin).unwrap();
@@ -15,10 +19,11 @@ fn cli(root: &Path, args: &[&str]) -> Output {
         fs::write(&docker, "#!/bin/sh\ncase \"$1\" in\n info) printf 'cli-fixture-daemon\\n';;\n *) exit 0;;\nesac\n").unwrap();
         fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
     }
-    Command::new(env!("CARGO_BIN_EXE_dks"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dks"));
+    if json { command.args(["--json", "--non-interactive", "--no-color"]); }
+    command
         .arg("--directory")
         .arg(root)
-        .args(["--json", "--non-interactive", "--no-color"])
         .args(args)
         .env("NO_COLOR", "1")
         .env("HOME", root.join("test-home"))
@@ -378,4 +383,74 @@ let env | contract = import "env.yaml" in {
     assert!(!result.to_string().contains("private-original"));
     assert_eq!(fs::read_to_string(dir.path().join("env.yaml")).unwrap(), "{}\n");
     assert!(!dir.path().join(".dockstride").exists());
+}
+
+#[test]
+fn presentation_flags_keep_captured_outputs_plain_unless_forced() {
+    let dir = initialized();
+    success(dir.path(), &["config", "set", "project", "presentation"]);
+    for flags in [vec![], vec!["--non-interactive"]] {
+        let mut args = flags;
+        args.extend(["config", "list"]);
+        let output = cli_mode(dir.path(), &args, false);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("Field\tValue") && text.contains("project\tpresentation"));
+        assert!(!text.contains('╭') && !text.contains('\x1b') && !text.contains('✓'));
+    }
+    for flags in [vec!["--interactive"], vec!["--interactive", "--no-color"]] {
+        let mut args = flags;
+        args.extend(["config", "list"]);
+        let output = cli_mode(dir.path(), &args, false);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains('╭') && text.contains('╯'));
+        assert!(!text.contains('\x1b'));
+    }
+    let help = cli_mode(dir.path(), &["--help"], false);
+    let text = String::from_utf8(help.stdout).unwrap();
+    for flag in ["--interactive", "--non-interactive", "--no-color", "--verbose"] {
+        assert!(text.contains(flag));
+    }
+    for flag in ["--json", "--non-interactive"] {
+        let output = cli_mode(dir.path(), &["--interactive", flag, "config", "list"], false);
+        assert_eq!(output.status.code(), Some(2));
+    }
+}
+
+#[test]
+fn interactive_presentation_never_enables_prompts_and_quiet_keeps_results() {
+    let dir = initialized();
+    let failed = cli_mode(dir.path(), &["--interactive", "--no-color", "setup"], false);
+    assert!(!failed.status.success());
+    assert!(!String::from_utf8_lossy(&failed.stdout).contains("Environment ready"));
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("Failed: Reading/provisioning environment"));
+    let output = cli_mode(dir.path(), &["--quiet", "setup", "--set", "project=presentation"], false);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.stderr.is_empty());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Environment ready") && text.contains("Next: dks up"));
+    let output = cli(dir.path(), &["--quiet", "setup"]);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 1);
+    let result = terminal(&output);
+    assert_eq!(result["result"]["configured"], true);
+    assert_eq!(result["result"]["started"], false);
+    assert!(result["result"].get("configuration").is_some());
+}
+
+#[test]
+fn raw_completions_and_yaml_are_identical_in_all_human_modes() {
+    let dir = initialized();
+    success(dir.path(), &["config", "set", "project", "raw-output"]);
+    for command in [vec!["completions", "bash"], vec!["render", "--target", "compose"]] {
+        let plain = cli_mode(dir.path(), &command, false);
+        assert!(plain.status.success(), "{}", String::from_utf8_lossy(&plain.stderr));
+        let mut args = vec!["--interactive", "--no-color"];
+        args.extend(command);
+        let pretty = cli_mode(dir.path(), &args, false);
+        assert!(pretty.status.success());
+        assert_eq!(plain.stdout, pretty.stdout);
+        assert!(!String::from_utf8_lossy(&pretty.stdout).contains('╭'));
+    }
 }

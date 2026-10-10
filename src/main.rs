@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use dockstride::{config, deploy, model::Project, nickel, output::Output, runtime, secrets, state};
+use dockstride::{config, deploy, model::Project, nickel, output::{Output, OutputMode}, runtime, secrets, state};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -21,6 +21,8 @@ struct Cli {
     json: bool,
     #[arg(long, global = true)]
     non_interactive: bool,
+    #[arg(long, global = true, conflicts_with_all = ["non_interactive", "json"], help = "Use terminal presentation without enabling prompts in pipes")]
+    interactive: bool,
     #[arg(long, global = true)]
     no_color: bool,
     #[arg(short, long, global = true)]
@@ -221,7 +223,7 @@ enum Target {
 
 fn main() {
     let no_color = std::env::var_os("NO_COLOR").is_some()
-        || std::env::args_os().any(|arg| arg == "--no-color" || arg == "--json");
+        || std::env::args_os().any(|arg| arg == "--no-color" || arg == "--json" || arg == "--non-interactive");
     let command = if no_color {
         Cli::command().color(clap::ColorChoice::Never)
     } else {
@@ -231,6 +233,12 @@ fn main() {
     let output = Output {
         json: cli.json,
         quiet: cli.quiet,
+        mode: OutputMode::select(cli.interactive, cli.non_interactive, cli.json,
+            [io::stdin().is_terminal(), io::stdout().is_terminal(), io::stderr().is_terminal()],
+            std::env::var_os("TERM").is_none_or(|term| term != "dumb") && console::Term::stdout().features().is_attended()),
+        no_color,
+        verbose: cli.verbose,
+        ..Output::default()
     };
     match execute(&cli, &output) {
         Ok(Some(result)) => {
@@ -380,19 +388,25 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                 }
                 plan
             } else {
-                config::setup_with_context(&root, &inputs, non_interactive, cli.timeout, out, "setup")?;
+                out.step("Reading/provisioning environment", ||
+                    config::setup_with_context(&root, &inputs, non_interactive, cli.timeout, out, "setup"))?;
                 if *adopt_existing_volumes {
-                    runtime::adopt_existing_volumes(&root, cli.timeout, out)?;
+                    out.step("Adopting existing volumes", || runtime::adopt_existing_volumes(&root, cli.timeout, out))?;
                 }
-                let provisioned = secrets::provision(&root, non_interactive, &secret_inputs, out)?;
-                {
+                let provisioned = out.step("Preparing secrets", ||
+                    secrets::provision(&root, non_interactive, &secret_inputs, out))?;
+                out.step("Allocating ports", || {
                     let _lifecycle = state::lock(&root, "lifecycle")?;
                     if runtime::allocate_ports(&root)? {
-                        out.event("Ports", "missing port fields saved to env.yaml")?;
+                        out.verbose_event("Ports", "missing port fields saved to env.yaml")?;
                     }
-                }
-                if provisioned["consumerValidation"] == "deferred" { secrets::validate_consumers(&root, out)?; }
-                json!({"configured":true,"started":false,"configuration":config::list(&root)?})
+                    Ok(())
+                })?;
+                let configuration = out.step("Validating configuration", || {
+                    if provisioned["consumerValidation"] == "deferred" { secrets::validate_consumers(&root, out)?; }
+                    config::list(&root)
+                })?;
+                json!({"configured":true,"started":false,"configuration":configuration,"secretProvisioning":provisioned})
             }
         }
         Commands::Config { command } => match command {
