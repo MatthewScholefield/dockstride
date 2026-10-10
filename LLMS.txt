@@ -1,0 +1,90 @@
+# Dockstride
+
+Dockstride (`dks`) is a Linux CLI for development with Docker Compose and deployment with Docker Swarm. It evaluates a checked-in Nickel definition into ordinary Docker configuration, provisions settings/secrets, and verifies startup. It preserves native Docker semantics rather than introducing another orchestration language. Requires Docker Engine and Compose 2.24+.
+
+## How it works
+
+- `compose.ncl`: services and architecture, plus non-exported `dockstride` metadata.
+- `libs/dockstride.ncl`: checked-in, inspectable helpers created by `dks init`; evaluation never downloads libraries.
+- `dockstride.Config`: typed, documented contract for editable settings.
+- `env.yaml`: environment-specific overrides and secret references; do not commit it. Precedence: contract defaults, ordered shared YAML sources, local overrides, explicit invocation inputs.
+- `let env | cfg = import "env.yaml" in` validates settings; `lib.forEnvironment env` provides `ComposeFile`, `Service`, `Env`, and secret helpers. `dc.ComposeFile` uses `env.backend` to select Compose or Swarm rendering.
+- `dks setup` fills missing settings and provisions declared secrets. `dks up` starts/verifies Compose; `dks dev` additionally runs declared Compose watch rules or a development command. `dks deploy` builds/publishes images and deploys the complete Swarm stack.
+- `dks render` inspects Docker output without running setup hooks. `dks config schema --json`, `dks config list`, `dks status`, and `dks doctor` expose configuration and operational state. `--json`, `--non-interactive`, and `--plan` support automation.
+
+## Migrate an existing Compose file
+
+1. Run `dks init` in the application checkout; replace its starter service with your existing services. It refuses to overwrite an existing definition/library.
+2. Translate YAML mappings/lists into Nickel records/arrays inside `dc.ComposeFile { ... }`. Preserve service names, commands, builds, networks, volumes, healthchecks, dependencies, and watch rules. Use `dc.Service { ... }` for services and `dc.Env { ... }` for scalar-to-string environment conversion.
+3. Replace `${VAR}`/`.env` interpolation with explicit Nickel values or `%{...}` string interpolation. Move only genuine environment-specific inputs into `cfg`, publish it as `dockstride | not_exported = { Config = cfg }`, and keep architecture/defaults in Nickel or application code.
+4. Replace inline credentials with file-backed secrets below. Commit the definition/library, not `env.yaml`, `.dockstride/`, or credential files. Keep the old Compose file until rendered configuration and behavior are verified; do not automatically adopt/delete existing resources or data.
+5. Run `dks setup`, inspect `dks render`, then test `dks up`/`dks status` using a distinct project namespace. For production, initialize Swarm, select production mode (`prod=true` in the example below), and use registry image names reachable by every node. Check Swarm compatibility: Compose watch/build/dependencies/profiles are not production ordering guarantees; migrations need explicit deploy-workflow command actions.
+
+## Keep configuration minimal
+
+- Treat `Config` as a public API. Expose the absolute minimum: identity, deployment intent, necessary external addresses, and secret references. Adding an override later is easy; removing one breaks environments that depend on it. Do not turn every Compose literal or application setting into an editable field.
+- Prefer one `prod | Bool | doc "Enable production defaults; false selects development." | default = false` flag over independent toggles for debug, logging, watch, ports, and replicas. Derive those values locally from `env.prod`, keeping environment policy in one place. Retain required `project`/`backend` declarations; if `prod` determines the backend, select a literal Compose/Swarm backend contract from the raw flag before validating `env`, rather than exposing a second independent decision.
+- Add `| doc "..."` to **every** exposed field, including nested leaves and secrets: purpose, units/constraints, default behavior, and when to override it. Use appropriate contracts (`String`, `Bool`, `lib.Port`, `lib.Choice`, `lib.SecretSource`) and safe defaults. Annotations precede assignments: `port | lib.Port | doc "Host HTTP port." | default = 8080`.
+- Keep the rendered Compose `environment` minimal too. Let application defaults handle ordinary settings; pass only required wiring, file paths, and intentional overrides. Do not mirror the application's entire configuration surface in Compose.
+- Use small local `let` bindings, common records/functions, and `&` merges for actual repetition; avoid sprawling helper layers. Prefer native healthchecks, `depends_on`, and `develop.watch` over custom lifecycle scripts. Use a distinct outer name such as `cfg`: Nickel records are recursive, so `Config = Config` shadows itself.
+
+## File-backed and generated secrets
+
+Declare references, not credential strings, and explicitly grant each service only what it needs:
+
+```nickel
+let lib = import "libs/dockstride.ncl" in
+let inputs = {
+  prod | Bool | doc "Enable production defaults; false selects development." | default = false,
+} in
+let selected = inputs & (import "env.yaml") in
+let cfg = inputs & {
+  project | String | doc "Unique lowercase project or stack name.",
+  secrets = {
+    apiToken | lib.SecretSource | doc "Provider token; reference an existing private file.",
+    authKey | lib.SecretSource | doc "Signing key; generated once when absent.",
+  },
+} & (if selected.prod then {
+  backend | lib.Choice ["swarm"] | doc "Runtime fixed by production mode." | default = "swarm",
+} else {
+  backend | lib.Choice ["compose"] | doc "Runtime fixed by development mode." | default = "compose",
+}) in
+let env | cfg = import "env.yaml" in
+let dc = lib.forEnvironment env in
+dc.ComposeFile {
+  dockstride | not_exported = {
+    Config = cfg,
+    setup.secrets = {
+      apiToken = lib.ReferenceSecret,
+      authKey = lib.GenerateSecret { bytes = 32, encoding = "hex" },
+    },
+  },
+  secrets = env.secrets,
+  services.api = dc.Service {
+    image = "example/api:latest",
+    secrets = dc.grantSecrets [dc.secrets.apiToken, dc.secrets.authKey],
+    environment = dc.Env {
+      API_TOKEN_FILE = dc.secretPath dc.secrets.apiToken,
+      AUTH_KEY_FILE = dc.secretPath dc.secrets.authKey,
+    },
+  },
+}
+```
+
+`example/api:latest` is a placeholder; use your actual image and its supported file-input settings. `_FILE` is application behavior, not automatic Docker behavior.
+
+- Supply an existing credential with `dks setup --secret-file apiToken=/absolute/private/token`. This records the original secure file, not a copy. References in YAML look like `secrets: {apiToken: {file: /absolute/private/token}}`.
+- Files must be nonempty, current-user-owned, private, outside every repository, and accessible without symlink traversal. Use `0600` normally; ensure the declared numeric container user can actually read the mount. Compose bind-backed secrets ignore requested container uid/gid/mode; non-root consumers may need explicit restrictive `setup.secretAccess` group access, not world-readable files.
+- `lib.GenerateSecret` supports `hex`/`base64` and 16–65536 random source bytes. Generated files live outside the repository under `$XDG_DATA_HOME/dockstride/secrets/u<uid>` (fallback `~/.local/share/dockstride/secrets/u<uid>`); only references enter YAML. Setup reuses existing references and never silently regenerates a missing referenced file.
+- `lib.PromptSecret` and `lib.StdinSecret` support private byte input; `lib.ReferenceSecret` requires a file reference. Never put credentials in ordinary config, command arguments, logs, or Git.
+- Swarm publishes file-backed secrets as immutable Docker secrets and keeps current bindings in local YAML. Use explicit `dks secrets replace`/`dks secrets sync` for changes; ordinary setup is not live rotation, and old credentials are not automatically deleted.
+
+## Generate ordinary fields only when needed
+
+Use contract defaults for constants and local Nickel expressions for derived values; do not persist every derived setting. For a checkout-local host port, declare a documented `lib.Port` field and `dockstride.setup.ports.apiPort = { service = "api", target = 8000 }`; setup allocates a missing value on a local Docker target and saves it as ordinary YAML. Explicit YAML values win.
+
+For genuine discovery, declare `dockstride.commands.devDefaults = { argv = ["python3", "scripts/dev-defaults.py"] }` and `dockstride.setup.defaults = { command = "devDefaults", fields = ["project"], sources = true }`. The trusted command reads JSON context on stdin and returns JSON such as `{"schemaVersion":1,"values":{"project":"my-app"}}`. Only missing allowlisted ordinary fields are filled; secret generation belongs in `setup.secrets`, not this hook. Omit source discovery unless needed. Inspection/render/plan do not execute defaults hooks.
+
+## Further reference
+
+See `README.md` for getting started, `docs/reference.md` for exact contracts/lifecycle/security behavior, `assets/compose.ncl` for the minimal starter, and `examples/sample/compose.ncl` for a fuller example. The sample demonstrates capabilities, not a recommendation to expose all of its settings.
