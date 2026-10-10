@@ -2,3 +2,7 @@
 /dist
 /env.yaml
 /.dockstride
+
+
+*.pyc
+__pycache__/
