@@ -86,7 +86,7 @@ else: raise SystemExit(9)
         fs::set_permissions(temp.path().join("bin/docker"), fs::Permissions::from_mode(0o700)).unwrap();
         let private = serde_json::to_string(&temp.path().join("private")).unwrap();
         fs::write(root.join("compose.ncl"), format!(r#"let lib = import "libs/dockstride.ncl" in
-let contract = {{project | String, backend | lib.Backend | default = "compose", secrets.token | lib.SecretSource}} in
+let contract = {{project | String, backend | lib.Backend | default = "compose", secrets.token | lib.SecretSource | doc "Provider credential stored in a private file outside Git."}} in
 let env | contract = import "env.yaml" in
 {{dockstride | not_exported = {{Config = contract, setup.secrets.token = {policy}, setup.secretDirectory = {private}}},
 secrets = env.secrets, services.api = {{image = "alpine", user = "0", secrets = ["token"]}}}}
@@ -164,6 +164,46 @@ finally:
         child.wait_with_output().unwrap()
     }
 
+    fn interactive_command(&self, args: &[&str], response: &str) -> Output {
+        Command::new("python3").args(["-c", r#"import errno, os, pty, select, signal, sys, time
+response = sys.argv[1].encode() + b'\n'
+pid, master = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[2], sys.argv[2:])
+transcript = bytearray()
+sent = False
+deadline = time.monotonic() + 30
+try:
+    while time.monotonic() < deadline:
+        if not select.select([master], [], [], 0.1)[0]: continue
+        try:
+            chunk = os.read(master, 65536)
+        except OSError as error:
+            if error.errno == errno.EIO: break
+            raise
+        if not chunk: break
+        transcript.extend(chunk)
+        if not sent and transcript.endswith(b'(hidden): '):
+            os.write(master, response)
+            sent = True
+    else:
+        os.kill(pid, signal.SIGKILL)
+        raise RuntimeError('interactive secret prompt timed out')
+finally:
+    os.close(master)
+    _, status = os.waitpid(pid, 0)
+    sys.stdout.buffer.write(transcript)
+sys.exit(os.waitstatus_to_exitcode(status))
+"#]).arg(response).arg(env!("CARGO_BIN_EXE_dks"))
+            .arg("-C").arg(&self.root).args(args).current_dir(&self.root)
+            .env("PATH", format!("{}:{}", self.temp.path().join("bin").display(), std::env::var("PATH").unwrap()))
+            .env("FIXTURE", self.temp.path()).env("HOME", self.temp.path().join("home"))
+            .env("XDG_DATA_HOME", self.temp.path().join("data"))
+            .env_remove("DOCKER_HOST").env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_TLS_VERIFY").env_remove("DOCKER_CERT_PATH")
+            .output().unwrap()
+    }
+
     fn result(output: Output) -> Value {
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         let line = output.stdout.split(|byte| *byte == b'\n').rfind(|line| !line.is_empty()).unwrap();
@@ -185,6 +225,44 @@ finally:
     }
 }
 
+
+#[test]
+fn interactive_secret_prompts_show_field_and_doc_without_echoing_input() {
+    for (policy, label) in [("lib.ReferenceSecret", "Private secret FILE PATH (hidden)"), ("lib.PromptSecret", "Secret (hidden)")] {
+        let fixture = Fixture::new("swarm", policy);
+        let file = fixture.private_file("provider-credential", b"provider-credential-bytes");
+        let response = if policy == "lib.ReferenceSecret" { file.to_str().unwrap() } else { "provider-credential-bytes" };
+        let output = fixture.interactive_command(&["setup"], response);
+        let transcript = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{transcript}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(transcript.contains(&format!("secrets.token — Provider credential stored in a private file outside Git.\r\n{label}: ")), "{transcript}");
+        assert!(!transcript.contains(response), "secret input was echoed");
+        assert!(!transcript.contains("provider-credential-bytes"), "secret bytes were exposed");
+    }
+}
+
+#[test]
+fn interactive_secret_replacement_shows_doc_and_missing_doc_keeps_field_name() {
+    let fixture = Fixture::new("swarm", "lib.ReferenceSecret");
+    let original = fixture.private_file("original", b"original-provider-credential");
+    fixture.success(&["setup", "--secret-file", &format!("token={}", original.display())]);
+    let replacement = fixture.private_file("replacement", b"replacement-provider-credential");
+    let output = fixture.interactive_command(&["secrets", "replace", "token"], replacement.to_str().unwrap());
+    let transcript = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{transcript}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(transcript.contains("secrets.token — Provider credential stored in a private file outside Git."), "{transcript}");
+    assert!(!transcript.contains(replacement.to_str().unwrap()), "secret path was echoed");
+
+    let fixture = Fixture::new("swarm", "lib.ReferenceSecret");
+    let compose = fixture.root.join("compose.ncl");
+    let source = fs::read_to_string(&compose).unwrap();
+    fs::write(compose, source.replace(" | doc \"Provider credential stored in a private file outside Git.\"", "")).unwrap();
+    let file = fixture.private_file("credential", b"provider-credential");
+    let output = fixture.interactive_command(&["setup"], file.to_str().unwrap());
+    let transcript = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{transcript}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(transcript.contains("secrets.token\r\nPrivate secret FILE PATH (hidden): "), "{transcript}");
+}
 
 fn metadata(path: &Path) -> (u32, u32, u32, u64) {
     let value = fs::metadata(path).unwrap();

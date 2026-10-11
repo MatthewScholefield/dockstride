@@ -397,12 +397,20 @@ fn validate_source(session:&Session, reference:&Value) -> Result<()> {
     Ok(())
 }
 
+fn secret_prompt(session:&Session, name:&str, label:&str) -> String {
+    let path = format!("secrets.{name}");
+    let doc = session.fields.iter().find(|field| field.path == path)
+        .and_then(|field| field.doc.as_deref()).filter(|doc| !doc.trim().is_empty())
+        .map(|doc| format!(" — {doc}")).unwrap_or_default();
+    format!("{path}{doc}\n{label}: ")
+}
+
 fn obtain_source(session:&Session, name:&str, policy:&Value, input:Option<&SecretInput>, non_interactive:bool, stdin_used:&mut bool) -> Result<Value> {
     if matches!(input,Some(SecretInput::File(_))) || policy_kind(policy) == "reference" {
-        return obtain_reference(&session.root,input,non_interactive);
+        return obtain_reference(&session.root,input,non_interactive,&secret_prompt(session,name,"Private secret FILE PATH (hidden)"));
     }
     let bytes = match input { Some(SecretInput::Stdin) => read_stdin(stdin_used)?,
-        Some(SecretInput::File(_)) => unreachable!(), None => obtain(policy,non_interactive,stdin_used)? };
+        Some(SecretInput::File(_)) => unreachable!(), None => obtain(policy,non_interactive,stdin_used,&secret_prompt(session,name,"Secret (hidden)"))? };
     if session.backend == "compose" { local_scope(session)?; }
     let directory = private_directory(session,true)?;
     let path = directory.join(format!("{name}--{}",state::random_id()?));
@@ -523,13 +531,13 @@ pub fn preflight_inputs(root:&Path, inputs:&BTreeMap<String,SecretInput>, candid
     Ok(())
 }
 
-fn obtain_reference(root:&Path,input:Option<&SecretInput>, non_interactive:bool) -> Result<Value> {
+fn obtain_reference(root:&Path,input:Option<&SecretInput>, non_interactive:bool, prompt:&str) -> Result<Value> {
     let path = match input {
         Some(SecretInput::File(path)) => path.clone(),
         Some(SecretInput::Stdin) => bail!("reference secrets require a private file path, not stdin"),
         None => {
             ensure!(!non_interactive && std::io::stdin().is_terminal(),"reference secret requires --secret-file NAME=PATH");
-            PathBuf::from(rpassword::prompt_password("Private secret FILE PATH (hidden): ")?)
+            PathBuf::from(rpassword::prompt_password(prompt)?)
         }
     };
     ensure!(!path.as_os_str().as_bytes().split(|byte| *byte == b'/').any(|part| part == b".." || part == b"."),
@@ -540,7 +548,7 @@ fn obtain_reference(root:&Path,input:Option<&SecretInput>, non_interactive:bool)
     Ok(json!({"file":sources::portable_home(&path)}))
 }
 
-fn obtain(policy:&Value,non_interactive:bool,stdin_used:&mut bool) -> Result<Vec<u8>> {
+fn obtain(policy:&Value,non_interactive:bool,stdin_used:&mut bool,prompt:&str) -> Result<Vec<u8>> {
     let bytes = match policy_kind(policy) {
         "generate" => {
             let size = policy.get("bytes").and_then(Value::as_u64).unwrap_or(32);
@@ -555,7 +563,7 @@ fn obtain(policy:&Value,non_interactive:bool,stdin_used:&mut bool) -> Result<Vec
         "stdin" => read_stdin(stdin_used)?,
         "prompt" => {
             ensure!(!non_interactive && std::io::stdin().is_terminal(),"secret input required; supply an original file/stdin input or a hidden prompt");
-            rpassword::prompt_password("Secret (hidden): ")?.into_bytes()
+            rpassword::prompt_password(prompt)?.into_bytes()
         }
         _ => bail!("unknown secret provisioning policy"),
     };
