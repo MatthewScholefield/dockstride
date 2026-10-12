@@ -1,10 +1,15 @@
 //! Docker CLI execution and explicit, ownership-scoped Compose workflows.
-use crate::{model::Project, output::Output, state};
+use crate::{
+    crash_loop::{CrashLoopPolicy, CrashLoopTracker},
+    model::Project,
+    output::Output,
+    state,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
 #[cfg(test)]
 use std::fs;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     ffi::OsString,
@@ -13,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, LazyLock, OnceLock,
+        Arc, LazyLock, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -74,7 +79,10 @@ impl std::error::Error for DockerError {}
 pub(crate) struct DeadlineExceeded;
 impl std::fmt::Display for DeadlineExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Command deadline exceeded; stopped consumers remain stopped and completed operations remain")
+        write!(
+            f,
+            "Command deadline exceeded; stopped consumers remain stopped and completed operations remain"
+        )
     }
 }
 impl std::error::Error for DeadlineExceeded {}
@@ -84,10 +92,13 @@ impl std::error::Error for DeadlineExceeded {}
 pub struct PrerequisiteFailed(pub Value);
 impl std::fmt::Display for PrerequisiteFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Prerequisite {} failed with observed exit code {}; inspect dks logs {}",
+        write!(
+            f,
+            "Prerequisite {} failed with observed exit code {}; inspect dks logs {}",
             self.0["service"].as_str().unwrap_or("unknown"),
             self.0["exitCode"],
-            self.0["service"].as_str().unwrap_or("unknown"))
+            self.0["service"].as_str().unwrap_or("unknown")
+        )
     }
 }
 impl std::error::Error for PrerequisiteFailed {}
@@ -214,6 +225,7 @@ fn stream_output<R: Read>(
     output: Output,
     phase: &'static str,
     retain_tail: bool,
+    activity: Option<&Mutex<Instant>>,
 ) -> Vec<u8> {
     // read_until is capped by take, including malformed giant output lines.
     let mut reader = BufReader::new(reader);
@@ -227,6 +239,11 @@ fn stream_output<R: Read>(
         {
             Ok(0) | Err(_) => break,
             Ok(_) => {
+                if let Some(activity) = activity {
+                    if let Ok(mut last) = activity.lock() {
+                        *last = Instant::now();
+                    }
+                }
                 let message = String::from_utf8_lossy(&bytes);
                 let _ = output.event(phase, message.trim_end());
                 if retain_tail {
@@ -245,7 +262,7 @@ pub(crate) fn streaming<R: Read + Send + 'static>(
     phase: &'static str,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        stream_output(reader, output, phase, false);
+        stream_output(reader, output, phase, false, None);
     })
 }
 
@@ -296,14 +313,26 @@ impl Docker {
     }
     pub(crate) fn with_deadline(&self, deadline: Instant) -> Self {
         let mut docker = self.clone();
-        docker.deadline = Some(self.deadline.map_or(deadline, |existing| existing.min(deadline)));
+        docker.deadline = Some(
+            self.deadline
+                .map_or(deadline, |existing| existing.min(deadline)),
+        );
         docker
     }
     /// Diagnostics have one fresh, bounded phase on the captured connection,
     /// even when the lifecycle phase exhausted its own deadline.
+    pub(crate) fn with_timeout(&self, timeout: u64) -> Self {
+        if timeout == 0 {
+            self.clone()
+        } else {
+            self.with_deadline(Instant::now() + Duration::from_secs(timeout))
+        }
+    }
     pub(crate) fn for_diagnostics(&self, timeout: u64) -> Self {
         let mut docker = self.clone();
-        docker.deadline = Some(Instant::now() + Duration::from_secs(timeout.min(10)));
+        docker.deadline = Some(
+            Instant::now() + Duration::from_secs(if timeout == 0 { 10 } else { timeout.min(10) }),
+        );
         docker
     }
     pub(crate) fn remaining(&self, limit: Duration) -> Result<Duration> {
@@ -311,7 +340,9 @@ impl Docker {
         let remaining = self.deadline.map_or(limit, |deadline| {
             limit.min(deadline.saturating_duration_since(Instant::now()))
         });
-        if remaining.is_zero() { return Err(DeadlineExceeded.into()); }
+        if remaining.is_zero() {
+            return Err(DeadlineExceeded.into());
+        }
         Ok(remaining)
     }
     fn with_profiles(&self, profiles: &[String]) -> Self {
@@ -418,7 +449,9 @@ impl Docker {
         if args.first().is_some_and(|arg| arg == "compose")
             && let Some(profiles) = &self.profiles
         {
-            command.env("COMPOSE_PROFILES", profiles.join(",")).arg("compose");
+            command
+                .env("COMPOSE_PROFILES", profiles.join(","))
+                .arg("compose");
             for profile in profiles.iter() {
                 command.args(["--profile", profile]);
             }
@@ -450,7 +483,7 @@ impl Docker {
         Ok(())
     }
     pub fn capture(&self, args: &[String], stdin: Option<&[u8]>) -> Result<String> {
-        self.capture_timeout(args, stdin, 300)
+        self.capture_timeout(args, stdin, 30)
     }
     pub fn capture_timeout(
         &self,
@@ -468,7 +501,7 @@ impl Docker {
         timeout: u64,
     ) -> Result<String> {
         interrupted()?;
-        self.remaining(Duration::from_secs(timeout.max(1)))?;
+        self.remaining(Duration::from_secs(if timeout == 0 { 30 } else { timeout }))?;
         let mut child = command
             .stdin(if stdin.is_some() {
                 Stdio::piped()
@@ -513,8 +546,17 @@ impl Docker {
         self.run_timeout(args, stdin, 0)
     }
     pub fn run_timeout(&self, args: &[String], stdin: Option<&[u8]>, timeout: u64) -> Result<()> {
+        self.run_mode(args, stdin, timeout, true)
+    }
+    fn run_mode(
+        &self,
+        args: &[String],
+        stdin: Option<&[u8]>,
+        timeout: u64,
+        progress: bool,
+    ) -> Result<()> {
         interrupted()?;
-        self.remaining(Duration::from_secs(timeout.max(1)))?;
+        self.remaining(Duration::from_secs(if timeout == 0 { 30 } else { timeout }))?;
         let mut child = self
             .command(args)?
             .stdin(if stdin.is_some() {
@@ -526,16 +568,23 @@ impl Docker {
             .stderr(Stdio::piped())
             .spawn()
             .context("Cannot start Docker")?;
-        let out = streaming(child.stdout.take().unwrap(), self.output.clone(), "docker");
+        let activity = Arc::new(Mutex::new(Instant::now()));
+        let stdout = child.stdout.take().unwrap();
+        let output = self.output.clone();
+        let active = activity.clone();
+        let out =
+            thread::spawn(move || stream_output(stdout, output, "docker", false, Some(&active)));
         let stderr = child.stderr.take().unwrap();
         let output = self.output.clone();
-        let err = thread::spawn(move || stream_output(stderr, output, "docker", true));
+        let active = activity.clone();
+        let err =
+            thread::spawn(move || stream_output(stderr, output, "docker", true, Some(&active)));
         thread::scope(|scope| {
             let writer = stdin.map(|bytes| {
                 let mut pipe = child.stdin.take().unwrap();
                 scope.spawn(move || pipe.write_all(bytes))
             });
-            let result = self.wait(&mut child, timeout);
+            let result = self.wait_mode(&mut child, timeout, true, progress.then_some(&*activity));
             let _ = out.join();
             let stderr = err
                 .join()
@@ -559,7 +608,7 @@ impl Docker {
     /// Preserve raw output and the foreground TTY for explicitly native commands.
     pub fn native(&self, args: &[String], stdin: Option<&[u8]>) -> Result<()> {
         if self.output.json {
-            return self.run(args, stdin);
+            return self.run_mode(args, stdin, 0, false);
         }
         interrupted()?;
         let group = unsafe { libc::getpgrp() };
@@ -580,7 +629,7 @@ impl Docker {
                 let mut pipe = child.stdin.take().unwrap();
                 scope.spawn(move || pipe.write_all(bytes))
             });
-            let result = self.wait_mode(&mut child, 0, false);
+            let result = self.wait_mode(&mut child, 0, false, None);
             let status = result?;
             if !status.success() {
                 return Err(docker_error(
@@ -598,13 +647,14 @@ impl Docker {
         })
     }
     pub(crate) fn wait(&self, child: &mut Child, timeout: u64) -> Result<std::process::ExitStatus> {
-        self.wait_mode(child, timeout, true)
+        self.wait_mode(child, timeout, true, None)
     }
     fn wait_mode(
         &self,
         child: &mut Child,
         timeout: u64,
         isolated: bool,
+        activity: Option<&Mutex<Instant>>,
     ) -> Result<std::process::ExitStatus> {
         let deadline = if timeout == 0 {
             self.deadline
@@ -613,6 +663,8 @@ impl Docker {
             Some(self.deadline.map_or(local, |deadline| deadline.min(local)))
         };
         let flag = cancellation()?;
+        let started = Instant::now();
+        let mut reported = started;
         loop {
             if flag.load(Ordering::Relaxed) {
                 terminate_mode(child, isolated);
@@ -620,8 +672,14 @@ impl Docker {
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 // At the absolute deadline there is no remaining grace budget.
-                let target = if isolated { -(child.id() as i32) } else { child.id() as i32 };
-                unsafe { libc::kill(target, libc::SIGKILL); }
+                let target = if isolated {
+                    -(child.id() as i32)
+                } else {
+                    child.id() as i32
+                };
+                unsafe {
+                    libc::kill(target, libc::SIGKILL);
+                }
                 let _ = child.wait();
                 return Err(DeadlineExceeded.into());
             }
@@ -633,6 +691,25 @@ impl Docker {
                     }
                 }
                 return Ok(status);
+            }
+            if let Some(activity) =
+                activity.filter(|_| reported.elapsed() >= Duration::from_secs(30))
+            {
+                let silent = activity
+                    .lock()
+                    .map(|last| last.elapsed().as_secs())
+                    .unwrap_or(0);
+                if let Err(error) = self.output.event(
+                    "docker",
+                    &format!(
+                        "Still working ({}s elapsed; {silent}s without output)",
+                        started.elapsed().as_secs()
+                    ),
+                ) {
+                    terminate_mode(child, isolated);
+                    return Err(error);
+                }
+                reported = Instant::now();
             }
             let pause = deadline.map_or(Duration::from_millis(50), |deadline| {
                 Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now()))
@@ -683,7 +760,11 @@ pub fn compose_args(project: &Project, file: &Path) -> Result<Vec<String>> {
 pub fn validate_ownership(project: &Project, docker: &Docker) -> Result<()> {
     validate_ownership_except_volumes(project, docker, &BTreeSet::new())
 }
-fn validate_ownership_except_volumes(project: &Project, docker: &Docker, adopting: &BTreeSet<String>) -> Result<()> {
+fn validate_ownership_except_volumes(
+    project: &Project,
+    docker: &Docker,
+    adopting: &BTreeSet<String>,
+) -> Result<()> {
     let id = project.owner()?;
     let name = project.name()?;
     let swarm = project.backend()? == "swarm";
@@ -702,7 +783,11 @@ fn validate_ownership_except_volumes(project: &Project, docker: &Docker, adoptin
         ),
     ] {
         let filters: &[&str] = if swarm {
-            &["com.docker.compose.project", "com.docker.stack.namespace", PROJECT]
+            &[
+                "com.docker.compose.project",
+                "com.docker.stack.namespace",
+                PROJECT,
+            ]
         } else {
             &[filter]
         };
@@ -711,14 +796,25 @@ fn validate_ownership_except_volumes(project: &Project, docker: &Docker, adoptin
             if kind == "volume" && adopting.contains(resource) {
                 continue;
             }
-            let field = if kind == "volume" { "volumes" } else { "networks" };
+            let field = if kind == "volume" {
+                "volumes"
+            } else {
+                "networks"
+            };
             if kind != "container"
                 && let Some(definitions) = model[field].as_object()
-                && definitions.values().any(|definition| definition["external"] == true)
+                && definitions
+                    .values()
+                    .any(|definition| definition["external"] == true)
             {
-                let actual_name = docker.capture(&strings(&[kind, "inspect", resource, "--format", "{{.Name}}"]), None)?;
-                if definitions.iter().any(|(logical, definition)| definition["external"] == true
-                    && definition["name"].as_str().unwrap_or(logical) == actual_name.trim()) {
+                let actual_name = docker.capture(
+                    &strings(&[kind, "inspect", resource, "--format", "{{.Name}}"]),
+                    None,
+                )?;
+                if definitions.iter().any(|(logical, definition)| {
+                    definition["external"] == true
+                        && definition["name"].as_str().unwrap_or(logical) == actual_name.trim()
+                }) {
                     continue;
                 }
             }
@@ -737,15 +833,19 @@ fn validate_ownership_except_volumes(project: &Project, docker: &Docker, adoptin
                 None,
             )?;
             let labels: Value = serde_json::from_str(&labels)?;
-            if !filters.iter().any(|filter| labels[*filter].as_str() == Some(name)) {
+            if !filters
+                .iter()
+                .any(|filter| labels[*filter].as_str() == Some(name))
+            {
                 continue;
             }
-            let owned = labels[OWNER].as_str() == Some(id)
-                && labels[PROJECT].as_str() == Some(name);
+            let owned =
+                labels[OWNER].as_str() == Some(id) && labels[PROJECT].as_str() == Some(name);
             ensure!(
                 owned,
                 "Foreign {kind} {resource} occupies project {name}; observed owner {:?}, expected {id}{}",
-                labels[OWNER].as_str(), volume_adoption_hint(kind)
+                labels[OWNER].as_str(),
+                volume_adoption_hint(kind)
             );
         }
     }
@@ -774,7 +874,9 @@ fn validate_ownership_except_volumes(project: &Project, docker: &Docker, adoptin
                 )?)?;
                 ensure!(
                     labels[OWNER].as_str() == Some(id) && labels[PROJECT].as_str() == Some(name),
-                    "Foreign {kind} {expected} occupies a declared managed resource name; observed owner {:?}, expected {id}{}", labels[OWNER].as_str(), volume_adoption_hint(kind)
+                    "Foreign {kind} {expected} occupies a declared managed resource name; observed owner {:?}, expected {id}{}",
+                    labels[OWNER].as_str(),
+                    volume_adoption_hint(kind)
                 );
             }
         }
@@ -791,36 +893,69 @@ fn validate_ownership_except_volumes(project: &Project, docker: &Docker, adoptin
         for kind in ["service", "secret", "config"] {
             let filters: &[&str] = if kind == "secret" {
                 &["com.docker.stack.namespace"]
-            } else { &["com.docker.stack.namespace", PROJECT] };
+            } else {
+                &["com.docker.stack.namespace", PROJECT]
+            };
             let resources = namespace_resources(docker, &[kind, "ls", "-q"], name, filters)?;
             for resource in &resources {
                 let labels: Value = serde_json::from_str(&docker.capture(
-                    &strings(&[kind, "inspect", resource, "--format", "{{json .Spec.Labels}}"]),
+                    &strings(&[
+                        kind,
+                        "inspect",
+                        resource,
+                        "--format",
+                        "{{json .Spec.Labels}}",
+                    ]),
                     None,
                 )?)?;
-                if !filters.iter().any(|filter| labels[*filter].as_str() == Some(name)) {
+                if !filters
+                    .iter()
+                    .any(|filter| labels[*filter].as_str() == Some(name))
+                {
                     continue;
                 }
-                ensure!(labels[OWNER].as_str() == Some(id) && labels[PROJECT].as_str() == Some(name),
-                    "Foreign Swarm {kind} {resource} occupies stack {name}; observed owner {:?}, expected {id}", labels[OWNER].as_str());
+                ensure!(
+                    labels[OWNER].as_str() == Some(id) && labels[PROJECT].as_str() == Some(name),
+                    "Foreign Swarm {kind} {resource} occupies stack {name}; observed owner {:?}, expected {id}",
+                    labels[OWNER].as_str()
+                );
             }
         }
         if let Some(secrets) = model["secrets"].as_object()
-            && project.swarm_secrets.keys().any(|logical| secrets.get(logical).is_some_and(|reference| reference.get("file").is_some()))
+            && project.swarm_secrets.keys().any(|logical| {
+                secrets
+                    .get(logical)
+                    .is_some_and(|reference| reference.get("file").is_some())
+            })
         {
-            let existing = docker.capture(&strings(&["secret", "ls", "--format", "{{.Name}}"]), None)?;
+            let existing =
+                docker.capture(&strings(&["secret", "ls", "--format", "{{.Name}}"]), None)?;
             let existing: HashSet<&str> = existing.lines().collect();
             for (logical, binding) in &project.swarm_secrets {
-                if !secrets.get(logical).is_some_and(|reference| reference.get("file").is_some())
-                    || !existing.contains(binding.as_str()) {
+                if !secrets
+                    .get(logical)
+                    .is_some_and(|reference| reference.get("file").is_some())
+                    || !existing.contains(binding.as_str())
+                {
                     continue;
                 }
                 let labels: Value = serde_json::from_str(&docker.capture(
-                    &strings(&["secret", "inspect", binding, "--format", "{{json .Spec.Labels}}"]), None)?)?;
-                ensure!(labels[OWNER].as_str() == Some(id) && labels[PROJECT].as_str() == Some(name)
-                    && labels["io.dockstride.secret"].as_str() == Some(logical),
+                    &strings(&[
+                        "secret",
+                        "inspect",
+                        binding,
+                        "--format",
+                        "{{json .Spec.Labels}}",
+                    ]),
+                    None,
+                )?)?;
+                ensure!(
+                    labels[OWNER].as_str() == Some(id)
+                        && labels[PROJECT].as_str() == Some(name)
+                        && labels["io.dockstride.secret"].as_str() == Some(logical),
                     "Foreign Swarm secret {binding} occupies current binding {logical}; observed owner {:?}, expected {id}",
-                    labels[OWNER].as_str());
+                    labels[OWNER].as_str()
+                );
             }
         }
     }
@@ -837,38 +972,67 @@ fn volume_adoption_hint(kind: &str) -> &'static str {
 pub fn adopt_existing_volumes(root: &Path, timeout: u64, output: &Output) -> Result<()> {
     let _lock = state::lock(root, "lifecycle")?;
     let project = crate::nickel::evaluate(root, None)?;
-    ensure!(project.backend()? == "compose", "--adopt-existing-volumes requires the Compose backend");
-    let docker = Docker::new(root, output.clone()).with_deadline(Instant::now() + Duration::from_secs(timeout.max(1)));
+    ensure!(
+        project.backend()? == "compose",
+        "--adopt-existing-volumes requires the Compose backend"
+    );
+    let docker = Docker::new(root, output.clone()).with_timeout(timeout);
     docker.check()?;
     let model = render_document(&project, "compose")?;
     let existing = docker.capture(&strings(&["volume", "ls", "--format", "{{.Name}}"]), None)?;
     let existing: HashSet<&str> = existing.lines().collect();
     let mut candidates = Vec::new();
-    for (logical, definition) in model["volumes"].as_object().into_iter().flat_map(|volumes| volumes.iter()) {
+    for (logical, definition) in model["volumes"]
+        .as_object()
+        .into_iter()
+        .flat_map(|volumes| volumes.iter())
+    {
         if definition["external"] == true {
             continue;
         }
-        let name = definition["name"].as_str().map(str::to_owned)
+        let name = definition["name"]
+            .as_str()
+            .map(str::to_owned)
             .unwrap_or_else(|| format!("{}_{}", project.name().unwrap(), logical));
         if !existing.contains(name.as_str()) {
             continue;
         }
-        let inspected: Vec<Value> = serde_json::from_str(&docker.capture(&strings(&["volume", "inspect", &name]), None)?)?;
-        let volume = inspected.first().context("Volume inspection returned no volume")?;
+        let inspected: Vec<Value> =
+            serde_json::from_str(&docker.capture(&strings(&["volume", "inspect", &name]), None)?)?;
+        let volume = inspected
+            .first()
+            .context("Volume inspection returned no volume")?;
         if volume["Labels"][OWNER].as_str() == Some(project.owner()?)
-            && volume["Labels"][PROJECT].as_str() == Some(project.name()?) {
+            && volume["Labels"][PROJECT].as_str() == Some(project.name()?)
+        {
             continue;
         }
-        ensure!(volume["Driver"] == "local"
-            && volume["Options"].as_object().is_none_or(Map::is_empty)
-            && definition["driver"].as_str().is_none_or(|driver| driver == "local")
-            && definition["driver_opts"].as_object().is_none_or(Map::is_empty),
-            "Cannot adopt volume {name}: only local volumes without driver options are supported");
-        let attached = docker.capture(&strings(&["ps", "-aq", "--filter", &format!("volume={name}")]), None)?;
-        ensure!(attached.trim().is_empty(),
-            "Cannot adopt volume {name}: remove attached containers first (stop alone is insufficient); do not remove their volumes");
+        ensure!(
+            volume["Driver"] == "local"
+                && volume["Options"].as_object().is_none_or(Map::is_empty)
+                && definition["driver"]
+                    .as_str()
+                    .is_none_or(|driver| driver == "local")
+                && definition["driver_opts"]
+                    .as_object()
+                    .is_none_or(Map::is_empty),
+            "Cannot adopt volume {name}: only local volumes without driver options are supported"
+        );
+        let attached = docker.capture(
+            &strings(&["ps", "-aq", "--filter", &format!("volume={name}")]),
+            None,
+        )?;
+        ensure!(
+            attached.trim().is_empty(),
+            "Cannot adopt volume {name}: remove attached containers first (stop alone is insufficient); do not remove their volumes"
+        );
         let mut labels = volume["Labels"].as_object().cloned().unwrap_or_default();
-        labels.extend(definition["labels"].as_object().context("Missing managed volume labels")?.clone());
+        labels.extend(
+            definition["labels"]
+                .as_object()
+                .context("Missing managed volume labels")?
+                .clone(),
+        );
         labels.insert("com.docker.compose.project".into(), json!(project.name()?));
         labels.insert("com.docker.compose.volume".into(), json!(logical));
         candidates.push((name, labels));
@@ -877,14 +1041,23 @@ pub fn adopt_existing_volumes(root: &Path, timeout: u64, output: &Output) -> Res
     validate_ownership_except_volumes(&project, &docker, &adopting)?;
     for (name, labels) in candidates {
         let backup = format!("dks-volume-adoption-{}", state::random_id()?);
-        output.event("volumes", &format!("Adopting {name}; temporary backup {backup}"))?;
+        output.event(
+            "volumes",
+            &format!("Adopting {name}; temporary backup {backup}"),
+        )?;
         docker.run(&strings(&["volume", "create", &backup]), None)?;
         let migration = (|| -> Result<()> {
             copy_volume(&docker, &name, &backup)?;
             docker.run(&strings(&["volume", "rm", &name]), None)?;
             let mut create = strings(&["volume", "create", "--driver", "local"]);
             for (key, value) in labels {
-                create.extend(strings(&["--label", &format!("{key}={}", value.as_str().context("Volume label must be a string")?)]));
+                create.extend(strings(&[
+                    "--label",
+                    &format!(
+                        "{key}={}",
+                        value.as_str().context("Volume label must be a string")?
+                    ),
+                ]));
             }
             create.push(name.clone());
             docker.run(&create, None)?;
@@ -893,18 +1066,36 @@ pub fn adopt_existing_volumes(root: &Path, timeout: u64, output: &Output) -> Res
             Ok(())
         })();
         migration.with_context(|| format!("Volume adoption failed for {name}; temporary volume {backup} retained for recovery (backup may be incomplete if the first copy failed)"))?;
-        output.event("volumes", &format!("Adopted {name}; dks destroy can now remove this managed volume"))?;
+        output.event(
+            "volumes",
+            &format!("Adopted {name}; dks destroy can now remove this managed volume"),
+        )?;
     }
     validate_ownership(&project, &docker)
 }
 
 fn copy_volume(docker: &Docker, source: &str, destination: &str) -> Result<()> {
-    docker.run(&strings(&[
-        "run", "--rm", "--network", "none", "--user", "0:0",
-        "--mount", &format!("type=volume,src={source},dst=/from,readonly,volume-nocopy"),
-        "--mount", &format!("type=volume,src={destination},dst=/to,volume-nocopy"),
-        "--entrypoint", "cp", "alpine:3.23", "-a", "/from/.", "/to/",
-    ]), None)
+    docker.run(
+        &strings(&[
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--user",
+            "0:0",
+            "--mount",
+            &format!("type=volume,src={source},dst=/from,readonly,volume-nocopy"),
+            "--mount",
+            &format!("type=volume,src={destination},dst=/to,volume-nocopy"),
+            "--entrypoint",
+            "cp",
+            "alpine:3.23",
+            "-a",
+            "/from/.",
+            "/to/",
+        ]),
+        None,
+    )
 }
 
 pub fn doctor(project: &Project, output: &Output) -> Result<Value> {
@@ -1001,31 +1192,81 @@ struct Dependency<'a> {
     restart: bool,
 }
 fn dependencies(service: &Value) -> Result<Vec<Dependency<'_>>> {
-    let Some(depends) = service.get("depends_on") else { return Ok(Vec::new()) };
+    let Some(depends) = service.get("depends_on") else {
+        return Ok(Vec::new());
+    };
     if let Some(list) = depends.as_array() {
-        return list.iter().map(|name| Ok(Dependency {
-            service: name.as_str().context("depends_on entries must be strings")?,
-            condition: "service_started", required: true, restart: false,
-        })).collect();
+        return list
+            .iter()
+            .map(|name| {
+                Ok(Dependency {
+                    service: name
+                        .as_str()
+                        .context("depends_on entries must be strings")?,
+                    condition: "service_started",
+                    required: true,
+                    restart: false,
+                })
+            })
+            .collect();
     }
-    depends.as_object().context("depends_on must be a mapping or list")?.iter().map(|(name, value)| {
-        ensure!(value.is_object(), "Dependency {name} must be an object");
-        for field in ["required", "restart"] {
-            ensure!(value.get(field).is_none_or(Value::is_boolean), "Dependency {name} {field} must be boolean");
-        }
-        let condition = value.get("condition").map_or(Ok("service_started"), |v| v.as_str().context("Dependency condition must be a string"))?;
-        ensure!(["service_started", "service_healthy", "service_completed_successfully"].contains(&condition), "Unsupported dependency condition {condition}");
-        Ok(Dependency { service: name, condition, required: value["required"] != false, restart: value["restart"] == true })
-    }).collect()
+    depends
+        .as_object()
+        .context("depends_on must be a mapping or list")?
+        .iter()
+        .map(|(name, value)| {
+            ensure!(value.is_object(), "Dependency {name} must be an object");
+            for field in ["required", "restart"] {
+                ensure!(
+                    value.get(field).is_none_or(Value::is_boolean),
+                    "Dependency {name} {field} must be boolean"
+                );
+            }
+            let condition = value.get("condition").map_or(Ok("service_started"), |v| {
+                v.as_str().context("Dependency condition must be a string")
+            })?;
+            ensure!(
+                [
+                    "service_started",
+                    "service_healthy",
+                    "service_completed_successfully"
+                ]
+                .contains(&condition),
+                "Unsupported dependency condition {condition}"
+            );
+            Ok(Dependency {
+                service: name,
+                condition,
+                required: value["required"] != false,
+                restart: value["restart"] == true,
+            })
+        })
+        .collect()
 }
 fn dependency_order(project: &Project, scope: &[String]) -> Result<Vec<String>> {
     dependency_order_scoped(project, scope, scope)
 }
-fn dependency_order_scoped(project: &Project, roots: &[String], optional_scope: &[String]) -> Result<Vec<String>> {
-    fn visit(name: &str, services: &Map<String, Value>, scope: &HashSet<&str>, visiting: &mut HashSet<String>, done: &mut HashSet<String>, ordered: &mut Vec<String>) -> Result<()> {
+fn dependency_order_scoped(
+    project: &Project,
+    roots: &[String],
+    optional_scope: &[String],
+) -> Result<Vec<String>> {
+    fn visit(
+        name: &str,
+        services: &Map<String, Value>,
+        scope: &HashSet<&str>,
+        visiting: &mut HashSet<String>,
+        done: &mut HashSet<String>,
+        ordered: &mut Vec<String>,
+    ) -> Result<()> {
         ensure!(services.contains_key(name), "Unknown service {name}");
-        if done.contains(name) { return Ok(()) }
-        ensure!(visiting.insert(name.into()), "Dependency cycle involving {name}");
+        if done.contains(name) {
+            return Ok(());
+        }
+        ensure!(
+            visiting.insert(name.into()),
+            "Dependency cycle involving {name}"
+        );
         for dependency in dependencies(&services[name])? {
             if dependency.required || scope.contains(dependency.service) {
                 visit(dependency.service, services, scope, visiting, done, ordered)?;
@@ -1040,14 +1281,23 @@ fn dependency_order_scoped(project: &Project, roots: &[String], optional_scope: 
     let mut done = HashSet::new();
     let scope_set = optional_scope.iter().map(String::as_str).collect();
     for name in roots {
-        visit(name, project.services()?, &scope_set, &mut HashSet::new(), &mut done, &mut ordered)
-            .context("Invalid Compose dependency configuration")?;
+        visit(
+            name,
+            project.services()?,
+            &scope_set,
+            &mut HashSet::new(),
+            &mut done,
+            &mut ordered,
+        )
+        .context("Invalid Compose dependency configuration")?;
     }
     Ok(ordered)
 }
 fn valid_profile(name: &str) -> bool {
     let mut bytes = name.bytes();
-    bytes.next().is_some_and(|byte| byte.is_ascii_alphanumeric())
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
 }
 fn active_profiles(flags: &[String]) -> Result<Vec<String>> {
@@ -1055,20 +1305,38 @@ fn active_profiles(flags: &[String]) -> Result<Vec<String>> {
     let mut profiles: BTreeSet<String> = flags.iter().cloned().collect();
     if let Some(value) = &environment {
         let value = value.to_str().context("COMPOSE_PROFILES must be UTF-8")?;
-        profiles.extend(value.split(',').map(str::trim).filter(|name| !name.is_empty()).map(str::to_owned));
+        profiles.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
+        );
     }
     for name in &profiles {
-        ensure!(name == "*" || valid_profile(name), "Invalid Compose profile {name:?}");
+        ensure!(
+            name == "*" || valid_profile(name),
+            "Invalid Compose profile {name:?}"
+        );
     }
     Ok(profiles.into_iter().collect())
 }
-fn selected_services_with_profiles(project: &Project, selected: &[String], profiles: &[String]) -> Result<Vec<String>> {
+fn selected_services_with_profiles(
+    project: &Project,
+    selected: &[String],
+    profiles: &[String],
+) -> Result<Vec<String>> {
     let services = project.services()?;
     for (name, service) in services {
         if let Some(value) = service.get("profiles") {
-            let declared = value.as_array().with_context(|| format!("Service {name} profiles must be a string list"))?;
+            let declared = value
+                .as_array()
+                .with_context(|| format!("Service {name} profiles must be a string list"))?;
             for profile in declared {
-                ensure!(profile.as_str().is_some_and(valid_profile), "Service {name} has invalid profile {profile}");
+                ensure!(
+                    profile.as_str().is_some_and(valid_profile),
+                    "Service {name} has invalid profile {profile}"
+                );
             }
         }
     }
@@ -1076,13 +1344,24 @@ fn selected_services_with_profiles(project: &Project, selected: &[String], profi
     let all: Vec<_> = services.keys().cloned().collect();
     dependency_order_scoped(project, &all, &all)?;
     let initial: Vec<String> = if selected.is_empty() {
-        services.iter().filter(|(_, service)| {
-            service["profiles"].as_array().is_none_or(|declared| {
-                declared.is_empty() || profiles.iter().any(|active| active == "*"
-                    || declared.iter().any(|profile| profile.as_str() == Some(active.as_str())))
+        services
+            .iter()
+            .filter(|(_, service)| {
+                service["profiles"].as_array().is_none_or(|declared| {
+                    declared.is_empty()
+                        || profiles.iter().any(|active| {
+                            active == "*"
+                                || declared
+                                    .iter()
+                                    .any(|profile| profile.as_str() == Some(active.as_str()))
+                        })
+                })
             })
-        }).map(|(name, _)| name.clone()).collect()
-    } else { selected.to_vec() };
+            .map(|(name, _)| name.clone())
+            .collect()
+    } else {
+        selected.to_vec()
+    };
     let mut scope = dependency_order(project, &initial)?;
     // Optional edges only participate when both endpoints are already required.
     dependency_order(project, &scope)?;
@@ -1099,15 +1378,25 @@ fn applicable(action: &Value, workflow: &str, selected: &[String]) -> bool {
         .is_none_or(|list| list.is_empty() || list.iter().any(|v| v.as_str() == Some(workflow)))
         && services.is_none_or(|list| {
             list.is_empty()
-                || list.iter().any(|v| v.as_str().is_some_and(|s| selected.iter().any(|n| n == s)))
+                || list
+                    .iter()
+                    .any(|v| v.as_str().is_some_and(|s| selected.iter().any(|n| n == s)))
         })
 }
 /// Validate declarations without side effects and select actions against the
 /// required Compose dependency scope (Swarm retains explicit selection).
-pub fn planned_actions<'a>(project: &'a Project, workflow: &str, selected: &[String]) -> Result<Vec<&'a Value>> {
+pub fn planned_actions<'a>(
+    project: &'a Project,
+    workflow: &str,
+    selected: &[String],
+) -> Result<Vec<&'a Value>> {
     validate_actions(project, workflow, selected).context("Invalid workflow configuration")
 }
-fn validate_actions<'a>(project: &'a Project, workflow: &str, selected: &[String]) -> Result<Vec<&'a Value>> {
+fn validate_actions<'a>(
+    project: &'a Project,
+    workflow: &str,
+    selected: &[String],
+) -> Result<Vec<&'a Value>> {
     let compose = project.backend()? == "compose";
     let scope = if compose {
         // Validate even inactive portions before any action can stop consumers.
@@ -1115,128 +1404,257 @@ fn validate_actions<'a>(project: &'a Project, workflow: &str, selected: &[String
         dependency_order_scoped(project, &all, &[])?;
         selected_services(project, selected)?
     } else {
-        for name in selected { ensure!(project.services()?.contains_key(name), "Unknown service {name}"); }
+        for name in selected {
+            ensure!(
+                project.services()?.contains_key(name),
+                "Unknown service {name}"
+            );
+        }
         selected.to_vec()
     };
-    let Some(value) = project.metadata.get("actions") else { return Ok(Vec::new()) };
-    let list = value.as_array().context("dockstride.actions must be an ordered array")?;
+    let Some(value) = project.metadata.get("actions") else {
+        return Ok(Vec::new());
+    };
+    let list = value
+        .as_array()
+        .context("dockstride.actions must be an ordered array")?;
     let applies = |action: &Value| {
-        if !compose && workflow == "deploy" && !action["workflows"].as_array().is_some_and(|list| list.iter().any(|v| v.as_str() == Some("deploy"))) {
+        if !compose
+            && workflow == "deploy"
+            && !action["workflows"]
+                .as_array()
+                .is_some_and(|list| list.iter().any(|v| v.as_str() == Some("deploy")))
+        {
             return false;
         }
-        if compose || !selected.is_empty() { applicable(action, workflow, &scope) }
-        else {
-            action["workflows"].as_array().is_none_or(|list| list.is_empty() || list.iter().any(|v| v.as_str() == Some(workflow)))
+        if compose || !selected.is_empty() {
+            applicable(action, workflow, &scope)
+        } else {
+            action["workflows"].as_array().is_none_or(|list| {
+                list.is_empty() || list.iter().any(|v| v.as_str() == Some(workflow))
+            })
         }
     };
     let mut names = HashSet::new();
     let mut prerequisites = HashSet::new();
     for action in list {
-        let name = action["name"].as_str().filter(|s| !s.is_empty()).context("Every action needs a nonempty name")?;
+        let name = action["name"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .context("Every action needs a nonempty name")?;
         ensure!(names.insert(name), "Duplicate action name {name}");
         let kind = action["kind"].as_str().context("Action needs kind")?;
-        ensure!(["up", "run", "exec", "command", "stop", "prerequisite"].contains(&kind), "Unsupported action kind {kind}");
-        let stage = action.get("stage").map_or(Ok("before"), |v| v.as_str().context("Action stage must be a string"))?;
-        ensure!(["before", "after"].contains(&stage), "Action stage must be before or after");
+        ensure!(
+            ["up", "run", "exec", "command", "stop", "prerequisite"].contains(&kind),
+            "Unsupported action kind {kind}"
+        );
+        let stage = action.get("stage").map_or(Ok("before"), |v| {
+            v.as_str().context("Action stage must be a string")
+        })?;
+        ensure!(
+            ["before", "after"].contains(&stage),
+            "Action stage must be before or after"
+        );
         for field in ["workflows", "services"] {
             if let Some(value) = action.get(field) {
-                ensure!(value.as_array().is_some_and(|list| list.iter().all(Value::is_string)), "Action {field} must be a string list");
+                ensure!(
+                    value
+                        .as_array()
+                        .is_some_and(|list| list.iter().all(Value::is_string)),
+                    "Action {field} must be a string list"
+                );
                 if field == "services" {
                     for name in value.as_array().unwrap() {
-                        ensure!(project.services()?.contains_key(name.as_str().unwrap()), "Action applicability references unknown service {name}");
+                        ensure!(
+                            project.services()?.contains_key(name.as_str().unwrap()),
+                            "Action applicability references unknown service {name}"
+                        );
                     }
                 }
             }
         }
         if let Some(timeout) = action.get("timeout") {
-            ensure!(timeout.as_u64().is_some_and(|n| n > 0), "Action timeout must be a positive integer");
+            ensure!(
+                timeout.as_u64().is_some_and(|n| n > 0),
+                "Action timeout must be a positive integer"
+            );
         }
-        if ["command", "exec", "run"].contains(&kind) && (kind != "run" || action.get("argv").is_some()) {
-            ensure!(!argv(&action["argv"])?.is_empty(), "Action argv cannot be empty");
+        if ["command", "exec", "run"].contains(&kind)
+            && (kind != "run" || action.get("argv").is_some())
+        {
+            ensure!(
+                !argv(&action["argv"])?.is_empty(),
+                "Action argv cannot be empty"
+            );
         }
         if kind == "stop" {
             let targets = argv(&action["targets"]).context("Stop action requires targets")?;
             ensure!(!targets.is_empty(), "Stop action targets cannot be empty");
-            for target in targets { ensure!(project.services()?.contains_key(&target), "Stop action references unknown service {target}"); }
+            for target in targets {
+                ensure!(
+                    project.services()?.contains_key(&target),
+                    "Stop action references unknown service {target}"
+                );
+            }
         } else if kind != "command" {
-            let service = action["service"].as_str().context("Compose actions require service")?;
-            ensure!(project.services()?.contains_key(service), "Action references unknown service {service}");
+            let service = action["service"]
+                .as_str()
+                .context("Compose actions require service")?;
+            ensure!(
+                project.services()?.contains_key(service),
+                "Action references unknown service {service}"
+            );
             if kind == "prerequisite" {
-                ensure!(stage == "before", "Prerequisite action must use stage before");
-                ensure!(action["fresh"].is_boolean(), "Prerequisite action requires explicit boolean fresh");
-                ensure!(one_shot(project, service)?, "Prerequisite service {service} must be a declared one-shot");
+                ensure!(
+                    stage == "before",
+                    "Prerequisite action must use stage before"
+                );
+                ensure!(
+                    action["fresh"].is_boolean(),
+                    "Prerequisite action requires explicit boolean fresh"
+                );
+                ensure!(
+                    one_shot(project, service)?,
+                    "Prerequisite service {service} must be a declared one-shot"
+                );
                 if applies(action) {
-                    ensure!(prerequisites.insert(service), "Duplicate prerequisite for service {service}");
+                    ensure!(
+                        prerequisites.insert(service),
+                        "Duplicate prerequisite for service {service}"
+                    );
                 }
             }
         }
     }
     let planned: Vec<_> = list.iter().filter(|action| applies(action)).collect();
     for action in &planned {
-        ensure!(compose || action["kind"] == "command", "Action {}: Compose {} is not supported on Swarm; use an explicit project argv command", action["name"], action["kind"]);
+        ensure!(
+            compose || action["kind"] == "command",
+            "Action {}: Compose {} is not supported on Swarm; use an explicit project argv command",
+            action["name"],
+            action["kind"]
+        );
     }
     if compose && !prerequisites.is_empty() {
         validate_prerequisite_order(project, &planned, &scope)?;
     }
     Ok(planned)
 }
-fn actions<'a>(project: &'a Project, workflow: &str, selected: &[String], stage: Option<&str>) -> Result<Vec<&'a Value>> {
-    Ok(planned_actions(project, workflow, selected)?.into_iter().filter(|a| stage.is_none_or(|stage| a["stage"].as_str().unwrap_or("before") == stage)).collect())
+fn actions<'a>(
+    project: &'a Project,
+    workflow: &str,
+    selected: &[String],
+    stage: Option<&str>,
+) -> Result<Vec<&'a Value>> {
+    Ok(planned_actions(project, workflow, selected)?
+        .into_iter()
+        .filter(|a| stage.is_none_or(|stage| a["stage"].as_str().unwrap_or("before") == stage))
+        .collect())
 }
-fn validate_prerequisite_order(project: &Project, planned: &[&Value], scope: &[String]) -> Result<()> {
-    let prerequisites: HashSet<_> = planned.iter().filter(|a| a["kind"] == "prerequisite").filter_map(|a| a["service"].as_str()).collect();
+fn validate_prerequisite_order(
+    project: &Project,
+    planned: &[&Value],
+    scope: &[String],
+) -> Result<()> {
+    let prerequisites: HashSet<_> = planned
+        .iter()
+        .filter(|a| a["kind"] == "prerequisite")
+        .filter_map(|a| a["service"].as_str())
+        .collect();
     let mut completed = HashSet::new();
-    let before = planned.iter().filter(|a| a["stage"].as_str().unwrap_or("before") == "before");
+    let before = planned
+        .iter()
+        .filter(|a| a["stage"].as_str().unwrap_or("before") == "before");
     let after = planned.iter().filter(|a| a["stage"] == "after");
     for action in before.chain(after) {
         if action["kind"] == "up" || action["kind"] == "prerequisite" {
-            let service = action["service"].as_str().context("Action requires service")?;
+            let service = action["service"]
+                .as_str()
+                .context("Action requires service")?;
             for dependency in dependency_order_scoped(project, &[service.into()], scope)? {
                 if prerequisites.contains(dependency.as_str())
                     && !(action["kind"] == "prerequisite" && dependency == service)
                 {
-                    ensure!(completed.contains(dependency.as_str()), "Prerequisite {dependency} must precede action {}", action["name"]);
+                    ensure!(
+                        completed.contains(dependency.as_str()),
+                        "Prerequisite {dependency} must precede action {}",
+                        action["name"]
+                    );
                 }
             }
-            if action["kind"] == "prerequisite" { completed.insert(service); }
+            if action["kind"] == "prerequisite" {
+                completed.insert(service);
+            }
         }
     }
     Ok(())
 }
-fn restart_consumers(project: &Project, roots: &BTreeSet<String>, running: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+fn restart_consumers(
+    project: &Project,
+    roots: &BTreeSet<String>,
+    running: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
     let mut affected = roots.clone();
     loop {
         let mut changed = false;
         for (name, definition) in project.services()? {
-            if running.contains(name) && !affected.contains(name)
-                && dependencies(definition)?.iter().any(|dep| dep.restart && affected.contains(dep.service))
+            if running.contains(name)
+                && !affected.contains(name)
+                && dependencies(definition)?
+                    .iter()
+                    .any(|dep| dep.restart && affected.contains(dep.service))
             {
                 changed |= affected.insert(name.clone());
             }
         }
-        if !changed { break }
+        if !changed {
+            break;
+        }
     }
     Ok(affected.intersection(running).cloned().collect())
 }
 fn running_services(rows: &[Value]) -> BTreeSet<String> {
-    rows.iter().filter(|row| row["State"]["Running"] == true
-        && row["Config"]["Labels"]["com.docker.compose.oneoff"].as_str() != Some("True"))
-        .filter_map(|row| row["Config"]["Labels"]["com.docker.compose.service"].as_str().map(str::to_owned))
+    rows.iter()
+        .filter(|row| {
+            row["State"]["Running"] == true
+                && row["Config"]["Labels"]["com.docker.compose.oneoff"].as_str() != Some("True")
+        })
+        .filter_map(|row| {
+            row["Config"]["Labels"]["com.docker.compose.service"]
+                .as_str()
+                .map(str::to_owned)
+        })
         .collect()
 }
-fn preflight_native_scope(project: &Project, planned: &[&Value], scope: &[String], docker: &Docker) -> Result<()> {
+fn preflight_native_scope(
+    project: &Project,
+    planned: &[&Value],
+    scope: &[String],
+    docker: &Docker,
+) -> Result<()> {
     let mut affected = BTreeSet::new();
-    for action in planned.iter().filter(|a| a["stage"].as_str().unwrap_or("before") == "before") {
-        if action["kind"] == "stop" { affected.extend(argv(&action["targets"])?); }
+    for action in planned
+        .iter()
+        .filter(|a| a["stage"].as_str().unwrap_or("before") == "before")
+    {
+        if action["kind"] == "stop" {
+            affected.extend(argv(&action["targets"])?);
+        }
         if action["kind"] == "prerequisite" {
-            affected.insert(action["service"].as_str().context("Prerequisite requires service")?.into());
+            affected.insert(
+                action["service"]
+                    .as_str()
+                    .context("Prerequisite requires service")?
+                    .into(),
+            );
         }
     }
     let running = running_services(&container_rows(project, docker)?);
     let mut expanded = scope.to_vec();
     expanded.extend(restart_consumers(project, &affected, &running)?);
     let expanded = selected_services(project, &expanded)?;
-    validate_prerequisite_order(project, planned, &expanded).context("Invalid native workflow configuration")
+    validate_prerequisite_order(project, planned, &expanded)
+        .context("Invalid native workflow configuration")
 }
 
 #[derive(Default)]
@@ -1248,33 +1666,63 @@ struct NativeOperation {
     scope: Vec<String>,
 }
 fn service_containers<'a>(rows: &'a [Value], service: &str) -> Vec<&'a Value> {
-    rows.iter().filter(|row| {
-        row["Config"]["Labels"]["com.docker.compose.service"].as_str() == Some(service)
-            && row["Config"]["Labels"]["com.docker.compose.oneoff"].as_str() != Some("True")
-    }).collect()
+    rows.iter()
+        .filter(|row| {
+            row["Config"]["Labels"]["com.docker.compose.service"].as_str() == Some(service)
+                && row["Config"]["Labels"]["com.docker.compose.oneoff"].as_str() != Some("True")
+        })
+        .collect()
 }
 fn completed_ids(rows: &[Value], service: &str) -> Result<Vec<String>> {
     let containers = service_containers(rows, service);
-    ensure!(!containers.is_empty(), "Prerequisite {service} has no retained container");
+    ensure!(
+        !containers.is_empty(),
+        "Prerequisite {service} has no retained container"
+    );
     let mut ids = Vec::new();
     for container in containers {
-        ensure!(container["State"]["Status"] == "exited" && container["State"]["ExitCode"] == 0 && container["State"]["OOMKilled"] != true,
-            "Prerequisite {service} did not complete successfully; inspect dks logs {service}");
-        ids.push(container["Id"].as_str().context("Container inspection lacks ID")?.to_owned());
+        ensure!(
+            container["State"]["Status"] == "exited"
+                && container["State"]["ExitCode"] == 0
+                && container["State"]["OOMKilled"] != true,
+            "Prerequisite {service} did not complete successfully; inspect dks logs {service}"
+        );
+        ids.push(
+            container["Id"]
+                .as_str()
+                .context("Container inspection lacks ID")?
+                .to_owned(),
+        );
     }
     ids.sort();
     Ok(ids)
 }
-fn revalidate_completed(project: &Project, docker: &Docker, operation: &NativeOperation) -> Result<()> {
-    if operation.completed.is_empty() { return Ok(()) }
+fn revalidate_completed(
+    project: &Project,
+    docker: &Docker,
+    operation: &NativeOperation,
+) -> Result<()> {
+    if operation.completed.is_empty() {
+        return Ok(());
+    }
     let rows = container_rows(project, docker)?;
     for (service, ids) in &operation.completed {
-        ensure!(completed_ids(&rows, service)? == *ids, "Successful prerequisite {service} container identity changed; consumers remain stopped");
+        ensure!(
+            completed_ids(&rows, service)? == *ids,
+            "Successful prerequisite {service} container identity changed; consumers remain stopped"
+        );
     }
     Ok(())
 }
-fn stop_running(project: &Project, targets: &[String], docker: &Docker, operation: &mut NativeOperation) -> Result<()> {
-    if targets.is_empty() { return Ok(()) }
+fn stop_running(
+    project: &Project,
+    targets: &[String],
+    docker: &Docker,
+    operation: &mut NativeOperation,
+) -> Result<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
     validate_ownership(project, docker)?;
     let rows = container_rows(project, docker)?;
     let running = running_services(&rows);
@@ -1284,7 +1732,9 @@ fn stop_running(project: &Project, targets: &[String], docker: &Docker, operatio
     } else {
         restart_consumers(project, &targets, &running)?
     };
-    if running.is_empty() { return Ok(()) }
+    if running.is_empty() {
+        return Ok(());
+    }
     let file = write_render(project, "compose")?;
     let mut args = compose_args(project, file.path())?;
     args.push("stop".into());
@@ -1297,42 +1747,98 @@ fn stop_running(project: &Project, targets: &[String], docker: &Docker, operatio
     Ok(())
 }
 fn wait_dependency(project: &Project, dependency: &Dependency<'_>, docker: &Docker) -> Result<()> {
+    let mut crashes = ComposeCrashTracker::new(project)?;
     loop {
-        docker.remaining(Duration::from_secs(300))?;
+        docker.remaining(Duration::from_secs(30))?;
         let rows = container_rows(project, docker)?;
+        crashes.observe(project, dependency.service, &rows, false)?;
         let containers = service_containers(&rows, dependency.service);
         let mut ready = !containers.is_empty();
         for container in &containers {
             let state = &container["State"];
-            if dependency.condition == "service_completed_successfully" && state["OOMKilled"] == true {
-                return Err(prerequisite_failure(dependency.service, &containers, container));
+            if dependency.condition == "service_completed_successfully"
+                && state["OOMKilled"] == true
+            {
+                return Err(prerequisite_failure(
+                    dependency.service,
+                    &containers,
+                    container,
+                ));
             }
-            ensure!(state["OOMKilled"] != true, "Dependency {} was killed by the kernel (out of memory)", dependency.service);
+            ensure!(
+                state["OOMKilled"] != true,
+                "Dependency {} was killed by the kernel (out of memory)",
+                dependency.service
+            );
             let status = state["Status"].as_str().unwrap_or("unknown");
+            ensure!(
+                state["Error"].as_str().is_none_or(str::is_empty),
+                "Dependency {} has a terminal Docker state error: {}",
+                dependency.service,
+                state["Error"]
+            );
+            if dependency.condition != "service_completed_successfully"
+                && retryable_container(project, dependency.service, container)?
+            {
+                ready = false;
+                continue;
+            }
             match dependency.condition {
                 "service_completed_successfully" => {
+                    if status == "restarting"
+                        && state["ExitCode"].as_i64().is_some_and(|code| code != 0)
+                    {
+                        return Err(prerequisite_failure(
+                            dependency.service,
+                            &containers,
+                            container,
+                        ));
+                    }
                     if status == "exited" || status == "dead" {
                         if status != "exited" || state["ExitCode"] != 0 {
-                            return Err(prerequisite_failure(dependency.service, &containers, container));
+                            return Err(prerequisite_failure(
+                                dependency.service,
+                                &containers,
+                                container,
+                            ));
                         }
-                    } else { ready = false; }
+                    } else {
+                        ready = false;
+                    }
                 }
                 "service_healthy" => {
-                    ensure!(status != "exited" && status != "dead", "Dependency {} stopped before becoming healthy", dependency.service);
-                    ensure!(state["Health"]["Status"] != "unhealthy", "Dependency {} is unhealthy", dependency.service);
+                    ensure!(
+                        status != "exited" && status != "dead",
+                        "Dependency {} stopped before becoming healthy",
+                        dependency.service
+                    );
+                    ensure!(
+                        state["Health"]["Status"] != "unhealthy",
+                        "Dependency {} is unhealthy",
+                        dependency.service
+                    );
                     ready &= state["Running"] == true && state["Health"]["Status"] == "healthy";
                 }
                 _ => {
                     if status == "exited" || status == "dead" {
-                        ensure!(status == "exited" && state["ExitCode"] == 0 && one_shot(project, dependency.service)?,
-                            "Dependency {} stopped before its consumer started", dependency.service);
+                        ensure!(
+                            status == "exited"
+                                && state["ExitCode"] == 0
+                                && one_shot(project, dependency.service)?,
+                            "Dependency {} stopped before its consumer started",
+                            dependency.service
+                        );
                     } else {
                         ready &= state["Running"] == true;
                     }
                 }
             }
         }
-        if ready { return Ok(()) }
+        if ready {
+            crashes.observe(project, dependency.service, &rows, true)?;
+            return Ok(());
+        }
+        crashes.pending(dependency.service, &rows);
         thread::sleep(docker.remaining(Duration::from_millis(100))?);
     }
 }
@@ -1348,29 +1854,61 @@ fn prerequisite_failure(service: &str, containers: &[&Value], failed: &Value) ->
             "exitCode":row["State"]["ExitCode"], "running":row["State"]["Running"],
             "oomKilled":row["State"]["OOMKilled"]
         })).collect::<Vec<_>>()
-    })).into()
+    }))
+    .into()
 }
-fn start_ordered(project: &Project, scope: &[String], docker: &Docker, operation: &mut NativeOperation) -> Result<()> {
+fn start_ordered(
+    project: &Project,
+    scope: &[String],
+    docker: &Docker,
+    operation: &mut NativeOperation,
+) -> Result<()> {
     for service in dependency_order_scoped(project, scope, &operation.scope)? {
-        if operation.completed.contains_key(&service) { continue }
-        ensure!(!operation.prerequisites.contains(&service), "Prerequisite {service} must complete in its declared action order before starting consumers");
+        if operation.completed.contains_key(&service) {
+            continue;
+        }
+        ensure!(
+            !operation.prerequisites.contains(&service),
+            "Prerequisite {service} must complete in its declared action order before starting consumers"
+        );
         for dependency in dependencies(&project.services()?[&service])? {
-            if dependency.required || operation.scope.iter().any(|name| name == dependency.service) {
+            if dependency.required
+                || operation
+                    .scope
+                    .iter()
+                    .any(|name| name == dependency.service)
+            {
                 wait_dependency(project, &dependency, docker)?;
             }
         }
-        if operation.started.contains(&service) { continue }
+        if operation.started.contains(&service) {
+            continue;
+        }
         revalidate_completed(project, docker, operation)?;
         let file = write_render(project, "compose")?;
         let mut args = compose_args(project, file.path())?;
-        args.extend(strings(&["up", "--detach", "--build", "--no-deps", &service]));
+        args.extend(strings(&[
+            "up",
+            "--detach",
+            "--build",
+            "--no-deps",
+            &service,
+        ]));
         docker.run(&args, None)?;
         operation.started.insert(service);
     }
     Ok(())
 }
-fn execute_native_action(project: &Project, action: &Value, docker: &Docker, output: &Output, operation: &mut NativeOperation, timeout: u64) -> Result<()> {
-    let bounded = docker.with_deadline(Instant::now() + Duration::from_secs(action["timeout"].as_u64().unwrap_or(timeout).max(1)));
+fn execute_native_action(
+    project: &Project,
+    action: &Value,
+    docker: &Docker,
+    output: &Output,
+    operation: &mut NativeOperation,
+    _timeout: u64,
+) -> Result<()> {
+    let timeout = action["timeout"].as_u64().unwrap_or(0);
+    let bounded = docker.with_timeout(timeout);
     let docker = &bounded;
     let kind = action["kind"].as_str().context("Action needs kind")?;
     if kind == "stop" {
@@ -1379,43 +1917,78 @@ fn execute_native_action(project: &Project, action: &Value, docker: &Docker, out
     }
     if kind == "up" {
         output.event("action", action["name"].as_str().unwrap_or("up"))?;
-        let service = action["service"].as_str().context("Up action requires service")?;
+        let service = action["service"]
+            .as_str()
+            .context("Up action requires service")?;
         start_ordered(project, &[service.into()], docker, operation)?;
         return wait_ready(project, &[service.into()], docker, output, timeout).map(|_| ());
     }
-    if kind != "prerequisite" { return execute_action(project, action, docker, output, timeout) }
+    if kind != "prerequisite" {
+        return execute_action(project, action, docker, output, timeout);
+    }
     output.event("action", action["name"].as_str().unwrap_or("prerequisite"))?;
-    let service = action["service"].as_str().context("Prerequisite requires service")?;
-    if operation.completed.contains_key(service) { return revalidate_completed(project, docker, operation) }
+    let service = action["service"]
+        .as_str()
+        .context("Prerequisite requires service")?;
+    if operation.completed.contains_key(service) {
+        return revalidate_completed(project, docker, operation);
+    }
     // Compose restart relationships are only applied to consumers already in
     // scope or actually running; never create unrelated, absent services.
-    let restart: Vec<_> = project.services()?.iter().filter_map(|(name, definition)| {
-        match dependencies(definition) {
-            Ok(deps) if deps.iter().any(|dep| dep.service == service && dep.restart) => Some(Ok(name.clone())),
+    let restart: Vec<_> = project
+        .services()?
+        .iter()
+        .filter_map(|(name, definition)| match dependencies(definition) {
+            Ok(deps) if deps.iter().any(|dep| dep.service == service && dep.restart) => {
+                Some(Ok(name.clone()))
+            }
             Ok(_) => None,
             Err(error) => Some(Err(error)),
-        }
-    }).collect::<Result<_>>()?;
+        })
+        .collect::<Result<_>>()?;
     stop_running(project, &restart, docker, operation)?;
-    let deps: Vec<_> = dependencies(&project.services()?[service])?.into_iter().filter(|dep| dep.required || operation.scope.iter().any(|name| name == dep.service)).collect();
+    let deps: Vec<_> = dependencies(&project.services()?[service])?
+        .into_iter()
+        .filter(|dep| dep.required || operation.scope.iter().any(|name| name == dep.service))
+        .collect();
     let dependency_scope: Vec<_> = deps.iter().map(|dep| dep.service.to_owned()).collect();
     start_ordered(project, &dependency_scope, docker, operation)?;
-    for dependency in &deps { wait_dependency(project, dependency, docker)?; }
+    for dependency in &deps {
+        wait_dependency(project, dependency, docker)?;
+    }
     revalidate_completed(project, docker, operation)?;
     let rows = container_rows(project, docker)?;
     let existing = service_containers(&rows, service);
     let fresh = action["fresh"] == true;
-    let retained_success = !existing.is_empty() && existing.iter().all(|row| row["State"]["Status"] == "exited" && row["State"]["ExitCode"] == 0 && row["State"]["OOMKilled"] != true);
+    let retained_success = !existing.is_empty()
+        && existing.iter().all(|row| {
+            row["State"]["Status"] == "exited"
+                && row["State"]["ExitCode"] == 0
+                && row["State"]["OOMKilled"] != true
+        });
     let already_running = existing.iter().any(|row| row["State"]["Running"] == true);
     if fresh || (!retained_success && !already_running) {
         let file = write_render(project, "compose")?;
         let mut args = compose_args(project, file.path())?;
         args.extend(strings(&["up", "--detach", "--build", "--no-deps"]));
-        if fresh { args.push("--force-recreate".into()); }
+        if fresh {
+            args.push("--force-recreate".into());
+        }
         args.push(service.into());
-        docker.run(&args, None).with_context(|| format!("Prerequisite {service} startup failed"))?;
+        docker
+            .run(&args, None)
+            .with_context(|| format!("Prerequisite {service} startup failed"))?;
     }
-    wait_dependency(project, &Dependency { service, condition: "service_completed_successfully", required: true, restart: false }, docker)?;
+    wait_dependency(
+        project,
+        &Dependency {
+            service,
+            condition: "service_completed_successfully",
+            required: true,
+            restart: false,
+        },
+        docker,
+    )?;
     let ids = completed_ids(&container_rows(project, docker)?, service)?;
     operation.completed.insert(service.into(), ids);
     operation.started.insert(service.into());
@@ -1438,9 +2011,10 @@ fn execute_action(
     action: &Value,
     docker: &Docker,
     output: &Output,
-    timeout: u64,
+    _timeout: u64,
 ) -> Result<()> {
-    let bounded = docker.with_deadline(Instant::now() + Duration::from_secs(timeout.max(1)));
+    let timeout = action["timeout"].as_u64().unwrap_or(0);
+    let bounded = docker.with_timeout(timeout);
     let docker = &bounded;
     let name = action["name"]
         .as_str()
@@ -1450,8 +2024,14 @@ fn execute_action(
         .as_str()
         .context("Each action requires kind")?;
     if kind == "command" {
-        return crate::commands::streamed(&project.root, &argv(&action["argv"])?, docker, output, timeout)
-            .with_context(|| format!("Action {name} failed"));
+        return crate::commands::streamed(
+            &project.root,
+            &argv(&action["argv"])?,
+            docker,
+            output,
+            timeout,
+        )
+        .with_context(|| format!("Action {name} failed"));
     }
     ensure!(
         project.backend()? == "compose",
@@ -1512,7 +2092,13 @@ pub(crate) fn execute_action_sequence(
 ) -> Result<()> {
     let applicable = planned_actions(project, workflow, selected)?;
     for action in sequence {
-        ensure!(applicable.iter().any(|candidate| std::ptr::eq(*candidate, *action)), "Action {} is outside the planned workflow configuration scope", action["name"]);
+        ensure!(
+            applicable
+                .iter()
+                .any(|candidate| std::ptr::eq(*candidate, *action)),
+            "Action {} is outside the planned workflow configuration scope",
+            action["name"]
+        );
     }
     execute_validated_sequence(project, selected, sequence, docker, output)
 }
@@ -1524,22 +2110,50 @@ fn execute_validated_sequence(
     output: &Output,
 ) -> Result<()> {
     if !planned.is_empty() {
-        output.event("target", &format!("{} ({}) checkout={} target={}", project.name()?, project.backend()?, project.owner()?, docker.context()?))?;
+        output.event(
+            "target",
+            &format!(
+                "{} ({}) checkout={} target={}",
+                project.name()?,
+                project.backend()?,
+                project.owner()?,
+                docker.context()?
+            ),
+        )?;
     }
-    let native = planned.iter().any(|action| action["kind"] == "prerequisite");
-    let budget = planned.iter().map(|action| action["timeout"].as_u64().unwrap_or(300)).max().unwrap_or(300);
-    let docker = docker.with_deadline(Instant::now() + Duration::from_secs(budget));
+    let native = planned
+        .iter()
+        .any(|action| action["kind"] == "prerequisite");
     let mut operation = NativeOperation {
-        scope: if native { selected_services(project, selected)? } else { Vec::new() },
-        prerequisites: planned.iter().filter(|a| a["kind"] == "prerequisite").filter_map(|a| a["service"].as_str().map(str::to_owned)).collect(),
+        scope: if native {
+            selected_services(project, selected)?
+        } else {
+            Vec::new()
+        },
+        prerequisites: planned
+            .iter()
+            .filter(|a| a["kind"] == "prerequisite")
+            .filter_map(|a| a["service"].as_str().map(str::to_owned))
+            .collect(),
         ..Default::default()
     };
-    if native { preflight_native_scope(project, planned, &operation.scope, &docker)?; }
-    for action in planned.iter().filter(|action| !native || action["stage"].as_str().unwrap_or("before") == "before") {
+    if native {
+        preflight_native_scope(project, planned, &operation.scope, &docker)?;
+    }
+    for action in planned
+        .iter()
+        .filter(|action| !native || action["stage"].as_str().unwrap_or("before") == "before")
+    {
         if native || action["kind"] == "stop" {
-            execute_native_action(project, action, &docker, output, &mut operation, budget)?;
+            execute_native_action(project, action, &docker, output, &mut operation, 0)?;
         } else {
-            execute_action(project, action, &docker, output, action["timeout"].as_u64().unwrap_or(300))?;
+            execute_action(
+                project,
+                action,
+                &docker,
+                output,
+                action["timeout"].as_u64().unwrap_or(0),
+            )?;
         }
     }
     if native {
@@ -1548,10 +2162,10 @@ fn execute_validated_sequence(
         scope = selected_services(project, &scope)?;
         operation.scope = scope.clone();
         start_ordered(project, &scope, &docker, &mut operation)?;
-        wait_ready(project, &scope, &docker, output, budget)?;
+        wait_ready(project, &scope, &docker, output, 0)?;
         revalidate_completed(project, &docker, &operation)?;
         for action in planned.iter().filter(|a| a["stage"] == "after") {
-            execute_native_action(project, action, &docker, output, &mut operation, budget)?;
+            execute_native_action(project, action, &docker, output, &mut operation, 0)?;
         }
     }
     Ok(())
@@ -1629,18 +2243,23 @@ pub(crate) fn local_context(context: &str) -> bool {
     context.contains(";unix://") || context.contains(";DOCKER_HOST=unix://")
 }
 fn container_rows(project: &Project, docker: &Docker) -> Result<Vec<Value>> {
-    let rows = container_rows_timeout(project, docker, 300)?;
+    let rows = container_rows_timeout(project, docker, 30)?;
     for row in &rows {
-        ensure!(row["Config"]["Labels"]["com.docker.compose.project"].as_str() == Some(project.name()?)
-            && row["Config"]["Labels"][OWNER].as_str() == Some(project.owner()?)
-            && row["Config"]["Labels"][PROJECT].as_str() == Some(project.name()?),
-            "Foreign container {:?}; observed owner {:?}, expected {}", row["Id"].as_str(),
-            row["Config"]["Labels"][OWNER].as_str(), project.owner()?);
+        ensure!(
+            row["Config"]["Labels"]["com.docker.compose.project"].as_str() == Some(project.name()?)
+                && row["Config"]["Labels"][OWNER].as_str() == Some(project.owner()?)
+                && row["Config"]["Labels"][PROJECT].as_str() == Some(project.name()?),
+            "Foreign container {:?}; observed owner {:?}, expected {}",
+            row["Id"].as_str(),
+            row["Config"]["Labels"][OWNER].as_str(),
+            project.owner()?
+        );
     }
     Ok(rows)
 }
 fn container_rows_timeout(project: &Project, docker: &Docker, timeout: u64) -> Result<Vec<Value>> {
-    let started = Instant::now();
+    let bounded = docker.with_timeout(if timeout == 0 { 30 } else { timeout });
+    let docker = &bounded;
     let ids = docker.capture_timeout(
         &strings(&[
             "ps",
@@ -1656,11 +2275,8 @@ fn container_rows_timeout(project: &Project, docker: &Docker, timeout: u64) -> R
     }
     let mut args = strings(&["container", "inspect"]);
     args.extend(ids.split_whitespace().map(str::to_owned));
-    let rows: Vec<Value> = serde_json::from_str(&docker.capture_timeout(
-        &args,
-        None,
-        timeout.saturating_sub(started.elapsed().as_secs()).max(1),
-    )?).context("Invalid Docker container inspection")?;
+    let rows: Vec<Value> = serde_json::from_str(&docker.capture_timeout(&args, None, 30)?)
+        .context("Invalid Docker container inspection")?;
     Ok(rows)
 }
 fn detect_ports(project: &Project, selected: &[String], docker: &Docker) -> Result<()> {
@@ -1762,7 +2378,128 @@ pub(crate) fn one_shot(project: &Project, service: &str) -> Result<bool> {
         .as_array()
         .is_some_and(|list| list.iter().any(|s| s.as_str() == Some(service))))
 }
+fn retryable_container(project: &Project, service: &str, container: &Value) -> Result<bool> {
+    if one_shot(project, service)? {
+        return Ok(false);
+    }
+    let state = &container["State"];
+    let status = state["Status"].as_str().unwrap_or("unknown");
+    if status == "restarting" {
+        return Ok(true);
+    }
+    if status != "exited" {
+        return Ok(false);
+    }
+    let configured = project.services()?[service]["restart"]
+        .as_str()
+        .unwrap_or("no")
+        .to_owned();
+    let policy = container["HostConfig"]["RestartPolicy"]["Name"]
+        .as_str()
+        .unwrap_or(&configured);
+    if policy == "always" || policy == "unless-stopped" {
+        return Ok(true);
+    }
+    if policy.split(':').next() != Some("on-failure")
+        || state["ExitCode"].as_i64().unwrap_or(0) == 0
+    {
+        return Ok(false);
+    }
+    let limit = container["HostConfig"]["RestartPolicy"]["MaximumRetryCount"]
+        .as_u64()
+        .or_else(|| {
+            policy
+                .split(':')
+                .nth(1)
+                .and_then(|limit| limit.parse().ok())
+        })
+        .unwrap_or(0);
+    Ok(limit == 0 || container["RestartCount"].as_u64().unwrap_or(0) < limit)
+}
+
+struct ComposeCrashTracker {
+    tracker: CrashLoopTracker,
+    attempts: usize,
+    restarts: BTreeMap<String, u64>,
+}
+impl ComposeCrashTracker {
+    fn new(project: &Project) -> Result<Self> {
+        let policy = CrashLoopPolicy::from_project(project)?;
+        Ok(Self {
+            tracker: CrashLoopTracker::new(policy),
+            attempts: policy.attempts,
+            restarts: BTreeMap::new(),
+        })
+    }
+    fn key(service: &str, container: &Value) -> String {
+        let labels = &container["Config"]["Labels"];
+        format!(
+            "{service}/{}/{}/{}",
+            labels["com.docker.compose.config-hash"]
+                .as_str()
+                .unwrap_or(""),
+            labels["com.docker.compose.container-number"]
+                .as_str()
+                .unwrap_or("1"),
+            container["Id"].as_str().unwrap_or("")
+        )
+    }
+    fn pending(&mut self, service: &str, rows: &[Value]) {
+        for container in service_containers(rows, service) {
+            self.tracker.observe_pending(&Self::key(service, container));
+        }
+    }
+    fn observe(
+        &mut self,
+        project: &Project,
+        service: &str,
+        rows: &[Value],
+        healthy: bool,
+    ) -> Result<()> {
+        let now = Instant::now();
+        for container in service_containers(rows, service) {
+            let key = Self::key(service, container);
+            let count = container["RestartCount"].as_u64().unwrap_or(0);
+            let previous = *self.restarts.entry(key.clone()).or_insert(count);
+            self.restarts.insert(key.clone(), count);
+            for restart in count.saturating_sub(self.attempts as u64).max(previous)..count {
+                ensure!(
+                    !self
+                        .tracker
+                        .observe_failure(&key, &format!("restart:{}", restart + 1), now),
+                    "Service {service} is in a crash loop (repeated container restart attempts); inspect dks logs {service}"
+                );
+            }
+            if retryable_container(project, service, container)?
+                || container["State"]["Running"] != true
+            {
+                self.tracker.observe_pending(&key);
+            } else if healthy {
+                self.tracker.observe_healthy(&key, now);
+            }
+        }
+        let current: BTreeSet<_> = rows
+            .iter()
+            .filter_map(|row| {
+                row["Config"]["Labels"]["com.docker.compose.service"]
+                    .as_str()
+                    .map(|service| Self::key(service, row))
+            })
+            .collect();
+        self.restarts.retain(|key, _| current.contains(key));
+        Ok(())
+    }
+}
+
 fn inspect_state(project: &Project, service: &str, rows: &[Value]) -> Result<(bool, String)> {
+    inspect_state_mode(project, service, rows, false)
+}
+fn inspect_state_mode(
+    project: &Project,
+    service: &str,
+    rows: &[Value],
+    startup: bool,
+) -> Result<(bool, String)> {
     let containers: Vec<&Value> = rows
         .iter()
         .filter(|row| {
@@ -1783,6 +2520,16 @@ fn inspect_state(project: &Project, service: &str, rows: &[Value]) -> Result<(bo
             "Service {service} was killed by the kernel (out of memory)"
         );
         let status = state["Status"].as_str().unwrap_or("unknown");
+        ensure!(
+            state["Error"].as_str().is_none_or(str::is_empty),
+            "Service {service} has a terminal Docker state error: {}",
+            state["Error"]
+        );
+        if startup && !oneshot && retryable_container(project, service, container)? {
+            ready = false;
+            description = format!("{status} (restart pending)");
+            continue;
+        }
         if status == "exited" || status == "dead" {
             let code = state["ExitCode"].as_i64().unwrap_or(-1);
             ensure!(
@@ -1793,6 +2540,11 @@ fn inspect_state(project: &Project, service: &str, rows: &[Value]) -> Result<(bo
             continue;
         }
         if oneshot {
+            ensure!(
+                status != "restarting" || state["ExitCode"].as_i64().is_none_or(|code| code == 0),
+                "One-shot service {service} failed with exit code {}; inspect dks logs {service}",
+                state["ExitCode"]
+            );
             ready = false;
             description = "one-shot still running".into();
             continue;
@@ -1828,18 +2580,37 @@ fn inspect_state(project: &Project, service: &str, rows: &[Value]) -> Result<(bo
     Ok((ready, description))
 }
 pub(crate) fn validate_readiness(project: &Project, service: &str) -> Result<()> {
-    let Some(check) = project.metadata["readiness"].get(service) else { return Ok(()) };
-    ensure!(check.is_object(), "Readiness for {service} must be an object");
-    ensure!(check.get("url").is_some() || check.get("command").is_some(), "Readiness for {service} requires url or command");
+    let Some(check) = project.metadata["readiness"].get(service) else {
+        return Ok(());
+    };
+    ensure!(
+        check.is_object(),
+        "Readiness for {service} must be an object"
+    );
+    ensure!(
+        check.get("url").is_some() || check.get("command").is_some(),
+        "Readiness for {service} requires url or command"
+    );
     if let Some(url) = check.get("url") {
         let url = url.as_str().context("Readiness URL must be a string")?;
-        ensure!(url.starts_with("http://") || url.starts_with("https://"), "Readiness URL must use HTTP(S)");
+        ensure!(
+            url.starts_with("http://") || url.starts_with("https://"),
+            "Readiness URL must use HTTP(S)"
+        );
     }
     if let Some(command) = check.get("command") {
-        ensure!(!argv(command)?.is_empty(), "Readiness command must not be empty");
+        ensure!(
+            !argv(command)?.is_empty(),
+            "Readiness command must not be empty"
+        );
     }
     if let Some(status) = check.get("status") {
-        ensure!(status.as_u64().is_some_and(|code| (100..=599).contains(&code)), "Readiness status must be an HTTP status code");
+        ensure!(
+            status
+                .as_u64()
+                .is_some_and(|code| (100..=599).contains(&code)),
+            "Readiness status must be an HTTP status code"
+        );
     }
     if let Some(contains) = check.get("contains") {
         ensure!(contains.is_string(), "Readiness contains must be a string");
@@ -1861,7 +2632,9 @@ pub(crate) fn readiness_check(
         // The library handles HTTP(S), redirects, and certificate verification; errors
         // while an application boots are retried within the same bounded wait.
         let config = ureq::Agent::config_builder()
-            .timeout_global(Some(docker.remaining(Duration::from_secs(remaining.clamp(1, 5)))?))
+            .timeout_global(Some(
+                docker.remaining(Duration::from_secs(remaining.clamp(1, 5)))?,
+            ))
             .http_status_as_error(false)
             .build();
         let agent: ureq::Agent = config.into();
@@ -1968,66 +2741,79 @@ fn wait_ready(
     output: &Output,
     timeout: u64,
 ) -> Result<Value> {
-    let started = Instant::now();
-    let bounded = docker.with_deadline(started + Duration::from_secs(timeout.max(1)));
+    let bounded = docker.with_timeout(timeout);
     let docker = &bounded;
+    let mut crashes = ComposeCrashTracker::new(project)?;
     let mut previous = Map::new();
-    let mut observations: BTreeMap<String, Value> = selected.iter().map(|service| (
-        service.clone(), json!({"name":service,"observed":false,
+    let mut observations: BTreeMap<String, Value> = selected
+        .iter()
+        .map(|service| {
+            (
+                service.clone(),
+                json!({"name":service,"observed":false,
             "containerReady":false,"applicationReady":null,"unhealthy":false}),
-    )).collect();
+            )
+        })
+        .collect();
     let result = (|| -> Result<Value> {
-    loop {
-        interrupted()?;
-        docker.remaining(Duration::from_secs(timeout.max(1)))?;
-        let rows = container_rows_timeout(
-            project,
-            docker,
-            timeout.saturating_sub(started.elapsed().as_secs()).max(1),
-        )?;
-        let mut ready = true;
-        for service in selected {
-            let observation = observations.get_mut(service).unwrap();
-            observation["observed"] = json!(true);
-            observation["containerReady"] = json!(false);
-            observation["unhealthy"] = json!(service_containers(&rows, service).iter()
-                .any(|row| row["State"]["Health"]["Status"] == "unhealthy"));
-            let (container_ready, description) = inspect_state(project, service, &rows)?;
-            observation["containerReady"] = json!(container_ready);
-            if !container_ready { observation["applicationReady"] = Value::Null; }
-            if previous.get(service).and_then(Value::as_str) != Some(&description) {
-                output.event("readiness", &format!("{service}: {description}"))?;
-                previous.insert(service.clone(), json!(description));
+        loop {
+            interrupted()?;
+            docker.remaining(Duration::from_secs(30))?;
+            let rows = container_rows_timeout(project, docker, 30)?;
+            let mut ready = true;
+            for service in selected {
+                let observation = observations.get_mut(service).unwrap();
+                observation["observed"] = json!(true);
+                observation["containerReady"] = json!(false);
+                observation["unhealthy"] = json!(
+                    service_containers(&rows, service)
+                        .iter()
+                        .any(|row| row["State"]["Health"]["Status"] == "unhealthy")
+                );
+                let (container_ready, description) =
+                    inspect_state_mode(project, service, &rows, true)?;
+                crashes.observe(project, service, &rows, false)?;
+                observation["containerReady"] = json!(container_ready);
+                if !container_ready {
+                    observation["applicationReady"] = Value::Null;
+                }
+                if previous.get(service).and_then(Value::as_str) != Some(&description) {
+                    output.event("readiness", &format!("{service}: {description}"))?;
+                    previous.insert(service.clone(), json!(description));
+                }
+                if !container_ready {
+                    crashes.pending(service, &rows);
+                    ready = false;
+                    continue;
+                }
+                let application_ready = readiness_check(project, service, docker, output, 30)?;
+                if application_ready {
+                    crashes.observe(project, service, &rows, true)?;
+                }
+                observation["applicationReady"] =
+                    if project.metadata["readiness"].get(service).is_some() {
+                        json!(application_ready)
+                    } else {
+                        Value::Null
+                    };
+                if !application_ready {
+                    crashes.pending(service, &rows);
+                    ready = false;
+                }
             }
-            if !container_ready {
-                ready = false;
-                continue;
+            if ready {
+                docker.remaining(Duration::from_secs(30))?;
+                return Ok(json!(selected.iter().map(|name| json!({"name":name,"status":if project.metadata["readiness"].get(name).is_some() {"application readiness verified"} else {previous[name].as_str().unwrap_or("unknown")},"containerReady":true,"applicationReady":project.metadata["readiness"].get(name).map(|_| true)})).collect::<Vec<_>>()));
             }
-            let application_ready = readiness_check(
-                project,
-                service,
-                docker,
-                output,
-                timeout.saturating_sub(started.elapsed().as_secs()).max(1),
-            )?;
-            observation["applicationReady"] = if project.metadata["readiness"].get(service).is_some() {
-                json!(application_ready)
-            } else { Value::Null };
-            if !application_ready {
-                ready = false;
-            }
+            thread::sleep(docker.remaining(Duration::from_millis(500))?);
         }
-        if ready {
-            docker.remaining(Duration::from_secs(timeout.max(1)))?;
-            return Ok(json!(selected.iter().map(|name| json!({"name":name,"status":if project.metadata["readiness"].get(name).is_some() {"application readiness verified"} else {previous[name].as_str().unwrap_or("unknown")},"containerReady":true,"applicationReady":project.metadata["readiness"].get(name).map(|_| true)})).collect::<Vec<_>>()));
-        }
-        thread::sleep(docker.remaining(Duration::from_millis(500))?);
-    }
     })();
-    result.map_err(|error| error.context(crate::status::StatusReport(json!({
-        "backend":"compose","project":project.name().ok(),"ready":false,
-        "services":observations.into_values().collect::<Vec<_>>(),
-    }))))
+    result.map_err(|error| {
+        error.context(crate::status::StatusReport(json!({
+            "backend":"compose","project":project.name().ok(),"ready":false,
+            "services":observations.into_values().collect::<Vec<_>>(),
+        })))
+    })
 }
 /// Only attach secondary evidence; neither hook failures nor a new diagnostic
 /// deadline may replace the original lifecycle error or cancellation.
@@ -2043,7 +2829,13 @@ pub(crate) fn startup_diagnostics(
         return error;
     }
     let report = crate::diagnostics::run(
-        project, selected, "startup-failed", timeout, docker, output, Some(&error),
+        project,
+        selected,
+        "startup-failed",
+        timeout,
+        docker,
+        output,
+        Some(&error),
     );
     error.context(crate::diagnostics::DiagnosticReport(report))
 }
@@ -2056,18 +2848,30 @@ fn diagnostic_owner<'a>(project: &'a Project, docker: &Docker) -> Result<(&'a st
 
 pub(crate) fn diagnostic_container_state(container: &Value) -> Value {
     let state = &container["State"];
-    let status = state["Status"].as_str().filter(|value|
-        ["created", "running", "paused", "restarting", "removing", "exited", "dead"].contains(value));
-    let health = state["Health"]["Status"].as_str().filter(|value|
-        ["starting", "healthy", "unhealthy", "none"].contains(value));
+    let status = state["Status"].as_str().filter(|value| {
+        [
+            "created",
+            "running",
+            "paused",
+            "restarting",
+            "removing",
+            "exited",
+            "dead",
+        ]
+        .contains(value)
+    });
+    let health = state["Health"]["Status"]
+        .as_str()
+        .filter(|value| ["starting", "healthy", "unhealthy", "none"].contains(value));
     json!({"status":status,"running":state["Running"].as_bool(),
         "exitCode":state["ExitCode"].as_i64(),"oomKilled":state["OOMKilled"].as_bool(),
         "health":health})
 }
 
 pub(crate) fn diagnostic_resource_id(value: &Value) -> Option<&str> {
-    value.as_str().filter(|id| !id.is_empty() && id.len() <= 64
-        && id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    value.as_str().filter(|id| {
+        !id.is_empty() && id.len() <= 64 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
 }
 
 /// A single read-only observation pass. Never pass Config, environment, health
@@ -2090,7 +2894,10 @@ pub(crate) fn diagnostic_observations(
         }
     };
     let scope = selected_services_with_profiles(project, selected, profiles)?;
-    ensure!(!scope.is_empty(), "Diagnostics have no required Compose services");
+    ensure!(
+        !scope.is_empty(),
+        "Diagnostics have no required Compose services"
+    );
     let containers = container_rows_timeout(project, docker, 10)?;
     let mut services = Vec::new();
     for service in scope {
@@ -2107,21 +2914,32 @@ pub(crate) fn diagnostic_observations(
             if labels[OWNER].as_str() != Some(owner)
                 || labels[PROJECT].as_str() != Some(project.name()?)
                 || labels["com.docker.compose.project"].as_str() != Some(project.name()?)
-                || id.is_none() {
+                || id.is_none()
+            {
                 all_owned = false;
-                row["failures"].as_array_mut().unwrap().push(json!("Container ownership or immutable identity could not be verified"));
+                row["failures"].as_array_mut().unwrap().push(json!(
+                    "Container ownership or immutable identity could not be verified"
+                ));
                 continue;
             }
             let id = id.unwrap();
-            row["verifiedContainerIds"].as_array_mut().unwrap().push(json!(id));
+            row["verifiedContainerIds"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(id));
             let mut state = diagnostic_container_state(container);
             state["id"] = json!(id);
-            if state["health"] == "unhealthy" { row["unhealthy"] = json!(true); }
+            if state["health"] == "unhealthy" {
+                row["unhealthy"] = json!(true);
+            }
             row["containers"].as_array_mut().unwrap().push(state);
         }
         if all_owned {
-            row["containerReady"] = json!(inspect_state(project, &service, &containers)
-                .map(|(ready, _)| ready).unwrap_or(false));
+            row["containerReady"] = json!(
+                inspect_state(project, &service, &containers)
+                    .map(|(ready, _)| ready)
+                    .unwrap_or(false)
+            );
         } else {
             row["observed"] = json!(false);
             // Mixed ownership must not make even a partial service target usable.
@@ -2130,8 +2948,10 @@ pub(crate) fn diagnostic_observations(
         }
         services.push(row);
     }
-    Ok(json!({"backend":"compose","project":project.name()?,"owner":owner,"context":context,
-        "activeProfiles":profiles,"services":services}))
+    Ok(
+        json!({"backend":"compose","project":project.name()?,"owner":owner,"context":context,
+        "activeProfiles":profiles,"services":services}),
+    )
 }
 
 pub fn lifecycle(
@@ -2152,33 +2972,48 @@ pub fn lifecycle(
         ["up", "dev", "down", "destroy"].contains(&workflow),
         "Unknown lifecycle {workflow}"
     );
+    CrashLoopPolicy::from_project(project)?;
     let active_profiles = active_profiles(profiles)?;
     let selected_full = selected_services_with_profiles(project, selected, &active_profiles)?;
     if workflow == "up" || workflow == "dev" {
-        ensure!(!selected_full.is_empty(), "No required Compose services; select services or activate profiles");
+        ensure!(
+            !selected_full.is_empty(),
+            "No required Compose services; select services or activate profiles"
+        );
     }
     if workflow == "up" || workflow == "dev" {
         crate::diagnostics::validate(project)?;
-        for service in &selected_full { validate_readiness(project, service)?; }
+        for service in &selected_full {
+            validate_readiness(project, service)?;
+        }
     }
     let planned = actions(project, workflow, &selected_full, None)?;
     if plan_only {
-        let native = planned.iter().any(|action| action["kind"] == "prerequisite");
+        let native = planned
+            .iter()
+            .any(|action| action["kind"] == "prerequisite");
         let operations = if workflow == "down" || workflow == "destroy" {
             json!([{"kind":"ownership-check"},{"kind":"remove-containers","scope":"recorded owner + project labels","services":selected},{"kind":"remove-networks","scope":"owned only","onlyFullProject":true},{"kind":"remove-volumes","enabled":workflow == "destroy","scope":"owned only","onlyFullProject":true}])
         } else {
             let startup = if native {
                 json!({"kind":"dependency-ordered-startup","services":dependency_order(project, &selected_full)?,"noDependencies":true,"retainPrerequisites":true,"restartStoppedConsumers":true})
             } else {
-                let mut command = compose_args(project, &project.root.join(".dockstride/render-compose.yaml"))?;
-                for profile in &active_profiles { command.extend(strings(&["--profile", profile])); }
+                let mut command = compose_args(
+                    project,
+                    &project.root.join(".dockstride/render-compose.yaml"),
+                )?;
+                for profile in &active_profiles {
+                    command.extend(strings(&["--profile", profile]));
+                }
                 command.extend(strings(&["up", "--detach", "--build"]));
                 command.extend_from_slice(&selected_full);
                 json!({"kind":"docker","argv":command})
             };
             json!([{"kind":"check-docker-context-ownership-ports"},{"kind":"allocate-declared-ports","policy":project.metadata["setup"]["ports"]},{"kind":"actions-before","actions":actions(project,workflow,&selected_full,Some("before"))?},startup,{"kind":"wait-readiness","services":selected_full,"timeoutSeconds":timeout},{"kind":"actions-after","actions":actions(project,workflow,&selected_full,Some("after"))?},{"kind":"compose-watch","enabled":workflow == "dev","requiresDeclaredWatch":true}])
         };
-        return Ok(json!({"backend":"compose","project":project.name()?,"workflow":workflow,"services":selected_full,"actions":planned,"readiness":project.metadata["readiness"],"portAllocation":project.metadata["setup"]["ports"],"effects":if workflow == "destroy" {"remove owned containers/networks and managed volumes; retain secret references"} else if workflow == "down" {"stop/remove owned containers/networks; preserve volumes and secrets"} else {"allocate declared ports, build/start, run declared actions, verify readiness"},"endpoints":project.endpoints(),"devLoop":project.metadata["dev"],"operations":operations}));
+        return Ok(
+            json!({"backend":"compose","project":project.name()?,"workflow":workflow,"services":selected_full,"actions":planned,"readiness":project.metadata["readiness"],"portAllocation":project.metadata["setup"]["ports"],"effects":if workflow == "destroy" {"remove owned containers/networks and managed volumes; retain secret references"} else if workflow == "down" {"stop/remove owned containers/networks; preserve volumes and secrets"} else {"allocate declared ports, build/start, run declared actions, verify readiness"},"endpoints":project.endpoints(),"devLoop":project.metadata["dev"],"operations":operations}),
+        );
     }
     ensure!(
         workflow != "destroy" || confirmed,
@@ -2191,22 +3026,34 @@ pub fn lifecycle(
         "Environment identity changed while waiting for lifecycle lock; rerun the command with current configuration"
     );
     let project = &fresh;
+    CrashLoopPolicy::from_project(project)?;
     // Revalidate the effective scope after waiting for the lifecycle lock.
     let initial_scope = selected_services_with_profiles(project, selected, &active_profiles)?;
     let initial_actions = planned_actions(project, workflow, &initial_scope)?;
     if workflow == "up" || workflow == "dev" {
-        ensure!(!initial_scope.is_empty(), "No required Compose services; select services or activate profiles");
+        ensure!(
+            !initial_scope.is_empty(),
+            "No required Compose services; select services or activate profiles"
+        );
         crate::diagnostics::validate(project)?;
-        for service in &initial_scope { validate_readiness(project, service)?; }
+        for service in &initial_scope {
+            validate_readiness(project, service)?;
+        }
     }
     drop(initial_actions);
     let mut docker = Docker::new(&project.root, output.clone()).with_profiles(&active_profiles);
     if workflow == "up" || workflow == "dev" {
-        docker = docker.with_deadline(Instant::now() + Duration::from_secs(timeout.max(1)));
+        docker = docker.with_timeout(timeout);
     }
     output.event(
         "check",
-        &format!("{} ({}) checkout={} target={}", project.name()?, project.backend()?, project.owner()?, docker.context()?),
+        &format!(
+            "{} ({}) checkout={} target={}",
+            project.name()?,
+            project.backend()?,
+            project.owner()?,
+            docker.context()?
+        ),
     )?;
     let preflight = (|| -> Result<()> {
         docker.check()?;
@@ -2216,37 +3063,59 @@ pub fn lifecycle(
     if let Err(error) = preflight {
         return Err(if workflow == "up" || workflow == "dev" {
             startup_diagnostics(error, project, &initial_scope, timeout, &docker, output)
-        } else { error });
+        } else {
+            error
+        });
     }
     if workflow == "down" || workflow == "destroy" {
         return teardown(project, workflow == "destroy", selected, &docker, output);
     }
     let mut selected_full = selected_services_with_profiles(project, selected, &active_profiles)?;
     crate::diagnostics::validate(project)?;
-    for service in &selected_full { validate_readiness(project, service)?; }
-    detect_ports(project, &selected_full, &docker)
-        .map_err(|error| startup_diagnostics(error, project, &selected_full, timeout, &docker, output))?;
+    for service in &selected_full {
+        validate_readiness(project, service)?;
+    }
+    detect_ports(project, &selected_full, &docker).map_err(|error| {
+        startup_diagnostics(error, project, &selected_full, timeout, &docker, output)
+    })?;
     let planned = planned_actions(project, workflow, &selected_full)?;
-    let native = planned.iter().any(|action| action["kind"] == "prerequisite");
+    let native = planned
+        .iter()
+        .any(|action| action["kind"] == "prerequisite");
     let mut operation = NativeOperation {
         scope: selected_full.clone(),
-        prerequisites: planned.iter().filter(|a| a["kind"] == "prerequisite").filter_map(|a| a["service"].as_str().map(str::to_owned)).collect(),
+        prerequisites: planned
+            .iter()
+            .filter(|a| a["kind"] == "prerequisite")
+            .filter_map(|a| a["service"].as_str().map(str::to_owned))
+            .collect(),
         ..Default::default()
     };
     if native {
         preflight_native_scope(project, &planned, &operation.scope, &docker).map_err(|error| {
             if error.is::<DockerError>() || error.is::<DeadlineExceeded>() {
                 startup_diagnostics(error, project, &selected_full, timeout, &docker, output)
-            } else { error }
+            } else {
+                error
+            }
         })?;
     }
     let file = write_render(project, "compose")?;
     let startup = (|| -> Result<Value> {
-        for action in planned.iter().filter(|a| a["stage"].as_str().unwrap_or("before") == "before") {
+        for action in planned
+            .iter()
+            .filter(|a| a["stage"].as_str().unwrap_or("before") == "before")
+        {
             if native || action["kind"] == "stop" {
                 execute_native_action(project, action, &docker, output, &mut operation, timeout)?;
             } else {
-                execute_action(project, action, &docker, output, action["timeout"].as_u64().unwrap_or(timeout))?;
+                execute_action(
+                    project,
+                    action,
+                    &docker,
+                    output,
+                    action["timeout"].as_u64().unwrap_or(timeout),
+                )?;
             }
         }
         if native {
@@ -2268,7 +3137,13 @@ pub fn lifecycle(
             if native || action["kind"] == "stop" {
                 execute_native_action(project, action, &docker, output, &mut operation, timeout)?;
             } else {
-                execute_action(project, action, &docker, output, action["timeout"].as_u64().unwrap_or(timeout))?;
+                execute_action(
+                    project,
+                    action,
+                    &docker,
+                    output,
+                    action["timeout"].as_u64().unwrap_or(timeout),
+                )?;
             }
         }
         Ok(readiness)
@@ -2280,11 +3155,24 @@ pub fn lifecycle(
                 let mut logs = compose_args(project, file.path())?;
                 logs.extend(strings(&["logs", "--tail", "30", "--no-color"]));
                 logs.extend_from_slice(&selected_full);
-                logs.extend(operation.prerequisites.iter().filter(|service| !selected_full.contains(service)).cloned());
+                logs.extend(
+                    operation
+                        .prerequisites
+                        .iter()
+                        .filter(|service| !selected_full.contains(service))
+                        .cloned(),
+                );
                 let _ = docker.run_timeout(&logs, None, 10);
             }
             let error = error.context("Compose startup failed; one-shot prerequisites must exit successfully. Stopped consumers remain stopped; detached containers and prerequisite logs remain");
-            return Err(startup_diagnostics(error, project, &selected_full, timeout, &docker, output));
+            return Err(startup_diagnostics(
+                error,
+                project,
+                &selected_full,
+                timeout,
+                &docker,
+                output,
+            ));
         }
     };
     let result = json!({"project":project.name()?,"services":readiness,"endpoints":project.endpoints(),"detached":true});
@@ -2353,14 +3241,18 @@ fn teardown(
             "Container ownership changed; refusing removal"
         );
         let resource = row["Id"].as_str().context("Missing container id")?;
-        let current: Vec<Value> = serde_json::from_str(&docker.capture(
-            &strings(&["container", "inspect", resource]), None,
-        )?)?;
-        ensure!(current.len() == 1 && current[0]["Id"].as_str() == Some(resource)
-            && current[0]["Config"]["Labels"][OWNER].as_str() == Some(id)
-            && current[0]["Config"]["Labels"][PROJECT].as_str() == Some(project.name()?)
-            && current[0]["Config"]["Labels"]["com.docker.compose.project"].as_str() == Some(project.name()?),
-            "Container {resource} identity/ownership changed; refusing removal");
+        let current: Vec<Value> = serde_json::from_str(
+            &docker.capture(&strings(&["container", "inspect", resource]), None)?,
+        )?;
+        ensure!(
+            current.len() == 1
+                && current[0]["Id"].as_str() == Some(resource)
+                && current[0]["Config"]["Labels"][OWNER].as_str() == Some(id)
+                && current[0]["Config"]["Labels"][PROJECT].as_str() == Some(project.name()?)
+                && current[0]["Config"]["Labels"]["com.docker.compose.project"].as_str()
+                    == Some(project.name()?),
+            "Container {resource} identity/ownership changed; refusing removal"
+        );
         docker.run(&strings(&["container", "rm", "--force", resource]), None)?;
         removed.push(resource.to_owned());
     }
@@ -2371,32 +3263,61 @@ fn teardown(
             vec!["network"]
         } {
             let mut listing = strings(&[
-                kind, "ls", "-q", "--filter", &format!("label={OWNER}={id}"),
-                "--filter", &format!("label={PROJECT}={}", project.name()?),
+                kind,
+                "ls",
+                "-q",
+                "--filter",
+                &format!("label={OWNER}={id}"),
+                "--filter",
+                &format!("label={PROJECT}={}", project.name()?),
             ]);
-            if kind == "network" { listing.push("--no-trunc".into()); }
+            if kind == "network" {
+                listing.push("--no-trunc".into());
+            }
             let resources = docker.capture(&listing, None)?;
             for resource in resources.split_whitespace() {
-                let inspected: Vec<Value> = serde_json::from_str(&docker.capture(
-                    &strings(&[kind, "inspect", resource]), None,
-                )?)?;
-                ensure!(inspected.len() == 1, "Cannot verify {kind} {resource} before removal");
+                let inspected: Vec<Value> = serde_json::from_str(
+                    &docker.capture(&strings(&[kind, "inspect", resource]), None)?,
+                )?;
+                ensure!(
+                    inspected.len() == 1,
+                    "Cannot verify {kind} {resource} before removal"
+                );
                 let current = &inspected[0];
-                ensure!(current["Labels"][OWNER].as_str() == Some(id)
-                    && current["Labels"][PROJECT].as_str() == Some(project.name()?),
-                    "{kind} {resource} ownership changed; refusing removal");
+                ensure!(
+                    current["Labels"][OWNER].as_str() == Some(id)
+                        && current["Labels"][PROJECT].as_str() == Some(project.name()?),
+                    "{kind} {resource} ownership changed; refusing removal"
+                );
                 let immutable = if kind == "network" {
-                    current["Id"].as_str().context("Network inspection lacks immutable id")?
+                    current["Id"]
+                        .as_str()
+                        .context("Network inspection lacks immutable id")?
                 } else {
-                    current["Name"].as_str().context("Volume inspection lacks name")?
+                    current["Name"]
+                        .as_str()
+                        .context("Volume inspection lacks name")?
                 };
-                ensure!(immutable == resource, "{kind} {resource} identity changed; refusing removal");
-                let external = project.model[if kind == "network" { "networks" } else { "volumes" }]
-                    .as_object().into_iter().flat_map(|resources| resources.iter())
-                    .any(|(logical, definition)| definition["external"] == true
+                ensure!(
+                    immutable == resource,
+                    "{kind} {resource} identity changed; refusing removal"
+                );
+                let external = project.model[if kind == "network" {
+                    "networks"
+                } else {
+                    "volumes"
+                }]
+                .as_object()
+                .into_iter()
+                .flat_map(|resources| resources.iter())
+                .any(|(logical, definition)| {
+                    definition["external"] == true
                         && Some(definition["name"].as_str().unwrap_or(logical))
-                            == current["Name"].as_str());
-                if external { continue; }
+                            == current["Name"].as_str()
+                });
+                if external {
+                    continue;
+                }
                 // No force: attached external/other-project resources must survive.
                 docker.run(&strings(&[kind, "rm", resource]), None)?;
                 removed.push(resource.into());
@@ -2414,7 +3335,12 @@ pub fn status(
     timeout: u64,
     output: &Output,
 ) -> Result<Value> {
-    let deadline = Instant::now() + Duration::from_secs(timeout.min(10).max(1));
+    let deadline = Instant::now()
+        + Duration::from_secs(if timeout == 0 {
+            10
+        } else {
+            timeout.min(10).max(1)
+        });
     let docker = Docker::new(&project.root, output.clone()).with_deadline(deadline);
     let mut report = json!({
         "backend":"compose", "project":project.name().ok(), "context":null,
@@ -2424,28 +3350,47 @@ pub fn status(
     });
     let observation = (|| -> Result<()> {
         (|| -> Result<()> {
-        ensure!(project.backend()? == "compose", "Compose status requires the Compose backend");
-        let names: Vec<_> = project.services()?.keys().cloned().collect();
-        report["services"] = json!(names.iter().map(|name| json!({
-            "name":name, "required":false, "observed":false,
-            "containerReady":false, "applicationReady":null, "ready":false,
-            "status":"unobserved", "containers":[]
-        })).collect::<Vec<_>>());
-        let active = active_profiles(profiles)?;
-        report["activeProfiles"] = json!(active);
-        let scope = selected_services_with_profiles(project, selected, &active)?;
-        report["requiredServices"] = json!(scope);
-        report["excludedServices"] = json!(names.iter().filter(|name| !scope.contains(name)).collect::<Vec<_>>());
-        for row in report["services"].as_array_mut().unwrap() {
-            let name = row["name"].as_str().unwrap();
-            validate_readiness(project, name)?;
-            let required = scope.iter().any(|service| service == name);
-            row["required"] = json!(required);
-            if !required { row["status"] = json!("excluded"); }
-        }
-        ensure!(!scope.is_empty(), "No required Compose services; select services or activate profiles");
+            ensure!(
+                project.backend()? == "compose",
+                "Compose status requires the Compose backend"
+            );
+            let names: Vec<_> = project.services()?.keys().cloned().collect();
+            report["services"] = json!(
+                names
+                    .iter()
+                    .map(|name| json!({
+                        "name":name, "required":false, "observed":false,
+                        "containerReady":false, "applicationReady":null, "ready":false,
+                        "status":"unobserved", "containers":[]
+                    }))
+                    .collect::<Vec<_>>()
+            );
+            let active = active_profiles(profiles)?;
+            report["activeProfiles"] = json!(active);
+            let scope = selected_services_with_profiles(project, selected, &active)?;
+            report["requiredServices"] = json!(scope);
+            report["excludedServices"] = json!(
+                names
+                    .iter()
+                    .filter(|name| !scope.contains(name))
+                    .collect::<Vec<_>>()
+            );
+            for row in report["services"].as_array_mut().unwrap() {
+                let name = row["name"].as_str().unwrap();
+                validate_readiness(project, name)?;
+                let required = scope.iter().any(|service| service == name);
+                row["required"] = json!(required);
+                if !required {
+                    row["status"] = json!("excluded");
+                }
+            }
+            ensure!(
+                !scope.is_empty(),
+                "No required Compose services; select services or activate profiles"
+            );
             Ok(())
-        })().map_err(|error| error.context(crate::status::StatusConfiguration))?;
+        })()
+        .map_err(|error| error.context(crate::status::StatusConfiguration))?;
         report["context"] = json!(docker.context()?);
         validate_ownership(project, &docker)?;
         report["owner"] = json!(project.owner()?);
@@ -2464,16 +3409,22 @@ pub fn status(
             match inspect_state(project, &name, &containers) {
                 Ok((ready, description)) => {
                     row["containerReady"] = json!(ready);
-                    if row["required"] == true { row["status"] = json!(description); }
+                    if row["required"] == true {
+                        row["status"] = json!(description);
+                    }
                 }
                 Err(error) => {
                     row["error"] = json!(error.to_string());
-                    if row["required"] == true { row["status"] = json!("failed"); }
+                    if row["required"] == true {
+                        row["status"] = json!("failed");
+                    }
                 }
             }
         }
         for row in report["services"].as_array_mut().unwrap() {
-            if row["required"] != true || row["containerReady"] != true { continue }
+            if row["required"] != true || row["containerReady"] != true {
+                continue;
+            }
             let name = row["name"].as_str().unwrap();
             if project.metadata["readiness"].get(name).is_none() {
                 row["ready"] = json!(true);
@@ -2490,20 +3441,32 @@ pub fn status(
             let application_ready = readiness_check(project, name, &docker, output, 10)?;
             row["applicationReady"] = json!(application_ready);
             row["ready"] = json!(application_ready);
-            row["status"] = json!(if application_ready { "application readiness verified" } else { "application readiness failed" });
+            row["status"] = json!(if application_ready {
+                "application readiness verified"
+            } else {
+                "application readiness failed"
+            });
         }
         Ok(())
     })();
     report["deadlineExceeded"] = json!(Instant::now() >= deadline);
-    report["ready"] = json!(!report["requiredServices"].as_array().unwrap().is_empty()
-        && report["services"].as_array().unwrap().iter().filter(|row| row["required"] == true).all(|row| row["ready"] == true)
-        && report["deadlineExceeded"] != true);
+    report["ready"] = json!(
+        !report["requiredServices"].as_array().unwrap().is_empty()
+            && report["services"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["required"] == true)
+                .all(|row| row["ready"] == true)
+            && report["deadlineExceeded"] != true
+    );
     if let Err(error) = observation {
         // Deadline exhaustion is an incomplete readiness observation. Genuine
         // transport/configuration/ownership failures retain their original type.
         if report["deadlineExceeded"] == true && error.is::<DeadlineExceeded>() {
             for row in report["services"].as_array_mut().unwrap() {
-                if row["required"] == true && row["ready"] != true && row["status"] == "unobserved" {
+                if row["required"] == true && row["ready"] != true && row["status"] == "unobserved"
+                {
                     row["status"] = json!("unobserved: deadline exceeded");
                 }
             }
@@ -2522,10 +3485,21 @@ pub fn passthrough(
     let docker = Docker::new(&project.root, output.clone());
     let _lifecycle = if namespace != "docker" {
         Some(state::lock(&project.root, "lifecycle")?)
-    } else { None };
+    } else {
+        None
+    };
     let render;
     if namespace != "docker" {
-        output.event("target", &format!("{} ({}) checkout={} target={}", project.name()?, project.backend()?, project.owner()?, docker.context()?))?;
+        output.event(
+            "target",
+            &format!(
+                "{} ({}) checkout={} target={}",
+                project.name()?,
+                project.backend()?,
+                project.owner()?,
+                docker.context()?
+            ),
+        )?;
         validate_ownership(project, &docker)?;
     }
     let mut command = match namespace {
@@ -2572,9 +3546,90 @@ mod tests {
         json!({"Config":{"Labels":{"com.docker.compose.service":service,"com.docker.compose.oneoff":"False"}},"State":state})
     }
     #[test]
+    fn compose_restarts_use_observed_deltas_and_immutable_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project(dir.path(), json!({"api":{"restart":"always"}}), json!({}));
+        let mut tracker = ComposeCrashTracker::new(&project).unwrap();
+        let mut row = container(
+            "api",
+            json!({"Status":"restarting","Running":false,"ExitCode":7}),
+        );
+        row["Id"] = json!("first");
+        row["RestartCount"] = json!(40);
+        tracker
+            .observe(&project, "api", &[row.clone()], false)
+            .unwrap();
+        assert!(
+            !inspect_state_mode(&project, "api", &[row.clone()], true)
+                .unwrap()
+                .0
+        );
+        assert!(inspect_state(&project, "api", &[row.clone()]).is_ok());
+        for count in [41, 42, 42] {
+            row["RestartCount"] = json!(count);
+            tracker
+                .observe(&project, "api", &[row.clone()], false)
+                .unwrap();
+        }
+        row["Id"] = json!("replacement");
+        row["RestartCount"] = json!(100);
+        tracker
+            .observe(&project, "api", &[row.clone()], false)
+            .unwrap();
+        row["RestartCount"] = json!(103);
+        assert!(
+            tracker
+                .observe(&project, "api", &[row.clone()], false)
+                .unwrap_err()
+                .to_string()
+                .contains("crash loop")
+        );
+        row["State"]["Status"] = json!("exited");
+        assert!(
+            !inspect_state_mode(&project, "api", &[row.clone()], true)
+                .unwrap()
+                .0
+        );
+        assert!(inspect_state(&project, "api", &[row]).is_err());
+    }
+    #[test]
+    fn zero_timeout_preserves_unlimited_and_inherited_deadlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker = Docker::new(dir.path(), Output::default());
+        assert!(docker.with_timeout(0).deadline.is_none());
+        let bounded = docker.with_timeout(10);
+        assert_eq!(bounded.with_timeout(0).deadline, bounded.deadline);
+        assert_eq!(bounded.with_timeout(20).deadline, bounded.deadline);
+        assert!(
+            docker
+                .for_diagnostics(0)
+                .remaining(Duration::from_secs(10))
+                .is_ok()
+        );
+    }
+    #[test]
+    fn crash_loop_policy_validates_project_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = project(
+            dir.path(),
+            json!({"api":{}}),
+            json!({"crashLoop":{"attempts":2,"windowSeconds":8,"healthyResetSeconds":4}}),
+        );
+        let policy = CrashLoopPolicy::from_project(&project).unwrap();
+        assert_eq!(policy.attempts, 2);
+        assert_eq!(policy.window, Duration::from_secs(8));
+        assert_eq!(policy.healthy_reset, Duration::from_secs(4));
+        project.metadata["crashLoop"]["attempts"] = json!(0);
+        assert!(CrashLoopPolicy::from_project(&project).is_err());
+    }
+    #[test]
     fn owned_sparse_render_keeps_optional_resource_sections_valid() {
         let dir = tempfile::tempdir().unwrap();
-        let project = project(dir.path(), json!({"app":{"image":"python:3.13-alpine"}}), json!({}));
+        let project = project(
+            dir.path(),
+            json!({"app":{"image":"python:3.13-alpine"}}),
+            json!({}),
+        );
         let rendered = render_document(&project, "compose").unwrap();
         for field in ["volumes", "networks"] {
             assert!(rendered.get(field).is_none_or(Value::is_object));
@@ -2636,7 +3691,17 @@ mod tests {
             json!({"api":{"build":"."}}),
             json!({"actions":[{"name":"seed","kind":"command","argv":["false"],"workflows":["dev"]}],"setup":{"ports":{"apiPort":{"service":"api","target":8000}}}}),
         );
-        let plan = lifecycle(&project, "dev", &[], &[], true, false, 1, &Output::default()).unwrap();
+        let plan = lifecycle(
+            &project,
+            "dev",
+            &[],
+            &[],
+            true,
+            false,
+            1,
+            &Output::default(),
+        )
+        .unwrap();
         assert_eq!(plan["actions"][0]["name"], "seed");
         assert_eq!(plan["operations"][3]["kind"], "docker");
         assert!(!dir.path().join(".dockstride").exists());
@@ -2687,9 +3752,15 @@ mod tests {
         );
         project.model["volumes"] = json!({"data":{},"shared":{"external":true}});
         let rendered = render_document(&project, "compose").unwrap();
-        assert_eq!(rendered["services"]["api"]["labels"][OWNER], project.owner().unwrap());
+        assert_eq!(
+            rendered["services"]["api"]["labels"][OWNER],
+            project.owner().unwrap()
+        );
         assert_eq!(rendered["services"]["api"]["labels"]["application"], "yes");
-        assert_eq!(rendered["volumes"]["data"]["labels"][OWNER], project.owner().unwrap());
+        assert_eq!(
+            rendered["volumes"]["data"]["labels"][OWNER],
+            project.owner().unwrap()
+        );
         assert!(!dir.path().join(".dockstride").exists());
         assert!(rendered["volumes"]["shared"].get("labels").is_none());
         assert!(!dir.path().join(".dockstride/render-compose.yaml").exists());
@@ -2845,12 +3916,22 @@ esac
     }
 }
 
-fn namespace_resources(docker: &Docker, listing: &[&str], project: &str, filters: &[&str]) -> Result<BTreeSet<String>> {
+fn namespace_resources(
+    docker: &Docker,
+    listing: &[&str],
+    project: &str,
+    filters: &[&str],
+) -> Result<BTreeSet<String>> {
     let mut resources = BTreeSet::new();
     for filter in filters {
         let mut args = strings(listing);
         args.extend(strings(&["--filter", &format!("label={filter}={project}")]));
-        resources.extend(docker.capture(&args, None)?.split_whitespace().map(str::to_owned));
+        resources.extend(
+            docker
+                .capture(&args, None)?
+                .split_whitespace()
+                .map(str::to_owned),
+        );
     }
     Ok(resources)
 }

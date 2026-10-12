@@ -1,6 +1,12 @@
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use dockstride::{config, deploy, model::Project, nickel, output::{Output, OutputMode}, runtime, secrets, sources, state};
+use dockstride::{
+    config, deploy,
+    model::Project,
+    nickel,
+    output::{Output, OutputMode},
+    runtime, secrets, sources, state,
+};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -38,7 +44,12 @@ struct Cli {
     /// Supply one initial secret from piped stdin, never from an argument.
     #[arg(long = "secret-stdin", global = true, value_name = "NAME")]
     secret_stdin: Option<String>,
-    #[arg(long, global = true, default_value_t = 180)]
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 0,
+        help = "Overall startup/deployment deadline in seconds; omitted means unlimited"
+    )]
     timeout: u64,
     #[command(subcommand)]
     command: Commands,
@@ -62,7 +73,10 @@ enum Commands {
         /// Disable automatic shared-source discovery for this checkout.
         #[arg(long)]
         no_shared_sources: bool,
-        #[arg(long, help = "Copy and recreate existing managed volumes with this checkout's ownership labels")]
+        #[arg(
+            long,
+            help = "Copy and recreate existing managed volumes with this checkout's ownership labels"
+        )]
         adopt_existing_volumes: bool,
     },
     Config {
@@ -73,7 +87,10 @@ enum Commands {
     Up {
         #[arg(long = "profile", value_name = "NAME")]
         profiles: Vec<String>,
-        #[arg(long, help = "Copy and recreate existing managed volumes with this checkout's ownership labels")]
+        #[arg(
+            long,
+            help = "Copy and recreate existing managed volumes with this checkout's ownership labels"
+        )]
         adopt_existing_volumes: bool,
         services: Vec<String>,
     },
@@ -188,7 +205,9 @@ enum SourceCommand {
         #[arg(long)]
         create: bool,
     },
-    Remove { path: PathBuf },
+    Remove {
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -223,7 +242,8 @@ enum Target {
 
 fn main() {
     let no_color = std::env::var_os("NO_COLOR").is_some()
-        || std::env::args_os().any(|arg| arg == "--no-color" || arg == "--json" || arg == "--non-interactive");
+        || std::env::args_os()
+            .any(|arg| arg == "--no-color" || arg == "--json" || arg == "--non-interactive");
     let command = if no_color {
         Cli::command().color(clap::ColorChoice::Never)
     } else {
@@ -233,9 +253,18 @@ fn main() {
     let output = Output {
         json: cli.json,
         quiet: cli.quiet,
-        mode: OutputMode::select(cli.interactive, cli.non_interactive, cli.json,
-            [io::stdin().is_terminal(), io::stdout().is_terminal(), io::stderr().is_terminal()],
-            std::env::var_os("TERM").is_none_or(|term| term != "dumb") && console::Term::stdout().features().is_attended()),
+        mode: OutputMode::select(
+            cli.interactive,
+            cli.non_interactive,
+            cli.json,
+            [
+                io::stdin().is_terminal(),
+                io::stdout().is_terminal(),
+                io::stderr().is_terminal(),
+            ],
+            std::env::var_os("TERM").is_none_or(|term| term != "dumb")
+                && console::Term::stdout().features().is_attended(),
+        ),
         no_color,
         verbose: cli.verbose,
         ..Output::default()
@@ -278,7 +307,8 @@ fn main() {
             if let Some(report) = error.downcast_ref::<dockstride::status::StatusReport>() {
                 details["status"] = report.0.clone();
             }
-            if let Some(report) = error.downcast_ref::<dockstride::diagnostics::DiagnosticReport>() {
+            if let Some(report) = error.downcast_ref::<dockstride::diagnostics::DiagnosticReport>()
+            {
                 details["diagnostics"] = report.0.clone();
             }
             if let Some(report) = error.downcast_ref::<secrets::SyncFailed>() {
@@ -363,6 +393,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
     runtime::pin_invocation();
     let non_interactive = cli.non_interactive || cli.json || !io::stdin().is_terminal();
     let secret_inputs = initial_secret_inputs(cli)?;
+    let bounded_timeout = if cli.timeout == 0 { 180 } else { cli.timeout };
     let result = match &cli.command {
         Commands::Init => {
             prohibit_plan_mutation(cli)?;
@@ -370,31 +401,51 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
         }
         Commands::Run { name } => {
             prohibit_plan_mutation(cli)?;
-            dockstride::commands::run(&root, name, cli.timeout, out)?
+            dockstride::commands::run(&root, name, bounded_timeout, out)?
         }
-        Commands::Env { command: EnvironmentCommand::List } => dockstride::environment::list(&root)?,
-        Commands::Setup { inputs, no_shared_sources, adopt_existing_volumes } => {
+        Commands::Env {
+            command: EnvironmentCommand::List,
+        } => dockstride::environment::list(&root)?,
+        Commands::Setup {
+            inputs,
+            no_shared_sources,
+            adopt_existing_volumes,
+        } => {
             let mut inputs = inputs.clone();
-            if *no_shared_sources { inputs.push("_dockstride.sources=[]".to_owned()); }
+            if *no_shared_sources {
+                inputs.push("_dockstride.sources=[]".to_owned());
+            }
             if !secret_inputs.is_empty() {
                 let candidate = config::setup_plan_candidate(&root, &inputs)?;
                 secrets::preflight_inputs(&root, &secret_inputs, Some(&candidate))?;
             }
             if cli.plan {
                 let candidate = config::setup_plan_candidate(&root, &inputs)?;
-                let mut plan = configuration_plan(&root, "setup", &secret_inputs, Some(&candidate))?;
+                let mut plan =
+                    configuration_plan(&root, "setup", &secret_inputs, Some(&candidate))?;
                 if *adopt_existing_volumes {
                     plan["operations"] = json!([volume_adoption_plan()]);
                 }
                 plan
             } else {
-                out.step("Reading/provisioning environment", ||
-                    config::setup_with_context(&root, &inputs, non_interactive, cli.timeout, out, "setup"))?;
+                out.step("Reading/provisioning environment", || {
+                    config::setup_with_context(
+                        &root,
+                        &inputs,
+                        non_interactive,
+                        cli.timeout,
+                        out,
+                        "setup",
+                    )
+                })?;
                 if *adopt_existing_volumes {
-                    out.step("Adopting existing volumes", || runtime::adopt_existing_volumes(&root, cli.timeout, out))?;
+                    out.step("Adopting existing volumes", || {
+                        runtime::adopt_existing_volumes(&root, cli.timeout, out)
+                    })?;
                 }
-                let provisioned = out.step("Preparing secrets", ||
-                    secrets::provision(&root, non_interactive, &secret_inputs, out))?;
+                let provisioned = out.step("Preparing secrets", || {
+                    secrets::provision(&root, non_interactive, &secret_inputs, out)
+                })?;
                 out.step("Allocating ports", || {
                     let _lifecycle = state::lock(&root, "lifecycle")?;
                     if runtime::allocate_ports(&root)? {
@@ -403,7 +454,9 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                     Ok(())
                 })?;
                 let configuration = out.step("Validating configuration", || {
-                    if provisioned["consumerValidation"] == "deferred" { secrets::validate_consumers(&root, out)?; }
+                    if provisioned["consumerValidation"] == "deferred" {
+                        secrets::validate_consumers(&root, out)?;
+                    }
                     config::list(&root)
                 })?;
                 json!({"configured":true,"started":false,"configuration":configuration,"secretProvisioning":provisioned})
@@ -424,7 +477,13 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
             },
             ConfigCommand::Get { path } => config::get(&root, path)?,
             ConfigCommand::Schema => json!({"fields":nickel::schema(&root,None)?}),
-            ConfigCommand::Set { path, value, file, shared, source } => {
+            ConfigCommand::Set {
+                path,
+                value,
+                file,
+                shared,
+                source,
+            } => {
                 prohibit_plan_mutation(cli)?;
                 let value = if let Some(file) = file {
                     parse_value(&std::fs::read_to_string(file)?)?
@@ -435,13 +494,23 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                             .context("config set requires VALUE or --file")?,
                     )?
                 };
-                if *shared { config::set_shared(&root, path, value, source.as_deref())? }
-                else { config::set(&root, path, value)? }
+                if *shared {
+                    config::set_shared(&root, path, value, source.as_deref())?
+                } else {
+                    config::set(&root, path, value)?
+                }
             }
-            ConfigCommand::Unset { path, shared, source } => {
+            ConfigCommand::Unset {
+                path,
+                shared,
+                source,
+            } => {
                 prohibit_plan_mutation(cli)?;
-                if *shared { config::unset_shared(&root, path, source.as_deref())? }
-                else { config::unset(&root, path)? }
+                if *shared {
+                    config::unset_shared(&root, path, source.as_deref())?
+                } else {
+                    config::unset(&root, path)?
+                }
             }
             ConfigCommand::Edit { shared, source } => {
                 prohibit_plan_mutation(cli)?;
@@ -450,8 +519,11 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                         "config edit requires an interactive editor; use config set --file for automation"
                     );
                 }
-                if *shared { config::edit_shared(&root, source.as_deref())? }
-                else { config::edit(&root)? }
+                if *shared {
+                    config::edit_shared(&root, source.as_deref())?
+                } else {
+                    config::edit(&root)?
+                }
             }
         },
         Commands::Render { target } => {
@@ -468,7 +540,7 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                 json!(serde_yaml::to_string(&model)?)
             }
         }
-        Commands::Doctor => doctor(&root, cli.timeout, cli.plan, out)?,
+        Commands::Doctor => doctor(&root, bounded_timeout, cli.plan, out)?,
         Commands::Secrets { command } => match command {
             SecretCommand::List => secrets::list(&root)?,
             SecretCommand::Replace {
@@ -479,28 +551,44 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
             } => {
                 prohibit_plan_mutation(cli)?;
                 let input = if let Some(file) = file {
-                    if file.as_os_str().as_encoded_bytes().split(|byte| *byte == b'/').any(|part| part == b".." || part == b".") {
+                    if file
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .split(|byte| *byte == b'/')
+                        .any(|part| part == b".." || part == b".")
+                    {
                         bail!("secret paths must not contain traversal components");
                     }
                     let path = sources::expand_home(file)?;
-                    let path = if path.is_absolute() { path }
-                        else { std::env::current_dir()?.join(path) };
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        std::env::current_dir()?.join(path)
+                    };
                     Some(secrets::SecretInput::File(path))
                 } else if *stdin {
                     Some(secrets::SecretInput::Stdin)
-                } else { None };
+                } else {
+                    None
+                };
                 secrets::replace(&root, name, input.as_ref(), *apply, non_interactive, out)?
             }
             SecretCommand::Sync { names, yes, apply } => {
-                let confirmed = cli.plan || *yes || confirm(
-                    cli, non_interactive, "Synchronize the selected current secret sources?",
-                )?;
+                let confirmed = cli.plan
+                    || *yes
+                    || confirm(
+                        cli,
+                        non_interactive,
+                        "Synchronize the selected current secret sources?",
+                    )?;
                 secrets::sync(&root, names, cli.plan, confirmed, *apply, out)?
             }
         },
         Commands::Up { .. } | Commands::Dev { .. } | Commands::Deploy => {
             let services = match &cli.command {
-                Commands::Up { services, .. } | Commands::Dev { services, .. } => services.as_slice(),
+                Commands::Up { services, .. } | Commands::Dev { services, .. } => {
+                    services.as_slice()
+                }
                 _ => &[],
             };
             let workflow = match cli.command {
@@ -509,10 +597,18 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                 _ => "up",
             };
             let profiles = match &cli.command {
-                Commands::Up { profiles, .. } | Commands::Dev { profiles, .. } => profiles.as_slice(),
+                Commands::Up { profiles, .. } | Commands::Dev { profiles, .. } => {
+                    profiles.as_slice()
+                }
                 _ => &[],
             };
-            let adopt_volumes = matches!(&cli.command, Commands::Up { adopt_existing_volumes: true, .. });
+            let adopt_volumes = matches!(
+                &cli.command,
+                Commands::Up {
+                    adopt_existing_volumes: true,
+                    ..
+                }
+            );
             let project = if cli.plan {
                 match nickel::evaluate(&root, None) {
                     Ok(project) => project,
@@ -523,7 +619,14 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                     }
                 }
             } else {
-                config::setup_with_context(&root, &[], non_interactive, cli.timeout, out, workflow)?;
+                config::setup_with_context(
+                    &root,
+                    &[],
+                    non_interactive,
+                    cli.timeout,
+                    out,
+                    workflow,
+                )?;
                 if adopt_volumes {
                     runtime::adopt_existing_volumes(&root, cli.timeout, out)?;
                 }
@@ -533,7 +636,9 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                     runtime::allocate_ports(&root)?;
                 }
                 let project = nickel::evaluate(&root, None)?;
-                if provisioned["consumerValidation"] == "deferred" { secrets::validate_consumers(&root, out)?; }
+                if provisioned["consumerValidation"] == "deferred" {
+                    secrets::validate_consumers(&root, out)?;
+                }
                 header(&project, out)?;
                 let result = if workflow == "deploy" {
                     deploy::deploy(&project, false, cli.timeout, out)?
@@ -554,14 +659,30 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
             if workflow == "deploy" {
                 deploy::deploy(&project, true, cli.timeout, out)?
             } else {
-                let mut plan = runtime::lifecycle(&project, workflow, services, profiles, true, false, cli.timeout, out)?;
+                let mut plan = runtime::lifecycle(
+                    &project,
+                    workflow,
+                    services,
+                    profiles,
+                    true,
+                    false,
+                    cli.timeout,
+                    out,
+                )?;
                 if adopt_volumes {
-                    plan["operations"].as_array_mut().unwrap().insert(0, volume_adoption_plan());
+                    plan["operations"]
+                        .as_array_mut()
+                        .unwrap()
+                        .insert(0, volume_adoption_plan());
                 }
                 plan
             }
         }
-        Commands::Status { services, profiles, inspect_only } => {
+        Commands::Status {
+            services,
+            profiles,
+            inspect_only,
+        } => {
             let project = nickel::evaluate(&root, None).map_err(|error| {
                 error.context(dockstride::status::StatusReport(json!({
                     "backend":null,"project":null,"context":null,"inspectOnly":inspect_only,
@@ -576,22 +697,36 @@ fn execute(cli: &Cli, out: &Output) -> Result<Option<Value>> {
                     } else {
                         services.iter().map(String::as_str).collect()
                     };
-                    let rows: Vec<_> = required.iter().map(|name| json!({
-                        "name":name,"required":true,"observed":false,"containerReady":false,
-                        "applicationReady":null,"ready":false,"status":"unobserved"
-                    })).collect();
-                    return Err(anyhow::anyhow!("Compose profiles do not apply to Swarm status")
-                        .context(dockstride::status::StatusConfiguration)
-                        .context(dockstride::status::StatusReport(json!({
-                            "backend":"swarm","project":project.name()?,"context":null,
-                            "inspectOnly":inspect_only,"ready":false,"deadlineExceeded":false,
-                            "requiredServices":required,"excludedServices":[],"services":rows,
-                            "endpoints":project.endpoints()
-                        }))));
+                    let rows: Vec<_> = required
+                        .iter()
+                        .map(|name| {
+                            json!({
+                                "name":name,"required":true,"observed":false,"containerReady":false,
+                                "applicationReady":null,"ready":false,"status":"unobserved"
+                            })
+                        })
+                        .collect();
+                    return Err(
+                        anyhow::anyhow!("Compose profiles do not apply to Swarm status")
+                            .context(dockstride::status::StatusConfiguration)
+                            .context(dockstride::status::StatusReport(json!({
+                                "backend":"swarm","project":project.name()?,"context":null,
+                                "inspectOnly":inspect_only,"ready":false,"deadlineExceeded":false,
+                                "requiredServices":required,"excludedServices":[],"services":rows,
+                                "endpoints":project.endpoints()
+                            }))),
+                    );
                 }
-                deploy::status(&project, services, *inspect_only, cli.timeout, out)?
+                deploy::status(&project, services, *inspect_only, bounded_timeout, out)?
             } else {
-                runtime::status(&project, services, profiles, *inspect_only, cli.timeout, out)?
+                runtime::status(
+                    &project,
+                    services,
+                    profiles,
+                    *inspect_only,
+                    bounded_timeout,
+                    out,
+                )?
             }
         }
         Commands::Down | Commands::Destroy { .. } => {
@@ -812,9 +947,7 @@ fn doctor(root: &Path, timeout: u64, plan_only: bool, out: &Output) -> Result<Va
                 json!({"schemaVersion":1,"sideEffects":false,"findings":[],"failures":[],
                     "plannedHooks":project.metadata.get("diagnostics").cloned().unwrap_or_else(|| json!({}))})
             } else {
-                dockstride::diagnostics::run(
-                    &project, &[], "doctor", timeout, &docker, out, None,
-                )
+                dockstride::diagnostics::run(&project, &[], "doctor", timeout, &docker, out, None)
             };
             match view {
                 Ok(_) => {
@@ -829,17 +962,16 @@ fn doctor(root: &Path, timeout: u64, plan_only: bool, out: &Output) -> Result<Va
         Ok(value) => value,
         Err(error) => json!({"ok":false,"diagnostic":format!("{error:#}")}),
     };
-    Ok(json!({"docker":prerequisites,"configuration":configuration,"secrets":secrets,"diagnostics":diagnostics}))
+    Ok(
+        json!({"docker":prerequisites,"configuration":configuration,"secrets":secrets,"diagnostics":diagnostics}),
+    )
 }
 
 fn initial_secret_inputs(cli: &Cli) -> Result<BTreeMap<String, secrets::SecretInput>> {
     if (!cli.secret_files.is_empty() || cli.secret_stdin.is_some())
         && !matches!(
             cli.command,
-            Commands::Setup { .. }
-                | Commands::Up { .. }
-                | Commands::Dev { .. }
-                | Commands::Deploy
+            Commands::Setup { .. } | Commands::Up { .. } | Commands::Dev { .. } | Commands::Deploy
         )
     {
         bail!(
@@ -882,4 +1014,26 @@ fn initial_secret_inputs(cli: &Cli) -> Result<BTreeMap<String, secrets::SecretIn
         }
     }
     Ok(inputs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_timeout_is_unlimited_unless_explicitly_bounded() {
+        assert_eq!(Cli::try_parse_from(["dks", "up"]).unwrap().timeout, 0);
+        assert_eq!(
+            Cli::try_parse_from(["dks", "deploy", "--timeout", "42"])
+                .unwrap()
+                .timeout,
+            42
+        );
+        assert_eq!(
+            Cli::try_parse_from(["dks", "--timeout", "0", "up"])
+                .unwrap()
+                .timeout,
+            0
+        );
+    }
 }

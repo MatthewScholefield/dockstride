@@ -1,9 +1,14 @@
 //! Consumer-facing startup error preservation and diagnostic ownership boundaries.
 use serde_json::{Value, json};
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::{Command, Output}};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    process::{Command, Output},
+};
 
 const DOCKER: &str = r#"#!/usr/bin/env python3
-import json, os, pathlib, sys
+import json, os, pathlib, sys, time
 r = pathlib.Path(os.environ['DIAGNOSTIC_FIXTURE'])
 a = sys.argv[1:]
 s = json.loads((r / 'state.json').read_text())
@@ -42,7 +47,15 @@ elif a[:2] == ['container','inspect']:
         name = next(n for n,c in s['containers'].items() if c['id'] == cid)
         if a[-1] == '{{.Id}}': print(s['containers'][name]['id'])
         else: print(json.dumps(row(name,s['containers'][name])['Config']['Labels']))
-    else: print(json.dumps([row(n,c) for n,c in s['containers'].items() if c['id'] in a[2:]]))
+    else:
+        if (r / 'resource-started').exists() and mode in ('recovering', 'crash-loop'):
+            p = r / 'restart-observations'
+            count = int(p.read_text()) + 1 if p.exists() else 0
+            p.write_text(str(count))
+            for c in s['containers'].values():
+                c['status'] = 'running' if mode == 'recovering' and count >= 2 else 'restarting'
+                c['restarts'] = 40 + count
+        print(json.dumps([dict(row(n,c), RestartCount=c.get('restarts',0)) for n,c in s['containers'].items() if c['id'] in a[2:]]))
 elif a[:2] == ['service','ls']:
     if backend == 'swarm': print('diagnostic-fixture_db')
 elif a[:2] == ['service','inspect']:
@@ -71,6 +84,7 @@ elif a[:1] == ['compose']:
     elif op == 'up':
         (r / 'resource-started').write_text('yes')
         if mode == 'docker-failure': raise SystemExit(29)
+        if mode == 'slow-start': time.sleep(1.3)
         if 'migrate' in rest:
             s['containers']['migrate'] = {'id':'b'*64,'status':'exited','exit':17}
             save()
@@ -112,7 +126,9 @@ print(json.dumps({'schemaVersion':1,'findings':[{'code':code,'severity':'error',
     'suggestedCommand':['python3','-c',"open('repair-ran','w').write('unsafe')"]}]}))
 "#;
 
-struct Fixture { temp: tempfile::TempDir }
+struct Fixture {
+    temp: tempfile::TempDir,
+}
 impl Fixture {
     fn new(backend: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -120,7 +136,9 @@ impl Fixture {
         fs::create_dir(r.join("bin")).unwrap();
         fs::write(r.join("bin/docker"), DOCKER).unwrap();
         fs::set_permissions(r.join("bin/docker"), fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(r.join("compose.ncl"), r#"
+        fs::write(
+            r.join("compose.ncl"),
+            r#"
 let contract = {project | String, backend | String | default = "compose"} in
 let env | contract = import "env.yaml" in
 {
@@ -135,8 +153,14 @@ let env | contract = import "env.yaml" in
   name = env.project,
   services = import "services.json",
 }
-"#).unwrap();
-        fs::write(r.join("env.yaml"), format!("project: diagnostic-fixture\nbackend: {backend}\n")).unwrap();
+"#,
+        )
+        .unwrap();
+        fs::write(
+            r.join("env.yaml"),
+            format!("project: diagnostic-fixture\nbackend: {backend}\n"),
+        )
+        .unwrap();
         fs::write(r.join("diagnose.py"), HOOK).unwrap();
         fs::write(r.join("docker-mode"), "normal").unwrap();
         fs::write(r.join("hook-mode"), "normal").unwrap();
@@ -147,22 +171,51 @@ let env | contract = import "env.yaml" in
         f.write_json("actions.json", &json!([]));
         f.write_json("readiness.json", &json!({}));
         f.write_json("diagnostics.json", &json!({"database":{"command":"diagnose","services":["db"],"on":["startup-failed","unhealthy"]}}));
-        f.write_json("state.json", &json!({"containers":{"db":{"id":"a".repeat(64),"status":"running"}}}));
+        f.write_json(
+            "state.json",
+            &json!({"containers":{"db":{"id":"a".repeat(64),"status":"running"}}}),
+        );
         f
     }
-    fn root(&self) -> &Path { self.temp.path() }
+    fn root(&self) -> &Path {
+        self.temp.path()
+    }
     fn write_json(&self, name: &str, value: &Value) {
         fs::write(self.root().join(name), serde_json::to_vec(value).unwrap()).unwrap();
     }
-    fn write(&self, name: &str, value: &str) { fs::write(self.root().join(name), value).unwrap(); }
-    fn run(&self, args: &[&str]) -> Output { self.run_timed(args, "10") }
+    fn write(&self, name: &str, value: &str) {
+        fs::write(self.root().join(name), value).unwrap();
+    }
+    fn run(&self, args: &[&str]) -> Output {
+        self.run_timed(args, "10")
+    }
     fn run_timed(&self, args: &[&str], timeout: &str) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_dks")).current_dir(self.root()).env_clear()
-            .env("PATH", format!("{}:{}", self.root().join("bin").display(), std::env::var("PATH").unwrap()))
-            .env("HOME", self.root().join("home")).env("XDG_DATA_HOME", self.root().join("data"))
-            .env("DOCKER_HOST", "unix:///diagnostic-fixture.sock").env("DIAGNOSTIC_FIXTURE", self.root())
-            .args(["--json", "--non-interactive", "--no-color", "--timeout", timeout, "-C"])
-            .arg(self.root()).args(args).output().unwrap()
+        self.run_optional_timeout(args, Some(timeout))
+    }
+    fn run_optional_timeout(&self, args: &[&str], timeout: Option<&str>) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dks"));
+        command
+            .current_dir(self.root())
+            .env_clear()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.root().join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("HOME", self.root().join("home"))
+            .env("XDG_DATA_HOME", self.root().join("data"))
+            .env("DOCKER_HOST", "unix:///diagnostic-fixture.sock")
+            .env("DIAGNOSTIC_FIXTURE", self.root())
+            .args(["--json", "--non-interactive", "--no-color", "-C"])
+            .arg(self.root())
+            .args(args);
+        if let Some(timeout) = timeout {
+            command.args(["--timeout", timeout]);
+        }
+        command.output().unwrap()
     }
     fn native(&self) {
         self.write("expected-proof", "startup");
@@ -179,10 +232,19 @@ let env | contract = import "env.yaml" in
     }
 }
 fn terminal(output: &Output) -> Value {
-    output.stdout.split(|b| *b == b'\n').filter(|line| !line.is_empty())
+    output
+        .stdout
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
         .map(|line| serde_json::from_slice::<Value>(line).unwrap())
         .find(|record| record["type"] == "result" || record["type"] == "error")
-        .unwrap_or_else(|| panic!("No terminal result: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)))
+        .unwrap_or_else(|| {
+            panic!(
+                "No terminal result: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
 }
 
 #[test]
@@ -195,15 +257,32 @@ fn native_failure_retains_exit_and_stop_safety_with_successful_or_failed_hooks()
         let record = terminal(&output);
         assert_eq!(output.status.code(), Some(1), "{record}");
         assert_eq!(record["category"], "operation", "{record}");
-        assert_eq!(record["details"]["prerequisite"]["exitCode"], 17, "{record}");
+        assert_eq!(
+            record["details"]["prerequisite"]["exitCode"], 17,
+            "{record}"
+        );
         let report = &record["details"]["diagnostics"];
         if mode == "normal" {
-            assert_eq!(report["findings"][0]["code"], "migration-failure", "{record}");
+            assert_eq!(
+                report["findings"][0]["code"], "migration-failure",
+                "{record}"
+            );
         } else {
-            assert!(report["failures"].as_array().unwrap().iter().any(|row| row["hook"] == "migration"), "{record}");
+            assert!(
+                report["failures"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["hook"] == "migration"),
+                "{record}"
+            );
         }
-        let state: Value = serde_json::from_slice(&fs::read(f.root().join("state.json")).unwrap()).unwrap();
-        assert_eq!(state["containers"]["backend"]["status"], "exited", "{state}");
+        let state: Value =
+            serde_json::from_slice(&fs::read(f.root().join("state.json")).unwrap()).unwrap();
+        assert_eq!(
+            state["containers"]["backend"]["status"], "exited",
+            "{state}"
+        );
         assert_eq!(state["containers"]["migrate"]["exit"], 17, "{state}");
         assert!(!f.root().join("seed-ran").exists());
         assert!(!f.root().join("repair-ran").exists());
@@ -219,15 +298,21 @@ fn genuine_docker_start_failure_retains_docker_exit_status() {
     assert_eq!(output.status.code(), Some(4), "{record}");
     assert_eq!(record["category"], "docker", "{record}");
     assert_eq!(record["details"]["underlyingDockerStatus"], 29, "{record}");
-    assert_eq!(record["details"]["diagnostics"]["findings"][0]["code"], "verified-owned-container", "{record}");
+    assert_eq!(
+        record["details"]["diagnostics"]["findings"][0]["code"], "verified-owned-container",
+        "{record}"
+    );
 }
 
 #[test]
 fn doctor_exposes_only_owned_immutable_container_linkage() {
     for (backend, mode, expected) in [
-        ("compose", "normal", "owned"), ("compose", "foreign", "blocked"),
-        ("swarm", "normal", "owned"), ("swarm", "foreign", "blocked"),
-        ("swarm", "wrong-task", "blocked"), ("swarm", "foreign-service", "blocked"),
+        ("compose", "normal", "owned"),
+        ("compose", "foreign", "blocked"),
+        ("swarm", "normal", "owned"),
+        ("swarm", "foreign", "blocked"),
+        ("swarm", "wrong-task", "blocked"),
+        ("swarm", "foreign-service", "blocked"),
     ] {
         let f = Fixture::new(backend);
         f.write("docker-mode", mode);
@@ -235,17 +320,28 @@ fn doctor_exposes_only_owned_immutable_container_linkage() {
         let output = f.run(&["doctor"]);
         let record = terminal(&output);
         assert!(output.status.success(), "{record}");
-        let expected_code = if expected == "owned" { "verified-owned-container" } else { "unverified-container-blocked" };
-        assert_eq!(record["result"]["diagnostics"]["findings"][0]["code"], expected_code, "{record}");
+        let expected_code = if expected == "owned" {
+            "verified-owned-container"
+        } else {
+            "unverified-container-blocked"
+        };
+        assert_eq!(
+            record["result"]["diagnostics"]["findings"][0]["code"], expected_code,
+            "{record}"
+        );
         assert!(!f.root().join("repair-ran").exists());
     }
 }
 
-
 #[test]
 fn invalid_declarations_fail_before_starts_and_read_only_surfaces_do_not_dispatch() {
     let f = Fixture::new("compose");
-    for args in [&["up", "--plan"][..], &["status", "--inspect-only"][..], &["render"][..], &["doctor", "--plan"][..]] {
+    for args in [
+        &["up", "--plan"][..],
+        &["status", "--inspect-only"][..],
+        &["render"][..],
+        &["doctor", "--plan"][..],
+    ] {
         let output = f.run(args);
         assert!(output.status.success(), "{}", terminal(&output));
         assert!(!f.root().join("hook-ran").exists());
@@ -266,13 +362,50 @@ fn invalid_declarations_fail_before_starts_and_read_only_surfaces_do_not_dispatc
 fn exhausted_startup_deadline_keeps_observed_application_failure_and_allows_diagnosis() {
     let f = Fixture::new("compose");
     f.write("readiness.py", "import pathlib,time\np=pathlib.Path('application-probed')\nif p.exists(): time.sleep(30)\np.write_text('failed')\nraise SystemExit(1)\n");
-    f.write_json("readiness.json", &json!({"db":{"command":["python3","readiness.py"]}}));
-    f.write_json("diagnostics.json", &json!({"application":{"command":"diagnose","services":["db"],"on":["readiness-failed"]}}));
+    f.write_json(
+        "readiness.json",
+        &json!({"db":{"command":["python3","readiness.py"]}}),
+    );
+    f.write_json(
+        "diagnostics.json",
+        &json!({"application":{"command":"diagnose","services":["db"],"on":["readiness-failed"]}}),
+    );
     let output = f.run_timed(&["up"], "10");
     let record = terminal(&output);
     assert_eq!(output.status.code(), Some(1), "{record}");
     assert!(f.root().join("application-probed").exists(), "{record}");
-    assert_eq!(record["details"]["status"]["services"][0]["applicationReady"], false, "{record}");
-    assert_eq!(record["details"]["diagnostics"]["findings"][0]["code"], "verified-owned-container", "{record}");
+    assert_eq!(
+        record["details"]["status"]["services"][0]["applicationReady"], false,
+        "{record}"
+    );
+    assert_eq!(
+        record["details"]["diagnostics"]["findings"][0]["code"], "verified-owned-container",
+        "{record}"
+    );
     assert!(!f.root().join("repair-ran").exists());
+}
+
+#[test]
+fn compose_unlimited_startup_recovers_and_detects_restart_deltas() {
+    for (mode, timeout, success) in [
+        ("slow-start", None, true),
+        ("recovering", Some("0"), true),
+        ("crash-loop", Some("0"), false),
+    ] {
+        let f = Fixture::new("compose");
+        f.write("docker-mode", mode);
+        f.write_json(
+            "services.json",
+            &json!({"db":{"image":"fixture","restart":"always"}}),
+        );
+        let output = f.run_optional_timeout(&["up"], timeout);
+        let record = terminal(&output);
+        assert_eq!(output.status.success(), success, "{record}");
+        if !success {
+            assert!(
+                record["message"].as_str().unwrap().contains("crash loop"),
+                "{record}"
+            );
+        }
+    }
 }
